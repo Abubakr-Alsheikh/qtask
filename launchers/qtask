@@ -1,0 +1,29 @@
+#!/bin/sh
+# Runs qtask from a clone, for bash on Linux and macOS and Git Bash on Windows.
+# Git Bash: path conversion stays off, so values such as --plan /d/x reach qtask
+# unchanged. -I keeps PYTHON* variables and the current folder out of the import path.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
+self=$0
+while [ -L "$self" ]; do
+    # Follow a symlink on PATH back to the clone.
+    link=$(readlink "$self")
+    case "$link" in
+        /*) self=$link ;;
+        *) self=$(dirname "$self")/$link ;;
+    esac
+done
+here=$(cd "$(dirname "$self")" && { pwd -W 2>/dev/null || pwd; })
+script="$here/../qtask.py"
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        if command -v python >/dev/null 2>&1; then exec python -I -X utf8 "$script" "$@"; fi
+        if command -v py >/dev/null 2>&1; then exec py -3 -I -X utf8 "$script" "$@"; fi
+        ;;
+    *)
+        if command -v python3 >/dev/null 2>&1; then exec python3 -I -X utf8 "$script" "$@"; fi
+        if command -v python >/dev/null 2>&1; then exec python -I -X utf8 "$script" "$@"; fi
+        ;;
+esac
+echo "qtask: Python 3.11 or newer was not found on PATH" >&2
+exit 1

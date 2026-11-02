@@ -1,0 +1,16 @@
+# Your own notes, plans and to-dos. Never committed.
+/private/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# A qtask database, in case QTASK_HOME points inside the repo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

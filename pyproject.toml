@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtask-cli"
+version = "0.1.0"
+description = "Local task tracker for AI coding agents and the people they work with. One Python file, no dependencies."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Abubakr Alsheikh" }]
+keywords = ["task-tracker", "cli", "ai-agents", "sqlite", "claude-code"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Software Development :: Bug Tracking",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Abubakr-Alsheikh/qtask"
+Changelog = "https://github.com/Abubakr-Alsheikh/qtask/blob/main/CHANGELOG.md"
+
+[project.scripts]
+qtask = "qtask:main"
+
+[tool.setuptools]
+py-modules = ["qtask"]
