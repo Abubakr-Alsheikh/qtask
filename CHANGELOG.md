@@ -13,6 +13,7 @@ Agents link their work to git history and keep task IDs out of the repo.
 - `answer --as NAME` and `comment --as NAME` record what someone said in chat with that person as the author. The event log keeps the agent that wrote it down.
 - `--body-file /tmp/x.md` works in Git Bash on Windows. The launcher keeps such paths as written, so qtask now asks `cygpath` for the Windows path.
 - Text and `--body-file` together exit 2 with the code `text_and_body_file` on every command, and missing text exits 2 with `text_required`. Both messages say how to fix the command.
+- The skill's "qtask stays out of the repo" section also keeps qtask's notes, plans and checklists, and its name, out of repo docs, PRs and notes for other people, not only its IDs and paths.
 - Schema 3 to 5 add the `commits` and `todos` tables and the `deployed` and `deploy_note` columns. They only add: no table or column that 0.1 reads changes.
 
 ## 0.1.0 (2026-11-02)

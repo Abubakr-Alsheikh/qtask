@@ -23,11 +23,13 @@ Give a subagent the task ID and the agent name to use. It claims the task, comme
 
 Use `--force` only when the developer says so. It logs an event.
 
-## Task IDs stay out of the repo
+## qtask stays out of the repo
 
-Tasks, IDs and plan files exist on this machine only, in `QTASK_HOME` (default `~/.qtask`). Nobody else can open them, and an ID such as `APP-12` reads like a ticket in another tracker, so people go looking for it.
+qtask is private to this machine. Tasks, IDs, comments, checklists and plan files exist only in `QTASK_HOME` (default `~/.qtask`). Nobody else can open them, and an ID such as `APP-12` reads like a ticket in another tracker, so people go looking for it.
 
 - Never write a task ID or a qtask path in a commit message, branch name, code, code comment, test, repo doc, PR or issue.
+- Keep qtask's content in qtask. Do not copy a task's notes, plan, checklist or evidence into a repo doc, the repo's plans folder, a PR, an issue or a hand-off note for other people, and do not name qtask there or ask anyone else to track work with it.
+- When the developer asks for a doc or a plan in the repo, write it as plain project content: what changes and why, for whoever reads the repo. No task IDs, no qtask paths, no mention of qtask.
 - Name the work itself: the feature, the file, the contract section, the commit hash. Keep the link in qtask with `qtask commit`, `qtask set --pr` or a comment.
 - `qtask scan` finds both. It knows the prefixes of every project in the database, current and earlier, and reports an ID in any letter case when that task exists. Run it before each commit, and run `qtask scan --range origin/main..HEAD` before you push or open a PR.
 - If qtask has no field for something you need to keep, tell the user. Do not put it in the repo instead.
