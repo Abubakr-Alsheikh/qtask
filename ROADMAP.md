@@ -2,13 +2,17 @@
 
 Plans, not promises. Open an issue to argue for or against any of them.
 
-## 0.2: share work from local tasks
+## 0.2: work that follows git history
+
+Done in 0.2.0: commit links that survive a rebase, `scan` to keep task IDs out of commits, a prefix per project, checklists, deploy state, and answers recorded for the developer. See [CHANGELOG.md](CHANGELOG.md).
+
+## 0.3: share work from local tasks
 
 - **`promote`**: turn a local task into a GitHub issue, or into a plan file inside the repo, and link the two. Today `--gh-issue` and `--visibility public` only record that you did it by hand.
 - **`gh sync`**: keep the status of promoted tasks and their issues in step, both ways.
 - **HTML board**: one read-only page with columns by status, written to a file you open in a browser. No server.
 
-## 0.3: easier to install and find
+## 0.4: easier to install and find
 
 - **PyPI**: publish as `qtask-cli` (the name `qtask` is taken), so `pipx install qtask-cli` works.
 - **Claude Code plugin**: package the skill as a plugin, so installing it is one command.
