@@ -6,14 +6,16 @@ https://github.com/Abubakr-Alsheikh/qtask, MIT license.
 
 Exit codes:
   0    success
-  1    unexpected, file or database error
-  2    bad usage or invalid value
+  1    unexpected, file, git or database error
+  2    bad usage or invalid value, or not in a git repo when the command needs one
   3    another agent holds a valid claim
-  4    a rule refused the action (closed, blocked, open question or child, no evidence)
-  5    task or comment not found
+  4    a rule refused the action (closed, blocked, open question, child or checklist item,
+       no evidence, prefix taken, task IDs found by scan)
+  5    task, comment, checklist item or commit not found
   130  stopped with Ctrl-C
 
-Needs SQLite 3.24 or newer with JSON functions, and git 2.31 or newer to detect projects.
+Needs SQLite 3.24 or newer with JSON functions, and git 2.31 or newer to detect projects,
+link commits and scan changes.
 
 Environment:
   QTASK_HOME    data folder, an absolute path, default ~/.qtask
@@ -39,7 +41,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -59,6 +61,8 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 SIDES = ("fe", "be", "infra", "docs", "other")
 VISIBILITIES = ("local", "public")
 COMMENT_KINDS = ("note", "question", "answer", "decision", "review")
+DEPLOY_STATES = ("none", "staging", "production")
+TODO_ACTIONS = ("add", "done", "undo", "rm")
 DEVELOPER = "developer"
 UNKNOWN_AGENT = "unknown"
 
@@ -68,7 +72,14 @@ MAX_TTL_HOURS = 720
 MAX_TOPIC_BYTES = 120
 MIN_SQLITE = (3, 24, 0)
 BACKUPS_KEPT = 7
-BACKUP_TABLES = ("schema_version", "meta", "projects", "tasks", "comments", "links", "events")
+BACKUP_TABLES = (
+    "schema_version", "meta", "projects", "tasks", "comments", "links", "events", "commits", "todos",
+)
+GIT_TIMEOUT = 15
+SCAN_TIMEOUT = 120
+RELINK_HISTORY = 500
+PREFIX_RE = re.compile(r"[A-Z]{1,6}")
+SCISSORS = "# ------------------------ >8 ------------------------"
 
 SQL_CLOSED = "('done','dropped')"
 SQL_HAS_BLOCKER = (
@@ -83,9 +94,13 @@ TASK_SELECT = (
     "AS blocked_by, "
     "(SELECT count(*) FROM tasks c WHERE c.parent_id = t.id) AS children_count, "
     "(SELECT count(*) FROM tasks c WHERE c.parent_id = t.id AND c.status = 'done') AS children_done, "
-    "(SELECT count(*) FROM tasks c WHERE c.parent_id = t.id AND c.status <> 'dropped') AS children_total "
+    "(SELECT count(*) FROM tasks c WHERE c.parent_id = t.id AND c.status <> 'dropped') AS children_total, "
+    "(SELECT count(*) FROM todos d WHERE d.task_id = t.id AND d.removed_at IS NULL) AS todos_total, "
+    "(SELECT count(*) FROM todos d WHERE d.task_id = t.id AND d.removed_at IS NULL AND d.done = 1) "
+    "AS todos_done "
     "FROM tasks t"
 )
+SQL_OPEN_TODOS = "t.id IN (SELECT task_id FROM todos WHERE removed_at IS NULL AND done = 0)"
 WINDOWS_RESERVED = {"con", "prn", "aux", "nul", *(f"com{n}" for n in range(1, 10)), *(f"lpt{n}" for n in range(1, 10))}
 
 SCHEMA_V1 = [
@@ -245,13 +260,13 @@ def now():
 # ---------------------------------------------------------- project detection
 
 
-@functools.lru_cache(maxsize=1)
-def git_path():
+def find_program(name):
     """
-    Full path of git from the absolute PATH entries, or None. Never a bare "git": on Windows that
-    runs a git.exe in the current folder first, so a cloned repo could plant one.
+    Full path of a program from the absolute PATH entries, or None. Never a bare name: on Windows
+    that runs a program in the current folder first, so a cloned repo could plant one.
     """
-    name = "git.exe" if os.name == "nt" else "git"
+    if os.name == "nt":
+        name += ".exe"
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip().strip('"')
         if not folder or not os.path.isabs(folder):
@@ -262,21 +277,67 @@ def git_path():
     return None
 
 
-def run_git(*git_args):
+@functools.lru_cache(maxsize=1)
+def git_path():
+    return find_program("git")
+
+
+def git_result(*git_args, timeout=GIT_TIMEOUT):
+    """Run git in the current folder. Returns the finished process, or None when git cannot start."""
     git = git_path()
     if git is None:
         return None
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
     try:
-        result = subprocess.run(
+        return subprocess.run(
             [git, *git_args], capture_output=True, encoding="utf-8",
-            errors="replace", timeout=15, env=env,
+            errors="replace", timeout=timeout, env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode != 0:
+
+
+def run_git(*git_args):
+    """Stripped output of a git command, or None when it fails or prints nothing."""
+    result = git_result(*git_args)
+    if result is None or result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+def git_text(*git_args, timeout=GIT_TIMEOUT):
+    """Raw output of a git command that must succeed, such as a diff."""
+    result = git_result(*git_args, timeout=timeout)
+    if result is None or result.returncode != 0:
+        detail = result.stderr.strip().splitlines()[-1] if result is not None and result.stderr.strip() else ""
+        raise QtaskError("git_failed", f"git failed: {detail}" if detail else "git failed to run.")
+    return result.stdout
+
+
+def require_repo():
+    """Stop with a clear error outside a git repo."""
+    if run_git("rev-parse", "--show-toplevel") is None:
+        raise usage_error(f"{no_repo_reason()} Run this command inside the repo.", "not_in_repo")
+
+
+def git_bash_path(path):
+    """
+    Windows path of a Git Bash path such as /tmp/x.md, through cygpath, or None. The launcher turns
+    Git Bash path conversion off, so qtask gets such paths as written.
+    """
+    if os.name != "nt" or not path.startswith("/") or path.startswith("//"):
+        return None
+    cygpath = find_program("cygpath")
+    if cygpath is None:
+        return None
+    try:
+        result = subprocess.run(
+            [cygpath, "-w", path], capture_output=True, encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    converted = result.stdout.strip()
+    return converted if result.returncode == 0 and converted else None
 
 
 def normalize_remote(url):
@@ -352,6 +413,27 @@ def free_short_name(conn, project):
     return next(name for name in short_name_candidates(project) if name not in taken)
 
 
+SQL_ID_PREFIX = "substr(id, 1, instr(id, '-') - 1)"
+SQL_ID_NUMBER = "CAST(substr(id, instr(id, '-') + 1) AS INTEGER)"
+
+
+def prefix_owners(conn):
+    """Map each prefix in use, now or by earlier task IDs, to the projects that use it."""
+    rows = conn.execute(
+        f"SELECT name AS project, prefix FROM projects UNION SELECT project, {SQL_ID_PREFIX} FROM tasks"
+    ).fetchall()
+    owners = {}
+    for row in rows:
+        if row["prefix"]:
+            owners.setdefault(row["prefix"].upper(), set()).add(row["project"])
+    return owners
+
+
+def free_prefix(conn, project):
+    taken = prefix_owners(conn)
+    return next(p for p in prefix_candidates(project) if p not in taken)
+
+
 # ------------------------------------------------------------------- database
 
 
@@ -388,7 +470,54 @@ def migrate_2(conn):
     conn.execute("CREATE UNIQUE INDEX idx_projects_short_name ON projects(short_name)")
 
 
-MIGRATIONS = {1: migrate_1, 2: migrate_2}
+def migrate_3(conn):
+    """Commits linked to tasks. repo is the project of the repo the commit came from."""
+    conn.execute(
+        """CREATE TABLE commits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            sha TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            authored_at TEXT,
+            branch TEXT,
+            repo TEXT,
+            note TEXT,
+            agent TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            UNIQUE (task_id, sha)
+        )"""
+    )
+    conn.execute("CREATE INDEX idx_commits_sha ON commits(sha)")
+
+
+def migrate_4(conn):
+    """Deploy state of a task, with a free-text note."""
+    states = ", ".join(f"'{s}'" for s in DEPLOY_STATES)
+    conn.execute(
+        "ALTER TABLE tasks ADD COLUMN deployed TEXT NOT NULL DEFAULT 'none' "
+        f"CHECK (deployed IN ({states}))"
+    )
+    conn.execute("ALTER TABLE tasks ADD COLUMN deploy_note TEXT")
+
+
+def migrate_5(conn):
+    """Checklist items inside a task. n counts per task and is never reused: rm sets removed_at."""
+    conn.execute(
+        """CREATE TABLE todos (
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            n INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            done_at TEXT,
+            removed_at TEXT,
+            PRIMARY KEY (task_id, n)
+        )"""
+    )
+
+
+MIGRATIONS = {1: migrate_1, 2: migrate_2, 3: migrate_3, 4: migrate_4, 5: migrate_5}
 
 
 def schema_version(conn):
@@ -553,16 +682,14 @@ def apply_changes(ctx, row, changes):
     return True
 
 
-def ensure_project(conn, project):
+def ensure_project(conn, project, prefix=None):
     """Return the project row, creating it inside the caller's write transaction."""
     row = conn.execute("SELECT * FROM projects WHERE name = ?", (project,)).fetchone()
     if row:
         return row
-    taken = {r["prefix"] for r in conn.execute("SELECT prefix FROM projects")}
-    prefix = next(p for p in prefix_candidates(project) if p not in taken)
     conn.execute(
         "INSERT INTO projects(name, prefix, next_n, created_at, short_name) VALUES (?, ?, 1, ?, ?)",
-        (project, prefix, now(), free_short_name(conn, project)),
+        (project, prefix or free_prefix(conn, project), now(), free_short_name(conn, project)),
     )
     return conn.execute("SELECT * FROM projects WHERE name = ?", (project,)).fetchone()
 
@@ -608,6 +735,7 @@ def task_dict(row):
     data["progress"] = (
         f"{data['children_done']}/{data['children_total']}" if data.get("children_count") else None
     )
+    data["todo_progress"] = f"{data['todos_done']}/{data['todos_total']}" if data.get("todos_total") else None
     return data
 
 
@@ -677,6 +805,8 @@ def read_text_file(path):
         target = Path(path)
         if not target.exists():
             target = Path(msys_to_windows(path))
+        if not target.exists():
+            target = Path(git_bash_path(path) or target)
         try:
             raw = target.read_bytes()
         except OSError as exc:
@@ -687,20 +817,59 @@ def read_text_file(path):
         raise usage_error(f"{path} is not UTF-8.") from None
 
 
+def both_texts_error(first):
+    return usage_error(
+        f"{first}, not both. Remove one of them: "
+        "--body-file is the safe choice for text with quotes, % or line breaks.",
+        "text_and_body_file",
+    )
+
+
+def prepare_todo(args):
+    """Split todo's positional values into the item text for add, or item numbers."""
+    if args.action == "add":
+        if len(args.values) > 1:
+            raise usage_error('Put the item text in quotes: qtask todo ID add "text".')
+        args.text = args.values[0] if args.values else None
+        return
+    if args.body_file is not None:
+        raise usage_error("--body-file works with todo add only.")
+    if args.action is None:
+        if args.values:
+            raise usage_error(f"Pass an action before the values: {', '.join(TODO_ACTIONS)}.")
+        return
+    if not args.values:
+        raise usage_error(f"todo {args.action} needs item numbers, such as: qtask todo ID {args.action} 2")
+    numbers = []
+    for value in args.values:
+        if not value.isdigit() or int(value) < 1:
+            raise usage_error(f"A checklist item number is 1 or more, got {value!r}.")
+        if int(value) not in numbers:
+            numbers.append(int(value))
+    args.numbers = numbers
+
+
 def load_inputs(args):
     """Read file and stdin inputs once, before any database retry."""
+    if getattr(args, "command", None) == "todo":
+        prepare_todo(args)
     body_file = getattr(args, "body_file", None)
     if hasattr(args, "text"):
         if body_file is not None:
             if args.text is not None:
-                raise usage_error("Pass the text or --body-file, not both.")
+                raise both_texts_error("Pass the text as an argument or with --body-file")
             args.text = read_text_file(body_file)
         if args.text is None or not args.text.strip():
-            raise usage_error("The text cannot be empty.")
+            name = "todo add" if args.command == "todo" else args.command
+            raise usage_error(
+                f"{name} needs text. Pass it as an argument or with --body-file FILE.", "text_required"
+            )
     elif body_file is not None:
         if args.body is not None:
-            raise usage_error("Pass --body or --body-file, not both.")
+            raise both_texts_error("Pass --body or --body-file")
         args.body = read_text_file(body_file)
+    if getattr(args, "message_file", None) is not None:
+        args.message_text = read_text_file(args.message_file)
 
 
 def assert_parent_allowed(conn, parent_row, task_id=None):
@@ -789,6 +958,10 @@ def task_line(task):
     parts = [f"{task['id']:<8} {task['priority']} {task['status']:<13} {task['kind']}{side}: {task['title']}"]
     if task["progress"]:
         parts.append(f"[{task['progress']}]")
+    if task.get("todo_progress"):
+        parts.append(f"[todo {task['todo_progress']}]")
+    if task.get("deployed", "none") != "none":
+        parts.append(f"[on {task['deployed']}]")
     if task["claim_valid"]:
         parts.append(f"[claimed by {task['claimed_by']}]")
     elif task["claimed_by"]:
@@ -809,6 +982,40 @@ def comment_line(comment):
         f"#{comment['id']} on {comment['task_id']} [{comment['kind']}, {state}] "
         f"{comment['author']}{target}: {comment['body']}"
     )
+
+
+def fetch_todos(conn, task_id):
+    rows = conn.execute(
+        "SELECT n, body, done, created_by, created_at, done_at FROM todos "
+        "WHERE task_id = ? AND removed_at IS NULL ORDER BY n",
+        (task_id,),
+    )
+    return [{**{k: r[k] for k in r.keys()}, "done": bool(r["done"])} for r in rows]
+
+
+def todo_line(todo):
+    return f"{todo['n']}. [{'x' if todo['done'] else ' '}] {todo['body']}"
+
+
+def fetch_commits(conn, task_id):
+    rows = conn.execute(
+        "SELECT sha, subject, authored_at, branch, repo, note, agent, added_at FROM commits "
+        "WHERE task_id = ? ORDER BY authored_at, id",
+        (task_id,),
+    )
+    return [{k: r[k] for k in r.keys()} for r in rows]
+
+
+def commit_line(commit, project=None):
+    where = [commit["branch"]] if commit["branch"] else []
+    if commit["repo"] and project and commit["repo"].lower() != project.lower():
+        where.append(f"repo {commit['repo']}")
+    line = f"{commit['sha'][:7]} {commit['subject']}"
+    if where:
+        line += f" ({', '.join(where)})"
+    if commit["note"]:
+        line += f". Note: {commit['note']}"
+    return line
 
 
 # ------------------------------------------------------------------- search
@@ -934,11 +1141,15 @@ def cmd_ls(ctx):
     a = ctx.args
     where, params = [], []
     build_filters(ctx, where, params)
+    if a.deployed:
+        where.append("t.deployed = ?")
+        params.append(choice(a.deployed, DEPLOY_STATES, "--deployed"))
     if a.status:
         statuses = [choice(s, STATUSES, "--status") for s in a.status]
         where.append(f"t.status IN ({','.join('?' * len(statuses))})")
         params.extend(statuses)
-    elif not a.include_closed:
+    elif not a.include_closed and not a.deployed:
+        # A deployed task is often done already, so --deployed lists closed tasks too.
         where.append(f"t.status NOT IN {SQL_CLOSED}")
     tasks = select_tasks(ctx, where, params)
     return {"tasks": tasks, "count": len(tasks)}, tasks_text(tasks)
@@ -988,6 +1199,8 @@ def cmd_show(ctx):
         {k: r[k] for k in r.keys()}
         for r in conn.execute("SELECT * FROM events WHERE task_id = ? ORDER BY id", (task_id,))
     ]
+    todos = fetch_todos(conn, task_id)
+    commits = fetch_commits(conn, task_id)
     links = {"blocks": [], "blocked_by": [], "relates": []}
     for r in conn.execute(
         "SELECT from_id, to_id, type FROM links WHERE from_id = ? OR to_id = ? ORDER BY from_id, to_id",
@@ -1010,19 +1223,30 @@ def cmd_show(ctx):
         if task[key]:
             value = ", ".join(task[key]) if key == "tags" else task[key]
             lines.append(f"{label}: {value}")
+    if task["deployed"] != "none":
+        lines.append(f"Deployed: {task['deployed']}")
+    if task["deploy_note"]:
+        lines.append(f"Deploy note: {task['deploy_note']}")
     lines.append(f"Visibility: {task['visibility']}")
     lines.append(f"Created: {task['created_at']} by {task['created_by']}")
     if task["body"]:
         lines += ["", task["body"]]
+    if todos:
+        lines += ["", f"Checklist, {task['todo_progress']} done:"] + [f"  {todo_line(t)}" for t in todos]
     if children:
         lines += ["", "Children:"] + [f"  {task_line(c)}" for c in children]
     if any(links.values()):
         lines += ["", "Links:"] + [f"  {k}: {', '.join(v)}" for k, v in links.items() if v]
+    if commits:
+        lines += ["", "Commits:"] + [f"  {commit_line(c, task['project'])}" for c in commits]
     if comments:
         lines += ["", "Comments:"] + [f"  {comment_line(c)}" for c in comments]
     lines += ["", "Events:"]
     lines += [f"  {e['at']} {e['actor']} {e['field']}: {e['old']} -> {e['new']}" for e in events]
-    data = {"task": task, "children": children, "comments": comments, "links": links, "events": events}
+    data = {
+        "task": task, "children": children, "todos": todos, "comments": comments, "links": links,
+        "commits": commits, "events": events,
+    }
     return data, "\n".join(lines)
 
 
@@ -1164,9 +1388,12 @@ def cmd_set(ctx):
         changes["side"] = choice(a.side, SIDES, "--side") if a.side.strip() else None
     if a.visibility is not None:
         changes["visibility"] = choice(a.visibility, VISIBILITIES, "--visibility")
+    if a.deployed is not None:
+        changes["deployed"] = choice(a.deployed, DEPLOY_STATES, "--deployed")
     for attr, column in (
         ("owner", "owner"), ("plan", "plan_path"), ("branch", "branch"), ("worktree", "worktree"),
         ("pr", "pr"), ("gh_issue", "gh_issue"), ("release_tag", "release_tag"), ("evidence", "evidence"),
+        ("deploy_note", "deploy_note"),
     ):
         value = getattr(a, attr)
         if value is not None:
@@ -1197,15 +1424,29 @@ def cmd_set(ctx):
     return {"task": task}, f"Updated {task_id}."
 
 
-def insert_comment(ctx, task_id, kind, body, to_agent=None):
+def insert_comment(ctx, task_id, kind, body, to_agent=None, author=None):
+    """Add a comment. With author, the agent writes down what someone else said; events keep both."""
+    author = author or ctx.agent
     cursor = ctx.conn.execute(
         "INSERT INTO comments(task_id, author, to_agent, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, ctx.agent, to_agent, kind, body, now()),
+        (task_id, author, to_agent, kind, body, now()),
     )
     comment_id = cursor.lastrowid
-    log_event(ctx, task_id, "comment", None, f"#{comment_id} {kind}")
+    written_for = f" as {author}" if author != ctx.agent else ""
+    log_event(ctx, task_id, "comment", None, f"#{comment_id} {kind}{written_for}")
     touch(ctx, task_id)
     return comment_id
+
+
+def author_name(args):
+    """The --as name, or None for the agent itself."""
+    raw = getattr(args, "as_name", None)
+    if raw is None:
+        return None
+    name = raw.strip()
+    if not name:
+        raise usage_error("--as needs a name, such as developer.")
+    return name
 
 
 def fetch_comment(conn, comment_id):
@@ -1215,9 +1456,10 @@ def fetch_comment(conn, comment_id):
 def cmd_comment(ctx):
     a = ctx.args
     kind = choice(a.kind, COMMENT_KINDS, "--kind")
+    author = author_name(a)
     with write_tx(ctx) as conn:
         task_id = get_row(conn, a.id)["id"]
-        comment_id = insert_comment(ctx, task_id, kind, a.text, text_or_null(a.to))
+        comment_id = insert_comment(ctx, task_id, kind, a.text, text_or_null(a.to), author)
     comment = fetch_comment(ctx.conn, comment_id)
     return {"comment": comment, "task": fetch_task(ctx.conn, task_id)}, f"Comment #{comment_id} added to {task_id}."
 
@@ -1254,6 +1496,7 @@ def cmd_ask(ctx):
 
 def cmd_answer(ctx):
     a = ctx.args
+    author = author_name(a)
     with write_tx(ctx) as conn:
         question = get_comment_row(conn, a.comment_id)
         if question["kind"] != "question":
@@ -1261,7 +1504,7 @@ def cmd_answer(ctx):
         if question["resolved"]:
             raise refused("already_resolved", f"Question #{question['id']} is already resolved.")
         task_id = question["task_id"]
-        answer_id = insert_comment(ctx, task_id, "answer", a.text, question["author"])
+        answer_id = insert_comment(ctx, task_id, "answer", a.text, question["author"], author)
         conn.execute("UPDATE comments SET resolved = 1 WHERE id = ?", (question["id"],))
         log_event(ctx, task_id, "comment_resolved", None, f"#{question['id']}")
         settle_needs_confirm(ctx, task_id)
@@ -1399,19 +1642,37 @@ def cmd_done(ctx):
                 (task_id,),
             )
         ]
-        if questions or children:
+        todos = [
+            r["n"]
+            for r in conn.execute(
+                "SELECT n FROM todos WHERE task_id = ? AND removed_at IS NULL AND done = 0 ORDER BY n",
+                (task_id,),
+            )
+        ]
+        if questions or children or todos:
             detail = []
             if questions:
                 detail.append("open questions " + ", ".join(f"#{q}" for q in questions))
             if children:
                 detail.append("open children " + ", ".join(children))
+            if todos:
+                detail.append("open checklist items " + ", ".join(map(str, todos)))
             joined = " and ".join(detail)
             if not a.force:
+                if questions or children:
+                    code, fix = "done_refused", "Close them or pass --force."
+                else:
+                    code = "open_todos"
+                    fix = (
+                        f"Mark them with 'qtask todo {task_id} done N', remove them with "
+                        f"'qtask todo {task_id} rm N', or pass --force."
+                    )
                 raise refused(
-                    "done_refused",
-                    f"{task_id} has {joined}. Close them or pass --force.",
+                    code,
+                    f"{task_id} has {joined}. {fix}",
                     open_questions=questions,
                     open_children=children,
+                    open_todos=todos,
                 )
             log_event(ctx, task_id, "force", None, f"done --force with {joined}")
         apply_changes(
@@ -1492,13 +1753,28 @@ def cmd_report(ctx):
             params,
         )
     ]
+    by_deployed = {d: 0 for d in DEPLOY_STATES}
+    for r in conn.execute(f"SELECT t.deployed, count(*) AS n FROM tasks t {clause} GROUP BY t.deployed", params):
+        by_deployed[r["deployed"]] = r["n"]
+    staging_where = [*where, "t.deployed = 'staging'"]
+    on_staging = [
+        task_dict(r)
+        for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(staging_where)} ORDER BY {SQL_ORDER}", params)
+    ]
+    checklists = [
+        task_dict(r)
+        for r in conn.execute(f"{TASK_SELECT} {open_clause} AND {SQL_OPEN_TODOS} ORDER BY {SQL_ORDER}", params)
+    ]
     left = sum(n for s, n in by_status.items() if s not in CLOSED)
     data = {
         "project": project,
         "counts_by_status": by_status,
         "counts_by_priority": by_priority,
+        "counts_by_deployed": by_deployed,
         "tasks_left": left,
         "parents": parents,
+        "open_checklists": checklists,
+        "on_staging": on_staging,
         "stale_claims": stale,
         "blocked": blocked,
         "waiting_on_developer": {"questions": questions, "tasks": waiting},
@@ -1506,8 +1782,15 @@ def cmd_report(ctx):
     lines = [f"Project: {project or 'all'}", f"Tasks left: {left}"]
     lines.append("By status: " + ", ".join(f"{k} {v}" for k, v in by_status.items() if v))
     lines.append("Open by priority: " + ", ".join(f"{k} {v}" for k, v in by_priority.items()))
+    deployed = [f"{k} {v}" for k, v in by_deployed.items() if v and k != "none"]
+    if deployed:
+        lines.append("Deployed: " + ", ".join(deployed))
     if parents:
         lines += ["", "Parents with progress:"] + [f"  {task_line(t)}" for t in parents]
+    if checklists:
+        lines += ["", "Open checklists:"] + [f"  {task_line(t)}" for t in checklists]
+    if on_staging:
+        lines += ["", "On staging, not on production:"] + [f"  {task_line(t)}" for t in on_staging]
     if stale:
         lines += ["", "Stale claims:"] + [f"  {task_line(t)}" for t in stale]
     if blocked:
@@ -1714,6 +1997,562 @@ def cmd_backup(ctx):
     )
 
 
+# ------------------------------------------------------------------ projects
+
+
+def project_ids(conn, project):
+    """Each prefix of the project's task IDs with its first and last number, oldest first."""
+    rows = conn.execute(
+        f"SELECT {SQL_ID_PREFIX} AS prefix, min({SQL_ID_NUMBER}) AS first_n, max({SQL_ID_NUMBER}) AS last_n, "
+        "count(*) AS tasks FROM tasks WHERE project = ? GROUP BY 1 ORDER BY 2",
+        (project,),
+    )
+    return [{k: r[k] for k in r.keys()} for r in rows]
+
+
+def project_dict(conn, row):
+    return {
+        "name": row["name"],
+        "short_name": row["short_name"],
+        "prefix": row["prefix"],
+        "next_n": row["next_n"],
+        "next_id": f"{row['prefix']}-{row['next_n']}",
+        "created_at": row["created_at"],
+        "ids": project_ids(conn, row["name"]),
+    }
+
+
+def id_span(ids):
+    first, last = f"{ids['prefix']}-{ids['first_n']}", f"{ids['prefix']}-{ids['last_n']}"
+    return first if first == last else f"{first} to {last}"
+
+
+def project_lines(project):
+    lines = [
+        f"Project: {project['name']}",
+        f"Short name: {project['short_name']}",
+        f"Prefix: {project['prefix']}",
+        f"Next ID: {project['next_id']}",
+    ]
+    if project["ids"]:
+        lines.append(f"IDs: {', '.join(id_span(ids) for ids in project['ids'])}")
+    return lines
+
+
+def cmd_project(ctx):
+    a = ctx.args
+    if a.action == "set-prefix":
+        return cmd_set_prefix(ctx)
+    if a.value is not None:
+        raise usage_error("project show takes no value. To change the prefix: qtask project set-prefix QT")
+    conn = ctx.conn
+    project = ctx.scope()
+    if project is None:
+        projects = [project_dict(conn, r) for r in conn.execute("SELECT * FROM projects ORDER BY name").fetchall()]
+        lines = [
+            f"{p['name']}  prefix {p['prefix']}  next {p['next_id']}  short name {p['short_name']}" for p in projects
+        ]
+        return {"projects": projects, "count": len(projects)}, "\n".join(lines) if lines else "No projects."
+    row = conn.execute("SELECT * FROM projects WHERE name = ?", (project,)).fetchone()
+    if row is None:
+        prefix = free_prefix(conn, project)
+        info = {
+            "name": project, "short_name": None, "prefix": prefix, "next_n": 1, "next_id": f"{prefix}-1",
+            "created_at": None, "ids": [],
+        }
+        text = (
+            f"Project {project} has no tasks yet. Its first task will be {prefix}-1. "
+            "Pick another prefix with: qtask project set-prefix XY"
+        )
+        return {"project": info, "exists": False}, text
+    info = project_dict(conn, row)
+    return {"project": info, "exists": True}, "\n".join(project_lines(info))
+
+
+def cmd_set_prefix(ctx):
+    a = ctx.args
+    if a.all:
+        raise usage_error("set-prefix changes one project. Pass --project, not --all.")
+    if a.value is None:
+        raise usage_error("set-prefix needs a prefix of 1 to 6 letters, such as: qtask project set-prefix QT")
+    prefix = a.value.strip().upper()
+    if not PREFIX_RE.fullmatch(prefix):
+        raise usage_error(f"A prefix is 1 to 6 letters from A to Z, such as QT. Got {a.value!r}.", "bad_prefix")
+    project = ctx.project()
+    with write_tx(ctx) as conn:
+        owners = prefix_owners(conn).get(prefix, set())
+        others = sorted(p for p in owners if p.casefold() != project.casefold())
+        if others:
+            raise refused(
+                "prefix_taken",
+                f"Project {others[0]} uses the prefix {prefix} for current or earlier IDs. Pick another prefix.",
+                project=others[0],
+            )
+        row = conn.execute("SELECT * FROM projects WHERE name = ?", (project,)).fetchone()
+        old = row["prefix"] if row else None
+        if row is None:
+            row = ensure_project(conn, project, prefix)
+        elif old != prefix:
+            conn.execute("UPDATE projects SET prefix = ? WHERE name = ?", (prefix, row["name"]))
+        row = conn.execute("SELECT * FROM projects WHERE name = ?", (row["name"],)).fetchone()
+    info = project_dict(ctx.conn, row)
+    if old == prefix:
+        text = f"{info['name']} already uses the prefix {prefix}. Next ID: {info['next_id']}."
+    else:
+        text = (
+            f"{info['name']} now uses the prefix {prefix}. Next ID: {info['next_id']}. "
+            "Existing IDs stay as they are."
+        )
+    return {"project": info, "changed": old != prefix, "old_prefix": old}, text
+
+
+# ------------------------------------------------------------------- commits
+
+
+def check_revision(raw):
+    rev = raw.strip()
+    if not rev or rev.startswith("-"):
+        raise usage_error(f"{raw!r} is not a revision. Pass a commit such as HEAD or a hash.", "bad_revision")
+    return rev
+
+
+def check_range(raw):
+    rev = check_revision(raw)
+    if ".." not in rev:
+        raise usage_error(
+            f"--range needs two revisions with .. between them, such as main..HEAD. Got {raw!r}.", "bad_revision"
+        )
+    return rev
+
+
+def range_not_found(rev_range):
+    message = f"git cannot read the range {rev_range} in this repo."
+    return QtaskError("commit_not_found", message, EXIT_NOT_FOUND, rev=rev_range)
+
+
+def log_commits(*rev_args):
+    """Commits from git log (sha, authored_at, subject), or None when git refuses the revisions."""
+    result = git_result("log", "--no-show-signature", "--no-color", "--format=%H%x00%at%x00%s", *rev_args, "--")
+    if result is None or result.returncode != 0:
+        return None
+    commits = []
+    for line in result.stdout.splitlines():
+        if line:
+            sha, stamp, subject = line.split("\x00", 2)
+            moment = datetime.fromtimestamp(int(stamp), timezone.utc)
+            commits.append({"sha": sha, "authored_at": iso(moment), "subject": subject})
+    return commits
+
+
+def resolve_commit(raw):
+    rev = check_revision(raw)
+    sha = run_git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    commits = log_commits("--max-count=1", sha) if sha else None
+    if not commits:
+        raise QtaskError("commit_not_found", f"git finds no commit {rev} in this repo.", EXIT_NOT_FOUND, rev=rev)
+    return commits[0]
+
+
+def reachable(sha):
+    """True when a local branch, a tag or HEAD contains the commit."""
+    result = git_result("rev-list", "--max-count=1", sha, "--not", "--branches", "--tags", "HEAD", "--")
+    return result is not None and result.returncode == 0 and not result.stdout.strip()
+
+
+def short_commit(commit):
+    return {"sha": commit["sha"], "subject": commit["subject"]}
+
+
+def cmd_commit(ctx):
+    a = ctx.args
+    if a.rebased:
+        if a.revs or a.range or a.note is not None:
+            raise usage_error("--rebased takes no REV, --range or --note. Run it alone after a rebase.")
+        return relink_commits(ctx)
+    task_id = get_row(ctx.conn, a.id)["id"]
+    require_repo()
+    found = [resolve_commit(rev) for rev in a.revs or ([] if a.range else ["HEAD"])]
+    if a.range:
+        rev_range = check_range(a.range)
+        commits = log_commits("--reverse", rev_range)
+        if commits is None:
+            raise range_not_found(rev_range)
+        if not commits:
+            raise usage_error(f"The range {rev_range} has no commits.", "empty_range")
+        found += commits
+    note = text_or_null(a.note)
+    branch = run_git("branch", "--show-current")
+    repo = detect_project()
+    linked, already, seen = [], [], set()
+    with write_tx(ctx) as conn:
+        at = now()
+        for commit in found:
+            if commit["sha"] in seen:
+                continue
+            seen.add(commit["sha"])
+            if conn.execute(
+                "SELECT 1 FROM commits WHERE task_id = ? AND sha = ?", (task_id, commit["sha"])
+            ).fetchone():
+                already.append(commit)
+                continue
+            conn.execute(
+                "INSERT INTO commits(task_id, sha, subject, authored_at, branch, repo, note, agent, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, commit["sha"], commit["subject"], commit["authored_at"], branch, repo, note, ctx.agent, at),
+            )
+            log_event(ctx, task_id, "commit", None, commit["sha"], at)
+            linked.append(commit)
+        if linked:
+            touch(ctx, task_id)
+    lines = []
+    if linked:
+        lines.append(f"Linked {len(linked)} commit{'s' if len(linked) > 1 else ''} to {task_id}:")
+        lines += [f"  {c['sha'][:7]} {c['subject']}" for c in linked]
+    if already:
+        lines.append(f"Already linked to {task_id}: {', '.join(c['sha'][:7] for c in already)}")
+    data = {
+        "task_id": task_id,
+        "linked": [short_commit(c) for c in linked],
+        "already_linked": [short_commit(c) for c in already],
+        "commits": fetch_commits(ctx.conn, task_id),
+    }
+    return data, "\n".join(lines)
+
+
+def relink_commits(ctx):
+    """After a rebase, point each stored commit that left history at its copy with the same subject."""
+    task_id = get_row(ctx.conn, ctx.args.id)["id"]
+    require_repo()
+    repo = detect_project()
+    stored = ctx.conn.execute(
+        "SELECT * FROM commits WHERE task_id = ? ORDER BY authored_at, id", (task_id,)
+    ).fetchall()
+    history = log_commits(f"--max-count={RELINK_HISTORY}", "HEAD") or []
+    branch = run_git("branch", "--show-current")
+    result = {"task_id": task_id, "moved": [], "not_found": [], "ambiguous": [], "other_repo": [], "unchanged": 0}
+    plan, used = [], set()
+    for row in stored:
+        if row["repo"] and repo and row["repo"].casefold() != repo.casefold():
+            result["other_repo"].append({**short_commit(row), "repo": row["repo"]})
+            continue
+        if reachable(row["sha"]):
+            result["unchanged"] += 1
+            continue
+        same = [c for c in history if c["subject"] == row["subject"] and c["sha"] not in used]
+        exact = [c for c in same if c["authored_at"] == row["authored_at"]]
+        pick = exact or same
+        if len(pick) == 1:
+            used.add(pick[0]["sha"])
+            plan.append((row, pick[0]))
+        elif pick:
+            result["ambiguous"].append({**short_commit(row), "candidates": [c["sha"] for c in pick]})
+        else:
+            result["not_found"].append(short_commit(row))
+    with write_tx(ctx) as conn:
+        for row, new in plan:
+            current = conn.execute("SELECT sha FROM commits WHERE id = ?", (row["id"],)).fetchone()
+            if current is None or current["sha"] != row["sha"]:
+                continue  # Another agent moved it in the meantime.
+            if conn.execute("SELECT 1 FROM commits WHERE task_id = ? AND sha = ?", (task_id, new["sha"])).fetchone():
+                conn.execute("DELETE FROM commits WHERE id = ?", (row["id"],))
+            else:
+                conn.execute(
+                    "UPDATE commits SET sha = ?, authored_at = ?, branch = coalesce(?, branch), "
+                    "repo = coalesce(repo, ?) WHERE id = ?",
+                    (new["sha"], new["authored_at"], branch, repo, row["id"]),
+                )
+            log_event(ctx, task_id, "commit", row["sha"], new["sha"])
+            result["moved"].append({"old_sha": row["sha"], "sha": new["sha"], "subject": row["subject"]})
+        if result["moved"]:
+            touch(ctx, task_id)
+    result["commits"] = fetch_commits(ctx.conn, task_id)
+    lines = []
+    if result["moved"]:
+        count = len(result["moved"])
+        lines.append(f"Moved {count} commit link{'s' if count > 1 else ''} on {task_id}:")
+        lines += [f"  {m['old_sha'][:7]} -> {m['sha'][:7]} {m['subject']}" for m in result["moved"]]
+    if result["not_found"]:
+        lines.append(f"No commit with the same subject in the last {RELINK_HISTORY} commits of HEAD:")
+        lines += [f"  {c['sha'][:7]} {c['subject']}" for c in result["not_found"]]
+    if result["ambiguous"]:
+        lines.append("Several commits have the same subject. Link the right one with qtask commit ID REV:")
+        lines += [f"  {c['sha'][:7]} {c['subject']}" for c in result["ambiguous"]]
+    if result["other_repo"]:
+        lines.append("Commits from another repo. Run this there:")
+        lines += [f"  {c['sha'][:7]} {c['subject']} ({c['repo']})" for c in result["other_repo"]]
+    if result["unchanged"]:
+        lines.append(f"{result['unchanged']} still in history, unchanged.")
+    return result, "\n".join(lines) if lines else f"{task_id} has no linked commits."
+
+
+def cmd_which(ctx):
+    conn = ctx.conn
+    rev = check_revision(ctx.args.rev)
+    sha = None
+    if run_git("rev-parse", "--show-toplevel") is not None:
+        sha = run_git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    if sha:
+        rows = conn.execute("SELECT * FROM commits WHERE sha = ? ORDER BY task_id", (sha,)).fetchall()
+    elif re.fullmatch(r"[0-9a-fA-F]{4,40}", rev):
+        rows = conn.execute(
+            "SELECT * FROM commits WHERE sha LIKE ? ORDER BY sha, task_id", (rev.lower() + "%",)
+        ).fetchall()
+    else:
+        raise QtaskError(
+            "commit_not_found",
+            f"git finds no commit {rev} here, and {rev} is not a hash of 4 or more hex digits.",
+            EXIT_NOT_FOUND,
+            rev=rev,
+        )
+    links = [
+        {"commit": {k: r[k] for k in r.keys() if k != "id"}, "task": fetch_task(conn, r["task_id"])} for r in rows
+    ]
+    lines = [f"{link['commit']['sha'][:7]} -> {task_line(link['task'])}" for link in links]
+    data = {"rev": rev, "sha": sha, "links": links, "count": len(links)}
+    return data, "\n".join(lines) if lines else f"No task links commit {rev}."
+
+
+# ---------------------------------------------------------------------- scan
+
+
+DIFF_ARGS = ("--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U0", "--src-prefix=a/", "--dst-prefix=b/")
+PATH_END = r"[^\s\"'`<>()\[\]{},;]*"
+
+
+def home_spellings():
+    """The ways a file could spell QTASK_HOME: as is, with either slash, Git Bash style, from ~."""
+    forward = str(qtask_home()).replace("\\", "/").rstrip("/")
+    spellings = {forward, forward.replace("/", "\\")}
+    drive = re.match(r"^([A-Za-z]):(/.*)$", forward)
+    if drive:
+        spellings.add(f"/{drive.group(1).lower()}{drive.group(2)}")
+    user = str(Path.home()).replace("\\", "/").rstrip("/")
+    if forward.casefold().startswith(user.casefold() + "/"):
+        spellings.add("~" + forward[len(user):])
+    return sorted((s for s in spellings if len(s.strip("/\\~:")) >= 3), key=len, reverse=True)
+
+
+def scan_rules(conn):
+    """Prefixes in use and the patterns for task IDs and qtask paths."""
+    prefixes = sorted(prefix_owners(conn), key=lambda p: (-len(p), p))
+    id_re = None
+    if prefixes:
+        alternatives = "|".join(map(re.escape, prefixes))
+        id_re = re.compile(rf"(?<![A-Za-z0-9])(?:{alternatives})-[0-9]+(?![A-Za-z0-9])", re.IGNORECASE)
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    path_res = [re.compile(rf"{PATH_END}(?<![\w.])\.qtask(?!\w){PATH_END}")]
+    path_res += [re.compile(re.escape(s) + PATH_END, flags) for s in home_spellings()]
+    return prefixes, id_re, path_res
+
+
+def line_matches(rules, text):
+    """(kind, matched text) for each match in a line. A path wins over an ID inside it."""
+    _, id_re, path_res = rules
+    spans = []
+    if id_re:
+        spans += [(m.start(), m.end(), "task_id", m.group(0).upper()) for m in id_re.finditer(text)]
+    for pattern in path_res:
+        spans += [(m.start(), m.end(), "qtask_path", m.group(0).rstrip(".:")) for m in pattern.finditer(text)]
+    spans.sort(key=lambda s: (s[0], s[0] - s[1]))
+    kept, end = [], -1
+    for start, stop, kind, match in spans:
+        if start >= end:
+            kept.append((kind, match))
+            end = stop
+    return kept
+
+
+def message_lines(text, from_file):
+    """Numbered lines of a commit message. From a file, skip git's comment lines and the diff below them."""
+    for number, line in enumerate(text.split("\n"), 1):
+        if from_file and line.rstrip() == SCISSORS:
+            break
+        if from_file and line.startswith("#"):
+            continue
+        yield number, line
+
+
+def diff_path(raw):
+    raw = raw.rstrip("\t")
+    if raw == "/dev/null":
+        return None
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        raw = re.sub(r"\\(.)", lambda m: {"t": "\t", "n": "\n"}.get(m.group(1), m.group(1)), raw[1:-1])
+    return raw[2:] if raw.startswith("b/") else raw
+
+
+def added_lines(diff):
+    """(file, line number, text) of each added line in a unified diff."""
+    path, number, in_hunk = None, 0, False
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            path, in_hunk = None, False
+        elif not in_hunk and line.startswith("+++ "):
+            path = diff_path(line[4:])
+        elif line.startswith("@@"):
+            match = re.match(r"^@@+ (?:-[0-9,]+ )+\+([0-9]+)", line)
+            number, in_hunk = (int(match.group(1)) if match else 0), True
+        elif in_hunk and path is not None:
+            if line.startswith("+"):
+                yield path, number, line[1:]
+                number += 1
+            elif line.startswith(" "):
+                number += 1
+
+
+def range_log(rev_range):
+    """(sha, message, patch) for each commit of a range."""
+    result = git_result(
+        "-c", "core.quotePath=false", "log", "--no-show-signature", *DIFF_ARGS, "-p",
+        "--format=%x01%H%x02%B%x03", rev_range, "--", timeout=SCAN_TIMEOUT,
+    )
+    if result is None or result.returncode != 0:
+        raise range_not_found(rev_range)
+    for chunk in result.stdout.split("\x01")[1:]:
+        sha, _, rest = chunk.partition("\x02")
+        message, _, patch = rest.partition("\x03")
+        yield sha, message, patch
+
+
+def cmd_scan(ctx):
+    a = ctx.args
+    from_file = a.message_file is not None
+    if a.message is not None and from_file:
+        raise usage_error("Pass --message or --message-file, not both.")
+    message = a.message_text if from_file else a.message
+    if a.range and (message is not None or a.staged):
+        raise usage_error("Pass --range alone. It covers the messages and the changes of those commits.")
+    rules = scan_rules(ctx.conn)
+    lines, sources = [], []  # lines: (where, file, line, commit, text)
+    if message is not None:
+        sources.append("the commit message")
+        lines += [(f"commit message, line {n}", None, n, None, text) for n, text in message_lines(message, from_file)]
+    if a.staged or (message is None and not a.range):
+        require_repo()
+        sources.append("the staged changes")
+        diff = git_text("-c", "core.quotePath=false", "diff", "--cached", *DIFF_ARGS, timeout=SCAN_TIMEOUT)
+        lines += [(f"{path}:{n}", path, n, None, text) for path, n, text in added_lines(diff)]
+    if a.range:
+        require_repo()
+        rev_range = check_range(a.range)
+        sources.append(f"the commits {rev_range}")
+        for sha, body, patch in range_log(rev_range):
+            short = sha[:7]
+            lines += [
+                (f"{short} commit message, line {n}", None, n, sha, text) for n, text in message_lines(body, False)
+            ]
+            lines += [(f"{short} {path}:{n}", path, n, sha, text) for path, n, text in added_lines(patch)]
+    found = [(line, line_matches(rules, line[4])) for line in lines]
+    candidates = {match for _, matches in found for kind, match in matches if kind == "task_id"}
+    existing = set()
+    if candidates:
+        known = hit_table(ctx.conn, "scan_ids", candidates)
+        existing = {r["id"] for r in ctx.conn.execute(f"SELECT id FROM tasks WHERE id IN {known}")}
+    hits = []
+    for (where, path, number, sha, text), matches in found:
+        for kind, match in matches:
+            if kind == "qtask_path" or match in existing:
+                hits.append(
+                    {"where": where, "file": path, "line": number, "commit": sha, "kind": kind, "match": match,
+                     "text": text.strip()[:200]}
+                )
+    scanned = " and ".join(sources)
+    if hits:
+        listing = "\n".join(f"  {h['where']}: {h['match']}" for h in hits)
+        raise refused(
+            "task_ids_found",
+            f"Found task IDs or qtask paths in {scanned}. Other people cannot open them, and an ID "
+            f"reads like a ticket of another tracker:\n{listing}\n"
+            "Name the work itself (feature, file, commit hash) and keep the link in qtask.",
+            hits=hits,
+            prefixes=rules[0],
+        )
+    return {"hits": [], "sources": sources, "prefixes": rules[0]}, f"No task IDs or qtask paths in {scanned}."
+
+
+# ---------------------------------------------------------------- checklists
+
+
+def cmd_todo(ctx):
+    a = ctx.args
+    changed = []
+    if a.action is None:
+        task_id = get_row(ctx.conn, a.id)["id"]
+    else:
+        with write_tx(ctx) as conn:
+            row = get_row(conn, a.id)
+            task_id = row["id"]
+            at = now()
+            if a.action == "add":
+                if row["status"] in CLOSED:
+                    raise refused(
+                        "task_closed",
+                        f"{task_id} is {row['status']}. Add the item to an open task, or reopen this one "
+                        f"with qtask set {task_id} --status ready.",
+                        status=row["status"],
+                    )
+                n = conn.execute(
+                    "SELECT coalesce(max(n), 0) + 1 FROM todos WHERE task_id = ?", (task_id,)
+                ).fetchone()[0]
+                body = a.text.strip()
+                conn.execute(
+                    "INSERT INTO todos(task_id, n, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (task_id, n, body, ctx.agent, at),
+                )
+                log_event(ctx, task_id, "todo", None, f"{n} added: {body}", at)
+                changed.append(n)
+            else:
+                items = []
+                for n in a.numbers:
+                    item = conn.execute(
+                        "SELECT * FROM todos WHERE task_id = ? AND n = ? AND removed_at IS NULL", (task_id, n)
+                    ).fetchone()
+                    if item is None:
+                        raise QtaskError(
+                            "todo_not_found",
+                            f"{task_id} has no checklist item {n}. List them with: qtask todo {task_id}",
+                            EXIT_NOT_FOUND,
+                            n=n,
+                        )
+                    items.append(item)
+                for item in items:
+                    n, state = item["n"], "done" if item["done"] else "open"
+                    if a.action == "rm":
+                        conn.execute("UPDATE todos SET removed_at = ? WHERE task_id = ? AND n = ?", (at, task_id, n))
+                        log_event(ctx, task_id, "todo", f"{n} {state}: {item['body']}", f"{n} removed", at)
+                    else:
+                        new_state = "done" if a.action == "done" else "open"
+                        if new_state == state:
+                            continue
+                        conn.execute(
+                            "UPDATE todos SET done = ?, done_at = ? WHERE task_id = ? AND n = ?",
+                            (int(new_state == "done"), at if new_state == "done" else None, task_id, n),
+                        )
+                        log_event(ctx, task_id, "todo", f"{n} {state}", f"{n} {new_state}", at)
+                    changed.append(n)
+            if changed:
+                touch(ctx, task_id)
+    task = fetch_task(ctx.conn, task_id)
+    todos = fetch_todos(ctx.conn, task_id)
+    lines = []
+    if a.action:
+        numbers = ", ".join(map(str, changed))
+        said = {
+            "add": f"Added item {numbers} to {task_id}.",
+            "done": f"Marked {numbers} done on {task_id}.",
+            "undo": f"Reopened {numbers} on {task_id}.",
+            "rm": f"Removed {numbers} from {task_id}.",
+        }
+        lines.append(said[a.action] if changed else f"Nothing changed on {task_id}.")
+    if todos:
+        lines.append(f"{task_id} checklist, {task['todo_progress']} done:")
+        lines += [f"  {todo_line(t)}" for t in todos]
+    else:
+        lines.append(f'{task_id} has no checklist items. Add one with: qtask todo {task_id} add "text"')
+    data = {"task_id": task_id, "todos": todos, "progress": task["todo_progress"], "changed": changed, "task": task}
+    return data, "\n".join(lines)
+
+
 # -------------------------------------------------------------------- parser
 
 
@@ -1789,11 +2628,14 @@ def build_parser():
     add_filters(p)
     p.add_argument("--status", action="append", help="repeatable")
     p.add_argument("--include-closed", action="store_true")
+    p.add_argument(
+        "--deployed", help=f"{', '.join(DEPLOY_STATES)}; lists closed tasks too unless --status is given"
+    )
 
     p = command("ready", cmd_ready, "List tasks an agent can claim now.")
     add_filters(p)
 
-    p = command("show", cmd_show, "Show a task with children, comments, links and events.")
+    p = command("show", cmd_show, "Show a task with its checklist, children, links, commits, comments and events.")
     p.add_argument("id")
 
     p = command("search", cmd_search, "Search tasks and comments.")
@@ -1825,6 +2667,8 @@ def build_parser():
     p.add_argument("--release-tag")
     p.add_argument("--visibility", help=", ".join(VISIBILITIES))
     p.add_argument("--evidence")
+    p.add_argument("--deployed", help=f"where the work runs: {', '.join(DEPLOY_STATES)}")
+    p.add_argument("--deploy-note", help="what to know about the deploy, such as a flag to keep off")
     p.add_argument("--parent")
     p.add_argument("--add-tag", action="append", help="repeatable")
     p.add_argument("--remove-tag", action="append", help="repeatable")
@@ -1834,6 +2678,7 @@ def build_parser():
     add_text(p, "comment text")
     p.add_argument("--to", help="address the comment to an agent")
     p.add_argument("--kind", default="note", help=", ".join(COMMENT_KINDS))
+    p.add_argument("--as", dest="as_name", metavar="NAME", help="write down what NAME said; NAME is the author")
 
     p = command("resolve", cmd_resolve, "Mark a comment resolved.")
     p.add_argument("comment_id")
@@ -1846,6 +2691,10 @@ def build_parser():
     p = command("answer", cmd_answer, "Answer a question and resolve it.")
     p.add_argument("comment_id")
     add_text(p, "answer text")
+    p.add_argument(
+        "--as", dest="as_name", metavar="NAME",
+        help="record an answer NAME gave you, such as the developer in chat; NAME is the author",
+    )
 
     p = command("inbox", cmd_inbox, "Questions and comments for an agent, plus owned tasks waiting on them.")
     p.add_argument("--for", dest="for_agent", help="agent name, default the current agent")
@@ -1863,7 +2712,9 @@ def build_parser():
     p = command("done", cmd_done, "Close a task with evidence.")
     p.add_argument("id")
     p.add_argument("--evidence", help="commands you ran and their results; required")
-    p.add_argument("--force", action="store_true", help="close despite open questions or children")
+    p.add_argument(
+        "--force", action="store_true", help="close despite open questions, children or checklist items"
+    )
 
     p = command("drop", cmd_drop, "Close a task without doing it.")
     p.add_argument("id")
@@ -1883,6 +2734,57 @@ def build_parser():
     p.add_argument("id", nargs="?")
 
     command("backup", cmd_backup, "Write a database backup and a JSONL export.")
+
+    p = command(
+        "project", cmd_project,
+        "Show the project: name, short name, ID prefix and next ID. --all lists every project. "
+        "set-prefix PREFIX changes the prefix of new IDs; existing IDs stay as they are.",
+    )
+    p.add_argument("action", nargs="?", choices=("show", "set-prefix"), help="show (default) or set-prefix")
+    p.add_argument("value", nargs="?", metavar="PREFIX", help="for set-prefix: 1 to 6 letters, such as QT")
+
+    p = command(
+        "commit", cmd_commit,
+        "Link commits to a task: HEAD when you pass no REV. Run it in the repo of the commits. "
+        "--rebased moves the links after a rebase or amend.",
+    )
+    p.add_argument("id")
+    p.add_argument("revs", nargs="*", metavar="REV", help="commits to link, default HEAD")
+    p.add_argument("--range", metavar="A..B", help="link every commit in the range, oldest first")
+    p.add_argument("--note", help="a short note for these links")
+    p.add_argument(
+        "--rebased", action="store_true",
+        help=f"match each linked commit that left history to a commit with the same subject "
+        f"in the last {RELINK_HISTORY} commits of HEAD",
+    )
+
+    p = command("which", cmd_which, "List the tasks a commit is linked to. Takes a full or short hash, or HEAD.")
+    p.add_argument("rev", metavar="REV")
+
+    p = command(
+        "scan", cmd_scan,
+        "Check text that will be public for task IDs and qtask paths. Default: the added lines of the "
+        "staged changes. Exit 4 with code task_ids_found when it finds any.",
+    )
+    p.add_argument("--message", metavar="TEXT", help="check this commit message")
+    p.add_argument(
+        "--message-file", metavar="PATH",
+        help="check a commit message file, such as the one a commit-msg hook gets; skips # lines",
+    )
+    p.add_argument(
+        "--staged", action="store_true", help="with --message or --message-file, check the staged changes too"
+    )
+    p.add_argument("--range", metavar="A..B", help="check the messages and added lines of these commits")
+
+    p = command(
+        "todo", cmd_todo,
+        "Checklist inside a task. 'todo ID' lists it; 'todo ID add TEXT', 'done N', 'undo N' and 'rm N' "
+        "change it. Numbers stay the same after rm. done refuses while items are open.",
+    )
+    p.add_argument("id")
+    p.add_argument("action", nargs="?", choices=TODO_ACTIONS, help="leave out to list the checklist")
+    p.add_argument("values", nargs="*", metavar="TEXT_OR_N", help="item text for add, item numbers otherwise")
+    p.add_argument("--body-file", help="for add: read the item text from a UTF-8 file, or stdin with -")
     return parser
 
 

@@ -68,6 +68,8 @@ HAS_FTS5 = sqlite_has_fts5()
 ARABIC ="إصلاح زر الإرسال «ذاكر» في الاختبار"
 RACE_ROUNDS = 5
 RACE_PROCESSES = 20
+LATEST_SCHEMA = 5
+SCISSORS = "# ------------------------ >8 ------------------------"
 
 
 def tearDownModule():
@@ -190,7 +192,7 @@ class AddRace(Base):
         self.assertEqual(len(set(ids)), RACE_PROCESSES)
         self.assertEqual(sorted(int(i.split("-")[1]) for i in ids), list(range(1, RACE_PROCESSES + 1)))
         self.assertEqual(self.sql("SELECT count(*) FROM tasks")[0][0], RACE_PROCESSES)
-        self.assertEqual(self.sql("SELECT count(*) FROM schema_version")[0][0], 2)
+        self.assertEqual(self.sql("SELECT count(*) FROM schema_version")[0][0], LATEST_SCHEMA)
 
     def test_daily_backup_runs_once_under_race(self):
         self.race([["add", f"task {i}", "--project", self.project] for i in range(RACE_PROCESSES)])
@@ -575,7 +577,9 @@ class Fields(Base):
         self.js("link", parent, "--relates", other)
         self.js("comment", parent, "note")
         data = self.js("show", parent.lower())
-        self.assertEqual(set(data), {"ok", "task", "children", "comments", "links", "events"})
+        self.assertEqual(
+            set(data), {"ok", "task", "children", "todos", "comments", "links", "commits", "events"}
+        )
         self.assertEqual([c["id"] for c in data["children"]], [child])
         self.assertEqual(data["links"]["relates"], [other])
         self.assertEqual(data["comments"][0]["body"], "note")
@@ -617,7 +621,9 @@ class Fields(Base):
     def test_migration_is_idempotent_and_refuses_newer_schema(self):
         self.add()
         self.add()
-        self.assertEqual(self.sql("SELECT version FROM schema_version"), [(1,), (2,)])
+        self.assertEqual(
+            self.sql("SELECT version FROM schema_version"), [(n,) for n in range(1, LATEST_SCHEMA + 1)]
+        )
         self.assertEqual(self.sql("PRAGMA journal_mode")[0][0], "wal")
         self.sql("INSERT INTO schema_version(version, applied_at) VALUES (999, 'x')")
         self.assertEqual(self.js("ls", "--all", expect=1)["error"]["code"], "schema_too_new")
@@ -918,7 +924,7 @@ class Plans(Base):
         old_file.write_text("# Old plan\n", encoding="utf-8")
         new_path = Path(self.plan("new")["path"])
         self.assertEqual(new_path.parent.parent.name, "quill")
-        self.assertEqual(self.sql("SELECT max(version) FROM schema_version"), [(2,)])
+        self.assertEqual(self.sql("SELECT max(version) FROM schema_version"), [(LATEST_SCHEMA,)])
         self.assertEqual(
             sorted(self.sql("SELECT name, short_name FROM projects")),
             [("acme/Quill", "quill"), ("two/quill", "quill2")],
@@ -1040,6 +1046,18 @@ class ShellLauncher(LauncherHelpers):
         self.assertIn("rc=0", result.stdout, result.stderr)
         data = self.js("show", task)["task"]
         self.assertEqual((data["worktree"], data["plan_path"]), ("/tmp/x", "/c/Users/x.md"))
+
+    def test_body_file_in_tmp(self):
+        """The launcher keeps /tmp/x as written, so on Git Bash qtask finds the Windows folder itself."""
+        task = self.add()
+        name = f"qtask-test-{os.getpid()}-{time.time_ns()}.md"
+        result = self.bash(
+            f"printf '%s' '{ARABIC}' > /tmp/{name}\n"
+            f"sh '{self.launcher()}' comment {task} --body-file /tmp/{name}; echo rc=$?\n"
+            f"rm -f /tmp/{name}\n"
+        )
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        self.assertEqual(self.js("show", task)["comments"][0]["body"], ARABIC)
 
 
 @unittest.skipUnless(WINDOWS, "launchers/qtask.cmd is for Windows")
@@ -1171,6 +1189,529 @@ class Hardening(Base):
         self.js("add", "x", "--project", self.project, env={**self.env, "QTASK_HOME": str(home)})
         self.assertEqual(stat.S_IMODE(home.stat().st_mode) & 0o077, 0)
         self.assertEqual(stat.S_IMODE((home / "qtask.db").stat().st_mode) & 0o077, 0)
+
+
+class Prefixes(Base):
+    def test_new_prefix_keeps_the_counter_and_old_ids(self):
+        first, second = self.add("one"), self.add("two")
+        self.assertEqual([first, second], ["APP-1", "APP-2"])
+        data = self.js("project", "set-prefix", "qt", "--project", self.project)
+        self.assertEqual((data["changed"], data["old_prefix"]), (True, "APP"))
+        self.assertEqual(data["project"]["next_id"], "QT-3")
+        third = self.add("three")
+        self.assertEqual(third, "QT-3")
+        self.assertEqual(self.js("show", "app-1")["task"]["title"], "one")
+        self.assertEqual(self.js("show", "qt-3")["task"]["title"], "three")
+        self.assertEqual(self.ls("ls"), ["APP-1", "APP-2", "QT-3"])
+        self.js("done", first, "--evidence", "e")
+        self.assertEqual(self.js("report", "--project", self.project)["tasks_left"], 2)
+        info = self.js("project", "--project", self.project)["project"]
+        self.assertEqual(
+            [(i["prefix"], i["first_n"], i["last_n"]) for i in info["ids"]], [("APP", 1, 2), ("QT", 3, 3)]
+        )
+        text = self.run_qtask("project", "--project", self.project).stdout
+        self.assertIn("Prefix: QT", text)
+        self.assertIn("IDs: APP-1 to APP-2, QT-3", text)
+        self.assertEqual(self.js("project", "set-prefix", "QT", "--project", self.project)["changed"], False)
+        self.js("project", "set-prefix", "APP", "--project", self.project)
+        self.assertEqual(self.add("back"), "APP-4")
+
+    def test_bad_prefixes(self):
+        self.add()
+        for value in ("Q1", "TOOLONG", "", "Q-T", "ق"):
+            error = self.js("project", "set-prefix", value, "--project", self.project, expect=2)["error"]
+            self.assertEqual(error["code"], "bad_prefix", value)
+        self.js("project", "set-prefix", "--project", self.project, expect=2)
+        self.js("project", "show", "XY", "--project", self.project, expect=2)
+        self.js("project", "set-prefix", "XY", "--all", expect=2)
+        self.assertEqual(self.js("project", "--project", self.project)["project"]["prefix"], "APP")
+
+    def test_prefix_of_another_project_now_or_before_is_refused(self):
+        self.add("a", project="x/alpha")
+        self.add("b", project="x/beta")
+        error = self.js("project", "set-prefix", "ALP", "--project", "x/beta", expect=4)["error"]
+        self.assertEqual((error["code"], error["project"]), ("prefix_taken", "x/alpha"))
+        self.js("project", "set-prefix", "AL", "--project", "x/alpha")
+        error = self.js("project", "set-prefix", "ALP", "--project", "x/beta", expect=4)["error"]
+        self.assertEqual(error["code"], "prefix_taken")
+        self.assertEqual(self.add("c", project="y/alpha"), "ALP2-1")
+
+    def test_set_prefix_before_the_first_task(self):
+        shown = self.js("project", "--project", self.project)
+        self.assertEqual((shown["exists"], shown["project"]["next_id"]), (False, "APP-1"))
+        self.js("project", "set-prefix", "QT", "--project", self.project)
+        self.assertEqual(self.add(), "QT-1")
+        self.assertEqual(self.add("other", project="z/app"), "APP-1")
+        listed = self.js("project", "--all")["projects"]
+        self.assertEqual({(p["name"], p["prefix"]) for p in listed}, {(self.project, "QT"), ("z/app", "APP")})
+
+
+class GitBase(Base):
+    """A temp repo whose remote makes its project acme/app, with git config kept out of the tests."""
+
+    def setUp(self):
+        super().setUp()
+        config = Path(self.home, "gitconfig")
+        config.write_text("", encoding="utf-8")
+        self.env.update({
+            "GIT_AUTHOR_NAME": "Tester", "GIT_AUTHOR_EMAIL": "tester@example.com",
+            "GIT_COMMITTER_NAME": "Tester", "GIT_COMMITTER_EMAIL": "tester@example.com",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(config),
+        })
+        self.repo = self.new_repo("my-repo", "https://example.com/acme/app.git")
+
+    def new_repo(self, name, remote):
+        repo = str(Path(self.home, name))
+        os.mkdir(repo)
+        self.git("init", "-q", "-b", "main", cwd=repo)
+        self.git("remote", "add", "origin", remote, cwd=repo)
+        return repo
+
+    def git(self, *args, cwd=None, env=None):
+        result = subprocess.run(
+            ["git", *args], cwd=cwd or self.repo, capture_output=True, encoding="utf-8", env=env or self.env
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def commit(self, message, name="file.txt", text=None, date=None, cwd=None):
+        with open(Path(cwd or self.repo, name), "a", encoding="utf-8", newline="\n") as handle:
+            handle.write((text or message) + "\n")
+        self.git("add", name, cwd=cwd)
+        env = {**self.env, "GIT_AUTHOR_DATE": date} if date else None
+        self.git("commit", "-q", "-m", message, cwd=cwd, env=env)
+        return self.git("rev-parse", "HEAD", cwd=cwd)
+
+    def q(self, *args, expect=0, agent=None):
+        return self.js(*args, cwd=self.repo, expect=expect, agent=agent)
+
+
+class Commits(GitBase):
+    def test_link_head_revs_and_range(self):
+        task = self.add()
+        base = self.commit("Add the base")
+        linked = self.q("commit", task, agent="a")
+        self.assertEqual(linked["linked"], [{"sha": base, "subject": "Add the base"}])
+        again = self.q("commit", task, "HEAD")
+        self.assertEqual((again["linked"], again["already_linked"]), ([], [{"sha": base, "subject": "Add the base"}]))
+        second = self.commit("Add the second")
+        third = self.commit("Add the third")
+        ranged = self.q("commit", task, "--range", f"{base}..HEAD", "--note", "the follow-up")
+        self.assertEqual([c["sha"] for c in ranged["linked"]], [second, third])
+        commits = self.js("show", task)["commits"]
+        self.assertEqual([c["sha"] for c in commits], [base, second, third])
+        self.assertEqual(
+            (commits[0]["subject"], commits[0]["branch"], commits[0]["repo"], commits[0]["agent"]),
+            ("Add the base", "main", "acme/app", "a"),
+        )
+        self.assertEqual(commits[2]["note"], "the follow-up")
+        self.assertRegex(commits[0]["authored_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        events = [e for e in self.js("show", task)["events"] if e["field"] == "commit"]
+        self.assertEqual([e["new"] for e in events], [base, second, third])
+        text = self.run_qtask("show", task).stdout
+        self.assertIn(f"Commits:\n  {base[:7]} Add the base (main)", text)
+        self.assertIn(f"{third[:7]} Add the third (main). Note: the follow-up", text)
+        other = self.add("other")
+        self.q("commit", other, base[:8])
+        self.assertEqual(len(self.q("commit", other, "HEAD", "HEAD")["linked"]), 1)
+
+    def test_which(self):
+        task, other = self.add("one"), self.add("two")
+        sha = self.commit("Shared work")
+        self.q("commit", task)
+        self.q("commit", other)
+        for rev in (sha, sha[:7], "HEAD"):
+            data = self.q("which", rev)
+            self.assertEqual(sorted(link["task"]["id"] for link in data["links"]), [task, other], rev)
+        outside = tempfile.mkdtemp(prefix="qtask-outside-")
+        self.addCleanup(force_rmtree, outside)
+        self.assertEqual(self.js("which", sha[:10].upper(), cwd=outside)["count"], 2)
+        self.assertEqual(self.q("which", "abcdef12")["count"], 0)
+        self.assertIn("No task links commit", self.run_qtask("which", "abcdef12", cwd=self.repo).stdout)
+        self.assertEqual(self.q("which", "nonsense", expect=5)["error"]["code"], "commit_not_found")
+        self.assertIn(f"{sha[:7]} -> {task}", self.run_qtask("which", "HEAD", cwd=self.repo).stdout)
+
+    def test_errors_are_clear(self):
+        task = self.add()
+        outside = tempfile.mkdtemp(prefix="qtask-outside-")
+        self.addCleanup(force_rmtree, outside)
+        result = self.run_qtask("commit", task, "--json", cwd=outside)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "not_in_repo")
+        self.assertEqual(self.js("commit", task, "--rebased", cwd=outside, expect=2)["error"]["code"], "not_in_repo")
+        self.commit("first")
+        self.assertEqual(self.q("commit", task, "nosuchrev", expect=5)["error"]["code"], "commit_not_found")
+        self.assertEqual(self.q("commit", "NOPE-1", expect=5)["error"]["code"], "task_not_found")
+        self.assertEqual(self.q("commit", task, "--range", "main", expect=2)["error"]["code"], "bad_revision")
+        self.assertEqual(self.q("commit", task, "--range=-x..y", expect=2)["error"]["code"], "bad_revision")
+        self.assertEqual(self.q("commit", task, "--range", "main..main", expect=2)["error"]["code"], "empty_range")
+        self.assertEqual(self.q("commit", task, "--range", "nope..main", expect=5)["error"]["code"], "commit_not_found")
+        self.q("commit", task, "HEAD", "--rebased", expect=2)
+        self.q("commit", task, "--rebased", "--note", "x", expect=2)
+        self.assertEqual(self.js("show", task)["commits"], [])
+
+    def test_rebase_and_amend_move_the_links(self):
+        task = self.add()
+        self.commit("Base")
+        self.git("checkout", "-q", "-b", "feature")
+        feature = self.commit("Add the feature", name="feature.txt")
+        kept = self.commit("Keep this one", name="kept.txt")
+        self.q("commit", task, "--range", "main..HEAD")
+        self.git("checkout", "-q", "main")
+        self.commit("Main moves on", name="main.txt")
+        self.git("checkout", "-q", "feature")
+        self.git("rebase", "-q", "main")
+        new_kept = self.git("rev-parse", "HEAD")
+        new_feature = self.git("rev-parse", "HEAD~1")
+        moved = self.q("commit", task, "--rebased", agent="fixer")["moved"]
+        self.assertEqual(
+            sorted((m["old_sha"], m["sha"]) for m in moved), sorted([(feature, new_feature), (kept, new_kept)])
+        )
+        show = self.js("show", task)
+        self.assertEqual({c["sha"] for c in show["commits"]}, {new_feature, new_kept})
+        events = [(e["old"], e["new"], e["actor"]) for e in show["events"] if e["field"] == "commit" and e["old"]]
+        self.assertIn((feature, new_feature, "fixer"), events)
+        self.assertEqual(self.q("commit", task, "--rebased")["unchanged"], 2)
+        self.commit("More", name="kept.txt")
+        self.q("commit", task)
+        self.git("commit", "-q", "--amend", "-m", "A new subject")
+        result = self.q("commit", task, "--rebased")
+        self.assertEqual([c["subject"] for c in result["not_found"]], ["More"])
+        text = self.run_qtask("commit", task, "--rebased", cwd=self.repo).stdout
+        self.assertIn("No commit with the same subject", text)
+
+    def test_same_subject_uses_the_author_date_then_reports_ambiguity(self):
+        task, twin = self.add("one"), self.add("two")
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "feature")
+        first = self.commit("wip", name="a.txt", date="2026-01-01T10:00:00Z")
+        self.commit("wip", name="b.txt", date="2026-01-02T10:00:00Z")
+        tied = self.commit("wip", name="c.txt", date="2026-01-03T10:00:00Z")
+        self.commit("wip", name="d.txt", date="2026-01-03T10:00:00Z")
+        self.q("commit", task, first)
+        self.q("commit", twin, tied)
+        self.git("checkout", "-q", "main")
+        self.commit("Main moves on", name="main.txt")
+        self.git("checkout", "-q", "feature")
+        self.git("rebase", "-q", "main")
+        result = self.q("commit", task, "--rebased")
+        new_first = self.git("rev-parse", "HEAD~3")
+        self.assertEqual([(m["old_sha"], m["sha"]) for m in result["moved"]], [(first, new_first)])
+        result = self.q("commit", twin, "--rebased")
+        self.assertEqual(result["moved"], [])
+        self.assertEqual(len(result["ambiguous"][0]["candidates"]), 2)
+        self.assertEqual([c["sha"] for c in self.js("show", twin)["commits"]], [tied])
+
+    def test_commits_from_another_repo_are_left_alone(self):
+        task = self.add()
+        self.commit("Here")
+        other = self.new_repo("other-repo", "https://example.com/acme/other.git")
+        there = self.commit("There", cwd=other)
+        self.js("commit", task, cwd=other)
+        self.q("commit", task)
+        self.assertIn("(main, repo acme/other)", self.run_qtask("show", task).stdout)
+        result = self.q("commit", task, "--rebased")
+        self.assertEqual([c["sha"] for c in result["other_repo"]], [there])
+        self.assertEqual(result["unchanged"], 1)
+
+
+class Scan(GitBase):
+    def stage(self, name, text):
+        Path(self.repo, name).write_text(text, encoding="utf-8", newline="\n")
+        self.git("add", name)
+
+    def test_staged_changes(self):
+        task = self.add()
+        self.commit("base")
+        self.assertIn("No task IDs", self.run_qtask("scan", cwd=self.repo).stdout)
+        self.stage("notes.md", f"line one\nfixes {task} and app-1 again\nsee APP-999 and XAPP-1\n")
+        self.stage("plan.txt", "~/.qtask/plans/app/2026-11-05/APP-1-topic.md\n")
+        error = self.q("scan", expect=4)["error"]
+        self.assertEqual(error["code"], "task_ids_found")
+        found = [(h["where"], h["kind"], h["match"]) for h in error["hits"]]
+        self.assertEqual(
+            found,
+            [
+                ("notes.md:2", "task_id", task), ("notes.md:2", "task_id", "APP-1"),
+                ("plan.txt:1", "qtask_path", "~/.qtask/plans/app/2026-11-05/APP-1-topic.md"),
+            ],
+        )
+        self.assertEqual(error["hits"][0]["text"], f"fixes {task} and app-1 again")
+        self.assertIn("APP", error["prefixes"])
+        text = self.run_qtask("scan", cwd=self.repo)
+        self.assertEqual(text.returncode, 4)
+        self.assertIn(f"notes.md:2: {task}", text.stderr)
+        self.git("reset", "-q")
+        clean = self.q("scan")
+        self.assertEqual((clean["hits"], clean["sources"]), ([], ["the staged changes"]))
+
+    def test_home_path_and_earlier_prefix_and_other_projects(self):
+        old = self.add()
+        self.js("project", "set-prefix", "QT", "--project", self.project)
+        self.add("other", project="x/beta")
+        self.commit("base")
+        home = Path(self.home).as_posix()
+        self.stage("a.txt", f"edit {home}/notes.md\nwas {old}, then BET-1\nonly a word: qtask\n")
+        hits = self.q("scan", expect=4)["error"]["hits"]
+        self.assertEqual([h["match"] for h in hits], [f"{home}/notes.md", old, "BET-1"])
+
+    def test_messages(self):
+        task = self.add()
+        error = self.q("scan", "--message", f"fix: the redirect\n\nRefs {task}", expect=4)["error"]
+        self.assertEqual([h["where"] for h in error["hits"]], ["commit message, line 3"])
+        self.assertEqual(self.q("scan", "--message", "fix: the redirect")["sources"], ["the commit message"])
+        path = Path(self.home, "COMMIT_EDITMSG")
+        path.write_text(
+            f"fix: the redirect\n# {task} in a comment\n{SCISSORS}\ndiff --git a/x b/x\n+{task}\n", encoding="utf-8"
+        )
+        self.assertEqual(self.q("scan", "--message-file", str(path))["hits"], [])
+        path.write_text(f"fix: {task}\n", encoding="utf-8")
+        self.assertEqual(self.q("scan", "--message-file", str(path), expect=4)["error"]["hits"][0]["line"], 1)
+        outside = tempfile.mkdtemp(prefix="qtask-outside-")
+        self.addCleanup(force_rmtree, outside)
+        self.js("scan", "--message", "plain", cwd=outside)
+        self.assertEqual(self.js("scan", cwd=outside, expect=2)["error"]["code"], "not_in_repo")
+        self.q("scan", "--message", "a", "--message-file", str(path), expect=2)
+        self.q("scan", "--range", "main..HEAD", "--message", "a", expect=2)
+
+    def test_staged_together_with_a_message(self):
+        task = self.add()
+        self.commit("base")
+        self.stage("a.txt", f"{task}\n")
+        data = self.q("scan", "--staged", "--message", "clean message", expect=4)["error"]
+        self.assertEqual([h["where"] for h in data["hits"]], ["a.txt:1"])
+        self.assertEqual(self.q("scan", "--message", "clean message")["hits"], [])
+
+    def test_range(self):
+        task = self.add()
+        base = self.commit("base")
+        bad = self.commit(f"feat: work for {task}", name="x.txt", text="clean line")
+        self.commit("feat: more", name="y.txt", text=f"one\nmentions {task}")
+        hits = self.q("scan", "--range", f"{base}..HEAD", expect=4)["error"]["hits"]
+        self.assertEqual(
+            sorted((h["commit"] == bad, h["file"], h["line"]) for h in hits), [(False, "y.txt", 2), (True, None, 1)]
+        )
+        self.assertEqual(self.q("scan", "--range", "HEAD..HEAD")["hits"], [])
+        self.assertEqual(self.q("scan", "--range", "nope..HEAD", expect=5)["error"]["code"], "commit_not_found")
+
+    def test_commit_msg_hook_recipe(self):
+        """The hook from the README blocks a commit whose message names a task."""
+        task = self.add()
+        self.commit("base")
+        hook = Path(self.repo, ".git", "hooks", "commit-msg")
+        python = Path(sys.executable).as_posix()
+        script = f'#!/bin/sh\nexec "{python}" -I "{QTASK.as_posix()}" scan --message-file "$1" >/dev/null\n'
+        hook.write_text(script, encoding="utf-8", newline="\n")
+        os.chmod(hook, 0o755)
+        Path(self.repo, "z.txt").write_text("z\n", encoding="utf-8")
+        self.git("add", "z.txt")
+        blocked = subprocess.run(
+            ["git", "commit", "-q", "-m", f"fix {task}"], cwd=self.repo, capture_output=True, encoding="utf-8",
+            env=self.env,
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn(f"commit message, line 1: {task}", blocked.stderr)
+        self.git("commit", "-q", "-m", "fix the redirect")
+
+
+class Deploys(Base):
+    def test_set_show_filter_and_report(self):
+        task = self.add()
+        other = self.add("other")
+        self.assertEqual(self.js("show", task)["task"]["deployed"], "none")
+        data = self.js("set", task, "--deployed", "Staging", "--deploy-note", "keep FLAG off until checked")["task"]
+        self.assertEqual((data["deployed"], data["deploy_note"]), ("staging", "keep FLAG off until checked"))
+        text = self.run_qtask("show", task).stdout
+        self.assertIn("Deployed: staging\nDeploy note: keep FLAG off until checked", text)
+        self.js("done", task, "--evidence", "ran it")
+        self.assertEqual(self.ls("ls", "--deployed", "staging"), [task])
+        self.assertEqual(self.ls("ls", "--deployed", "staging", "--status", "ready"), [])
+        self.assertEqual(self.ls("ls", "--deployed", "none"), [other])
+        self.assertIn("[on staging]", self.run_qtask("ls", "--project", self.project, "--deployed", "staging").stdout)
+        report = self.js("report", "--project", self.project)
+        self.assertEqual(report["counts_by_deployed"], {"none": 1, "staging": 1, "production": 0})
+        self.assertEqual([t["id"] for t in report["on_staging"]], [task])
+        self.assertIn("Deployed: staging 1", self.run_qtask("report", "--project", self.project).stdout)
+        cleared = self.js("set", task, "--deployed", "production", "--deploy-note", "")["task"]
+        self.assertEqual((cleared["deployed"], cleared["deploy_note"]), ("production", None))
+        self.assertEqual(self.js("report", "--project", self.project)["on_staging"], [])
+        self.js("set", task, "--deployed", "prod", expect=2)
+        self.js("ls", "--project", self.project, "--deployed", "x", expect=2)
+        fields = [e["field"] for e in self.js("show", task)["events"]]
+        self.assertIn("deployed", fields)
+        self.assertIn("deploy_note", fields)
+
+
+class Todos(Base):
+    def todo(self, task, *args, expect=0, agent=None):
+        return self.js("todo", task, *args, expect=expect, agent=agent)
+
+    def test_add_done_undo_rm_and_numbers(self):
+        task = self.add()
+        self.assertEqual(self.todo(task)["todos"], [])
+        self.assertIn("has no checklist items", self.run_qtask("todo", task).stdout)
+        body = Path(self.home, "item.md")
+        body.write_text(f"{ARABIC}\n", encoding="utf-8")
+        self.todo(task, "add", "write the migration", agent="a")
+        self.todo(task, "add", "--body-file", str(body))
+        self.todo(task, "add", "update the docs")
+        data = self.todo(task, "done", "1", "3")
+        self.assertEqual((data["changed"], data["progress"]), ([1, 3], "2/3"))
+        self.assertEqual(data["todos"][1]["body"], ARABIC)
+        self.assertEqual(self.todo(task, "done", "1")["changed"], [])
+        self.assertEqual(self.todo(task, "undo", "3")["progress"], "1/3")
+        self.assertEqual(self.todo(task, "rm", "3")["progress"], "1/2")
+        self.assertEqual(self.todo(task, "add", "a new one")["changed"], [4])
+        self.assertEqual([t["n"] for t in self.todo(task)["todos"]], [1, 2, 4])
+        self.assertEqual(self.todo(task, "done", "3", expect=5)["error"]["code"], "todo_not_found")
+        text = self.run_qtask("show", task).stdout
+        self.assertIn("Checklist, 1/3 done:\n  1. [x] write the migration\n  2. [ ] " + ARABIC, text)
+        self.assertIn("[todo 1/3]", self.run_qtask("ls", "--project", self.project).stdout)
+        listed = self.js("ls", "--project", self.project)["tasks"][0]
+        self.assertEqual((listed["todo_progress"], listed["todos_done"], listed["todos_total"]), ("1/3", 1, 3))
+        events = [(e["field"], e["old"], e["new"], e["actor"]) for e in self.js("show", task)["events"]]
+        self.assertIn(("todo", None, "1 added: write the migration", "a"), events)
+        self.assertIn(("todo", "3 done", "3 open", "unknown"), events)
+        self.assertIn(("todo", "3 open: update the docs", "3 removed", "unknown"), events)
+
+    def test_done_refuses_open_items_and_force_closes(self):
+        task = self.add()
+        self.todo(task, "add", "one")
+        self.todo(task, "add", "two")
+        self.todo(task, "done", "1")
+        error = self.js("done", task, "--evidence", "ran", expect=4)["error"]
+        self.assertEqual((error["code"], error["open_todos"]), ("open_todos", [2]))
+        self.assertIn(f"qtask todo {task} done N", error["message"])
+        report = self.js("report", "--project", self.project)
+        self.assertEqual([t["id"] for t in report["open_checklists"]], [task])
+        self.js("ask", task, "why?", "--to", "developer")
+        error = self.js("done", task, "--evidence", "ran", expect=4)["error"]
+        self.assertEqual((error["code"], error["open_todos"]), ("done_refused", [2]))
+        done = self.js("done", task, "--evidence", "ran", "--force", agent="closer")["task"]
+        self.assertEqual(done["status"], "done")
+        forced = [e for e in self.js("show", task)["events"] if e["field"] == "force"]
+        self.assertIn("open checklist items 2", forced[0]["new"])
+        self.assertEqual(self.todo(task, "add", "late", expect=4)["error"]["code"], "task_closed")
+        self.todo(task, "done", "2")
+        other = self.add("other")
+        self.todo(other, "add", "x")
+        self.todo(other, "rm", "1")
+        self.js("done", other, "--evidence", "ran")
+
+    def test_usage_errors(self):
+        task = self.add()
+        body = Path(self.home, "item.md")
+        body.write_text("x", encoding="utf-8")
+        self.assertEqual(self.todo(task, "add", expect=2)["error"]["code"], "text_required")
+        self.assertEqual(self.todo(task, "add", "  ", expect=2)["error"]["code"], "text_required")
+        self.assertEqual(
+            self.todo(task, "add", "x", "--body-file", str(body), expect=2)["error"]["code"], "text_and_body_file"
+        )
+        self.todo(task, "add", "two", "words", expect=2)
+        self.todo(task, "done", expect=2)
+        self.todo(task, "done", "x", expect=2)
+        self.todo(task, "done", "0", expect=2)
+        self.todo(task, "done", "1", "--body-file", str(body), expect=2)
+        self.todo(task, "bogus", expect=2)
+        self.todo("NOPE-1", expect=5)
+        self.assertEqual(self.todo(task)["todos"], [])
+
+
+class AnswerAs(Base):
+    def test_answer_as_the_developer(self):
+        task = self.add()
+        self.js("claim", task, agent="alice")
+        question = self.js("ask", task, "keep the old URL?", "--to", "developer", agent="alice")["comment"]["id"]
+        data = self.js("answer", str(question), "yes, redirect it", "--as", "developer", agent="alice")
+        self.assertEqual(
+            (data["comment"]["author"], data["comment"]["to_agent"], data["task"]["status"]),
+            ("developer", "alice", "in_progress"),
+        )
+        comments = self.js("show", task)["comments"]
+        self.assertTrue(comments[0]["resolved"])
+        event = [e for e in self.js("show", task)["events"] if e["field"] == "comment"][-1]
+        self.assertEqual((event["actor"], event["new"]), ("alice", f"#{data['comment']['id']} answer as developer"))
+        self.assertEqual(self.js("inbox", "--for", "developer", "--project", self.project)["comments"], [])
+
+    def test_comment_as_and_empty_name(self):
+        task = self.add()
+        comment = self.js("comment", task, "ship it friday", "--as", "Product Owner", agent="bot")["comment"]
+        self.assertEqual(comment["author"], "Product Owner")
+        self.assertEqual(self.js("comment", task, "x", "--as", " ", expect=2)["error"]["code"], "bad_usage")
+        mine = self.js("comment", task, "mine", agent="bot")["comment"]
+        self.assertEqual(mine["author"], "bot")
+        events = [e["new"] for e in self.js("show", task)["events"] if e["field"] == "comment"]
+        self.assertEqual(events, [f"#{comment['id']} note as Product Owner", f"#{mine['id']} note"])
+
+
+class BodyFile(Base):
+    def test_same_rule_for_every_command(self):
+        task = self.add()
+        path = Path(self.home, "text.md")
+        path.write_text("from the file\n", encoding="utf-8")
+        file = str(path)
+        self.assertEqual(self.js("comment", task, "--body-file", file)["comment"]["body"], "from the file\n")
+        question = self.js("ask", task, "--to", "bob", "--body-file", file)["comment"]["id"]
+        for command in (
+            ["comment", task, "text", "--body-file", file],
+            ["ask", task, "text", "--to", "bob", "--body-file", file],
+            ["answer", str(question), "text", "--body-file", file],
+            ["add", "title", "--project", self.project, "--body", "b", "--body-file", file],
+            ["set", task, "--body", "b", "--body-file", file],
+            ["todo", task, "add", "text", "--body-file", file],
+        ):
+            error = self.js(*command, expect=2)["error"]
+            self.assertEqual(error["code"], "text_and_body_file", command)
+            self.assertIn("not both. Remove one of them", error["message"])
+        self.js("answer", str(question), "--body-file", file)
+        for command in (["comment", task], ["ask", task, "--to", "bob"], ["comment", task, "   "]):
+            error = self.js(*command, expect=2)["error"]
+            self.assertEqual(error["code"], "text_required", command)
+            self.assertIn("--body-file FILE", error["message"])
+        self.assertEqual(self.js("set", task, "--body-file", file)["task"]["body"], "from the file\n")
+
+
+class OldSchema(Base):
+    def test_migration_from_schema_two_keeps_data_and_old_writes(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import qtask
+        finally:
+            sys.path.pop(0)
+        conn = sqlite3.connect(Path(self.home, "qtask.db"), isolation_level=None)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        qtask.migrate_1(conn)
+        qtask.migrate_2(conn)
+        conn.executemany("INSERT INTO schema_version VALUES (?, 'x')", [(1,), (2,)])
+        conn.execute(
+            "INSERT INTO projects(name, prefix, next_n, created_at, short_name) "
+            f"VALUES ('{self.project}', 'APP', 3, '2026-01-01T00:00:00Z', 'app')"
+        )
+        for n in (1, 2):
+            conn.execute(
+                "INSERT INTO tasks(id, project, title, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (f"APP-{n}", self.project, f"old {n}"),
+            )
+        conn.close()
+        old = self.js("show", "APP-1")
+        self.assertEqual((old["task"]["deployed"], old["task"]["deploy_note"]), ("none", None))
+        self.assertEqual((old["todos"], old["commits"], old["task"]["todo_progress"]), ([], [], None))
+        self.assertEqual(self.sql("SELECT version FROM schema_version"), [(n,) for n in range(1, LATEST_SCHEMA + 1)])
+        # The columns and tables an older qtask writes still take its writes.
+        self.sql(
+            "INSERT INTO tasks(id, project, title, created_by, created_at, updated_at) "
+            f"VALUES ('APP-3', '{self.project}', 'old write', 'old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        self.sql("UPDATE projects SET next_n = 4")
+        self.assertEqual(self.js("show", "APP-3")["task"]["deployed"], "none")
+        self.assertEqual(self.add("new"), "APP-4")
+        self.js("todo", "APP-1", "add", "x")
+        self.js("set", "APP-1", "--deployed", "staging")
+        export = Path(self.js("backup")["jsonl"]).read_text(encoding="utf-8")
+        tables = {json.loads(line)["table"] for line in export.splitlines()}
+        self.assertTrue({"todos", "tasks", "projects"} <= tables)
 
 
 class Version(Base):
