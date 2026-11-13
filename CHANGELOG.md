@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+Send a task to a TaskFlow team hub and read back what changed there.
+
+- `publish ID --scope TEXT | --scope-file FILE` sends a task to the hub. By default it sends the title and the scope text you pass. `--fields` adds `checklist` (open items as acceptance criteria), `priority`, `side` and `tags`. The body, comments, evidence and plan never leave.
+- `publish` checks each line first for task IDs, qtask paths, private keys, API tokens, `KEY=value` secret lines, IPv4 addresses and email addresses. A hit exits 4 with `publish_blocked` and the field and line.
+- `publish` shows the exact JSON and the URL, then asks in the terminal. Without a terminal it exits 4 with `confirm_required`, and no flag or variable skips the question. `--dry-run` stops after the preview.
+- The hub gets a random fingerprint, `ext:<uuid>`, never the task ID. When the hub already has an open task with that fingerprint, qtask links to it. A second `publish` exits 4 with `already_published`.
+- `hub-pull ID` prints the hub task's status, deploy state, git links and new events and comments, marked as written by others. In a terminal it asks to save them as one comment by `hub`. `--dry-run` only prints.
+- `hub` lists the project's published tasks, and `hub set-url URL` stores the project's hub URL. `QTASK_HUB_URL` and `--hub-url` override it. The URL must use https, except for 127.0.0.1 and localhost, and qtask never follows a redirect.
+- The token comes from `QTASK_HUB_TOKEN` or `~/.qhub/token`. qtask never prints or stores it.
+- `show` prints the hub link of a published task.
+- Schema 6 adds the `hub_links` table. It only adds.
+
 ## 0.2.0 (unreleased)
 
 Agents link their work to git history and keep task IDs out of the repo.

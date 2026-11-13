@@ -8,6 +8,8 @@ Done in 0.2.0: commit links that survive a rebase, `scan` to keep task IDs out o
 
 ## 0.3: share work from local tasks
 
+Done in 0.3.0: `publish` and `hub-pull` for a TaskFlow team hub. See [CHANGELOG.md](CHANGELOG.md).
+
 - **`promote`**: turn a local task into a GitHub issue, or into a plan file inside the repo, and link the two. Today `--gh-issue` and `--visibility public` only record that you did it by hand.
 - **`gh sync`**: keep the status of promoted tasks and their issues in step, both ways.
 - **HTML board**: one read-only page with columns by status, written to a file you open in a browser. No server.
