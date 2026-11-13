@@ -21,7 +21,7 @@ $ qtask done APP-14 --evidence "npm test: 412 passed" --agent fe-fix-1
 Done APP-14.
 ```
 
-Status: **0.2, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
+Status: **0.3, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
 
 ## Why another tracker
 
@@ -105,6 +105,7 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | `project` | The project, its ID prefix and next ID. Change the prefix of new IDs |
 | `plan-path`, `plans` | Dated private plan files, linked to tasks |
 | `backup` | A database copy and a JSONL export, kept 7 deep |
+| `publish`, `hub-pull`, `hub` | Send a task to a team hub after you confirm, read back what changed there, list published tasks |
 
 `qtask COMMAND --help` lists the flags. The skill file has the full table and the exit codes.
 
@@ -165,6 +166,39 @@ my-org/my-repo now uses the prefix QT. Next ID: QT-105. Existing IDs stay as the
 
 New tasks get the new prefix and keep the counter. Old IDs keep working.
 
+### Publish to a team hub
+
+`publish` sends one task to a TaskFlow team hub, so the rest of the team can see it. You choose what leaves your machine, check it, and confirm it in your own terminal.
+
+```text
+$ qtask hub set-url https://hub.example.com/api
+$ qtask publish APP-14 --scope-file scope.md --fields title,scope,checklist --dry-run
+POST https://hub.example.com/api/tasks
+{
+  "title": "Fix the login redirect",
+  "description": "Old links to /signin land on a 404. Redirect them to /login.",
+  "kind": "bug",
+  ...
+}
+Dry run: nothing was sent.
+$ qtask publish APP-14 --scope-file scope.md --fields title,scope,checklist
+...
+Publish to https://hub.example.com/api? [y/N] y
+Published APP-14 as HUB-31: https://hub.example.com/board?task=31
+```
+
+- **What it sends:** the title and the scope text you pass with `--scope` or `--scope-file`. `--fields` adds `checklist` (open items become acceptance criteria), `priority` (P0 urgent, P1 high, P2 medium, P3 low), `side` (docs maps to other) and `tags`. The task body, comments, evidence and plan never leave, and no field sends them. `--kind` sets the hub kind; a qtask bug is a `bug`, anything else a `task`. `--status` is `backlog` (default), `to_do` or `proposed`.
+- **What it refuses:** before it shows anything, it checks every line for task IDs of any prefix in your database, qtask paths, private keys, API tokens, `KEY=value` secret lines, IPv4 addresses (except 127.0.0.1 and 0.0.0.0) and email addresses. A hit exits 4 with the code `publish_blocked` and the field and line.
+- **When it sends:** only after you answer `y` in a terminal. Without a terminal, such as from an agent, it exits 4 with `confirm_required`. No flag or variable skips the question. `--dry-run` checks and shows the JSON, then stops.
+- **The fingerprint:** each task gets a random reference, sent as `ext:<uuid>`. The hub never sees the task ID. If the hub already has an open task with that fingerprint, qtask links to it.
+- **After it sends:** qtask keeps the link, adds a note to the task, and `show` prints it. A second `publish` of the same task exits 4 with `already_published`.
+
+`qtask hub-pull APP-14` reads the hub task: status, deploy state, git links, and the events and comments since the last pull. It marks that text as written by other people, then asks whether to add it to the task as one comment. With `--dry-run` or without a terminal it only prints. No other command calls the hub.
+
+`qtask hub` lists the project's published tasks and its hub URL.
+
+The hub URL comes from `--hub-url`, else `QTASK_HUB_URL`, else the project's URL from `qtask hub set-url URL`. It must use https, except for 127.0.0.1 and localhost. The token comes from `QTASK_HUB_TOKEN`, else the file `~/.qhub/token`. qtask sends it only in the `Authorization` header, never prints it and never stores it.
+
 ## Keep task IDs out of the repo
 
 Task IDs are local: nobody else can open `APP-14`, and it reads like a ticket in another tracker. Name the work in commits, code and docs, and keep the link in qtask with `qtask commit`.
@@ -191,7 +225,7 @@ Git for Windows runs hooks with its own `sh`, so the `qtask` launcher on your PA
 
 ## Where data lives
 
-`QTASK_HOME`, default `~/.qtask`: the database `qtask.db`, plan files under `plans/`, and backups under `backups/`. qtask makes no network calls. Delete the folder and it is gone. On Linux and macOS only your user can read it.
+`QTASK_HOME`, default `~/.qtask`: the database `qtask.db`, plan files under `plans/`, and backups under `backups/`. qtask makes no network calls, except `publish` and `hub-pull` to the hub you name. Delete the folder and it is gone. On Linux and macOS only your user can read it.
 
 Keep `QTASK_HOME` on a local disk. SQLite's WAL mode needs every process on one machine, so a network drive breaks locking, and Dropbox, OneDrive or iCloud copy the database and its `-wal` file apart, so two machines hand out the same IDs.
 
@@ -202,6 +236,8 @@ qtask needs SQLite 3.24 or newer with JSON functions. The Python builds from pyt
 | `QTASK_HOME` | Data folder, an absolute path |
 | `QTASK_AGENT` | Agent name when `--agent` is absent |
 | `QTASK_NO_FTS` | Use plain `LIKE` search instead of SQLite FTS5 when the database is created |
+| `QTASK_HUB_URL` | Hub base URL when `--hub-url` is absent |
+| `QTASK_HUB_TOKEN` | Hub API token. Else qtask reads `~/.qhub/token` |
 
 ## Development
 
