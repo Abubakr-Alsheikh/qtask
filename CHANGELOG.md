@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+Hand work to agent sessions and see what waits on whom.
+
+- Leases follow activity. Each event of the claim holder on the task renews the claim. Before each command, qtask releases every expired claim back to the lane it came from (the new `claimed_from`), with an `auto_released` event by `qtask`. `release` also returns the task to that lane. `report` lists claims idle for more than 24 hours.
+- `ready` lists the planned lane (status `ready`), then the backlog, with a lane column and a footer counting lanes, sides and priorities. `--planned` and `--backlog` pick one lane.
+- `--requested-by manager|stakeholder|developer|scan|agent`, `--requester NAME`, `--requested-on DATE` and `--audience students|teachers|parents|managers|admins|team` on `add` and `set`, and as filters on `ls` and `ready`. `--sort impact|oldest|priority`; `ready` sorts by impact by default: manager and stakeholder requests, then bugs, then audience, then priority, then age.
+- `review` lists the `needs_review` queue, oldest first. `approve ID --evidence` closes a task with evidence; `reject ID --reason` moves it to `in_progress` and sends the reason to the submitter's inbox.
+- `needs_confirm` and `blocked` need a reason: an open question, an open blocker, or `--waiting-on developer|manager|person|external` with `--waiting-note`. Without one, exit 4 with `waiting_on_required`. `decisions` groups open questions and parked tasks by who must act, with the exact command. `report` lists parked tasks with no reason.
+- `brief ID` prints about 2 KB: status, claim, next step, summary, plan, branch, worktree, open checklist items, open questions, blockers, context files and the body. `set --next` and `set --summary` fill the new fields.
+- A `handback` comment needs `Summary:`, `Checks run:` and `Left:` parts, else exit 2 with `handback_incomplete`. Its Summary becomes the task summary.
+- `area add NAME --parent P` builds a tree of areas per project. `area --tree` shows open and total counts rolled up to the parents. `--area` on `ls` and `ready` includes the areas below. `report --by area|requester` adds open counts.
+- `next` lists comments addressed to you, your idle and expired claims, and the top ready task, each with the commands to run.
+- `prompt ID --agent NAME` prints a session prompt: the brief, where to work, the setup command (`project set-setup CMD` or `--setup`) and the rules for claims, comments, scans, commits and hand-backs. `context ID add PATH --note` keeps file links on a task. `export ID --pack [DIR]` writes all of it to `pack.md`, and refuses a folder inside a git repo.
+- `split ID --part be --part fe` makes one subtask per side; `take ID --part be` claims one.
+- `add` prints open tasks with a similar title, and `similar TITLE` checks before you add.
+- New kinds `feature`, `chore`, `content`, `research`; new sides `mobile`, `content`, `qa`. `template KIND` prints a body template. `add --kind bug` needs `Steps:`, `Expected:` and `Actual:` lines, else exit 2 with `bug_template`.
+- `claim` warns when the agent then holds more than two claims. The claim still stands.
+- `report` lists tasks in `in_progress` that nobody holds, such as a rejected task. `ready` and `next` do not show them, so they could sit unseen.
+- Schema 7 adds `claimed_from`, `claim_ttl_hours` and `claim_active_at`, and fills them for open claims from the event log. Schema 8 adds the request, audience, waiting, next step, summary and area columns, widens the kind, side and comment kind lists, and gives tasks tagged `manager-list*` `requested_by = manager` with the date from the tag (the tags stay). Schema 9 adds the `areas` and `context_files` tables. Nothing is dropped or renamed.
+
 ## 0.3.0 (unreleased)
 
 Send a task to a TaskFlow team hub and read back what changed there.
