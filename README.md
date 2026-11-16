@@ -21,7 +21,7 @@ $ qtask done APP-14 --evidence "npm test: 412 passed" --agent fe-fix-1
 Done APP-14.
 ```
 
-Status: **0.3, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
+Status: **0.4, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
 
 ## Why another tracker
 
@@ -82,8 +82,11 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 ## How it works
 
 - **Statuses:** `backlog`, `ready`, `in_progress`, `blocked`, `needs_review`, `needs_confirm`, `done`, `dropped`. A new task starts `ready`.
-- **Claims:** `claim` sets `in_progress` and a lease, 2 hours by default. Claiming again renews it. Another agent's claim fails with exit 3 until the lease runs out, and then `ready` offers the task again.
+- **Lanes:** `ready` lists two lanes: planned work (status `ready`), then the backlog. It sorts each by impact: manager and stakeholder requests, then bugs, then the audience (students first), then priority, then age.
+- **Claims:** `claim` sets `in_progress` and a lease, 2 hours by default. Each later qtask command of the holder on the task renews it. Another agent's claim fails with exit 3. When a lease runs out, the next qtask command releases the task back to the lane it came from and logs `auto_released`. `report` lists claims idle for more than 24 hours.
 - **Questions:** `ask` moves the task to `needs_confirm`. Once every question has an answer, the task goes back to `in_progress`, or to `ready` when nobody holds it.
+- **Parked work:** `needs_confirm` and `blocked` need a reason: an open question, an open blocker, or `--waiting-on developer|manager|person|external` with a note. `decisions` groups what waits on whom.
+- **Review:** `review` lists the `needs_review` queue, oldest first. `approve` closes a task with evidence, and `reject` sends it back to `in_progress` with the reason in the submitter's inbox.
 - **Closing:** `done` needs `--evidence`, and refuses while a question, a subtask or a checklist item is open. `drop` closes work that will not happen.
 - **Blockers:** `link A --blocks B` keeps B out of `ready` until A closes.
 - **Projects:** each task belongs to the project of the folder you ran the command in. `--project` picks another, and `--all` shows every project. An ID such as `APP-14` finds its task from any folder.
@@ -93,8 +96,14 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | Command | Does |
 |---------|------|
 | `add`, `set`, `show`, `ls`, `search` | Create, change, read and find tasks |
-| `ready` | Tasks an agent may claim now, by priority then age |
-| `claim`, `release` | Take or give back a task. Claims expire after 2 hours unless renewed |
+| `ready`, `next` | Tasks an agent may claim now, by lane and impact; what to do next, with the commands |
+| `brief` | About 2 KB of what an agent needs to start a task |
+| `claim`, `release` | Take or give back a task. Activity renews a claim; an expired one goes back to its lane |
+| `review`, `approve`, `reject`, `decisions` | The review queue, and what waits on whom |
+| `prompt`, `context`, `export` | Hand a task to another agent session |
+| `area` | Areas of a project as a tree, with counts |
+| `split`, `take` | One subtask per side, and claim one part |
+| `similar`, `template` | Look for duplicates; body templates per kind |
 | `comment`, `ask`, `answer`, `resolve`, `inbox` | Notes and questions between agents and people |
 | `todo` | A checklist inside a task |
 | `link`, `unlink` | Blockers and related tasks |
@@ -108,6 +117,46 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | `publish`, `hub-pull`, `hub` | Send a task to a team hub after you confirm, read back what changed there, list published tasks |
 
 `qtask COMMAND --help` lists the flags. The skill file has the full table and the exit codes.
+
+### Hand a task to another agent
+
+```text
+$ qtask project set-setup "bash scripts/setup.sh"
+$ qtask set APP-14 --worktree ../app-login --branch fix/login-redirect --next "add the redirect test"
+$ qtask context APP-14 add src/auth/routes.py --note "the old URL lives here"
+$ qtask prompt APP-14 --agent fe-fix-2
+You are agent fe-fix-2. Your task is APP-14 in the project my-org/my-repo.
+Run every qtask command with --agent fe-fix-2, or set QTASK_AGENT=fe-fix-2 first.
+
+Where to work:
+  cd ../app-login
+  Then run: bash scripts/setup.sh
+...
+```
+
+`prompt` prints the brief (status, next step, plan, open checklist items, open questions, blockers, summary, context files) and the rules the session follows: claim first, comment and tick the checklist, scan before each commit, link each commit, never write task IDs in the repo, and hand back before it stops. `qtask export APP-14 --pack` writes the same as `pack.md` in the qtask data folder; it refuses a folder inside a git repo.
+
+A hand-back is a comment with three parts. Its Summary becomes the task's summary, which the next `brief` shows:
+
+```text
+$ qtask comment APP-14 --kind handback --body-file handback.md
+```
+
+```markdown
+Summary: Old /signin links redirect to /login with a 301.
+Checks run: npm test -- auth, 14 passed
+Left: nothing
+```
+
+### Who asked, and for whom
+
+```text
+$ qtask add "Show weekly progress on the dashboard" --requested-by manager --requester Sam --audience students --area dashboard
+$ qtask ready --requested-by manager
+$ qtask report --by requester
+```
+
+`--audience` takes students, teachers, parents, managers, admins or team. Areas form a tree (`qtask area add dashboard --parent app`), and `--area app` includes the areas below it.
 
 ### Checklists
 

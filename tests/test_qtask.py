@@ -73,7 +73,8 @@ HAS_FTS5 = sqlite_has_fts5()
 ARABIC ="إصلاح زر الإرسال «ذاكر» في الاختبار"
 RACE_ROUNDS = 5
 RACE_PROCESSES = 20
-LATEST_SCHEMA = 6
+LATEST_SCHEMA = 9
+BUG_BODY = "Steps: save a file\nExpected: it saves\nActual: it crashes"
 SCISSORS = "# ------------------------ >8 ------------------------"
 
 
@@ -205,7 +206,7 @@ class AddRace(Base):
 
 
 class Claims(Base):
-    def test_expired_claim_takeover_logs_event(self):
+    def test_expired_claim_is_released_then_taken_with_events(self):
         task = self.add()
         self.js("claim", task, agent="alice")
         self.js("claim", task, agent="bob", expect=3)
@@ -213,9 +214,10 @@ class Claims(Base):
         result = self.js("claim", task, agent="bob")["task"]
         self.assertEqual(result["claimed_by"], "bob")
         events = self.js("show", task)["events"]
-        takeover = [e for e in events if e["field"] == "claim_takeover"]
-        self.assertEqual(len(takeover), 1)
-        self.assertEqual((takeover[0]["old"], takeover[0]["new"]), ("alice", "bob"))
+        released = [(e["actor"], e["old"]) for e in events if e["field"] == "auto_released"]
+        self.assertEqual(released, [("qtask", "alice")])
+        claimed = [e for e in events if e["field"] == "claimed_by" and e["new"] == "bob"]
+        self.assertEqual(len(claimed), 1)
 
     def test_same_agent_extends(self):
         task = self.add()
@@ -255,7 +257,7 @@ class Claims(Base):
         self.js("done", closed, "--evidence", "ran it")
         self.assertEqual(self.js("claim", closed, agent="a", expect=4)["error"]["code"], "task_closed")
         held = self.add()
-        self.js("set", held, "--status", "blocked")
+        self.js("set", held, "--status", "blocked", "--waiting-on", "external")
         self.assertEqual(self.js("claim", held, agent="a", expect=4)["error"]["code"], "task_blocked")
 
     def test_ready_hides_valid_claim_and_reports_expired(self):
@@ -268,7 +270,8 @@ class Claims(Base):
         self.sql("UPDATE tasks SET claim_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?", task)
         data = self.js("ready", "--project", self.project)
         self.assertIn(task, [t["id"] for t in data["tasks"]])
-        self.assertEqual(data["stale_claims"], [task])
+        self.assertEqual(data["stale_claims"], [])
+        self.assertEqual([r["id"] for r in data["auto_released"]], [task])
 
 
 class Blockers(Base):
@@ -414,7 +417,7 @@ class AskAnswer(Base):
         note = self.js("comment", noted, "fyi", "--to", "bob", agent="alice")["comment"]["id"]
         self.js("comment", noted, "for carol", "--to", "carol", agent="alice")
         self.js("comment", noted, "for nobody", agent="alice")
-        self.js("set", owned_confirm, "--status", "needs_confirm")
+        self.js("set", owned_confirm, "--status", "needs_confirm", "--waiting-on", "developer")
         inbox = self.js("inbox", "--for", "bob", "--project", self.project)
         self.assertEqual(sorted(c["id"] for c in inbox["comments"]), sorted([question, note]))
         self.assertEqual(sorted(t["id"] for t in inbox["tasks"]), sorted([owned_confirm, owned_review]))
@@ -547,7 +550,7 @@ class Fields(Base):
     def test_ls_filters(self):
         a = self.js(
             "add", "fe bug", "--project", self.project, "--kind", "bug", "--pri", "P0", "--side", "fe",
-            "--tag", "x", "--owner", "o",
+            "--tag", "x", "--owner", "o", "--body", BUG_BODY,
         )["task"]["id"]
         b = self.add("be task", "--side", "be", "--parent", a)
         self.assertEqual(self.ls("ls", "--kind", "bug"), [a])
@@ -605,7 +608,8 @@ class Fields(Base):
         self.assertEqual(data["tasks_left"], 5)
         self.assertEqual(data["counts_by_status"]["done"], 1)
         self.assertEqual(data["counts_by_priority"]["P2"], 5)
-        self.assertEqual([t["id"] for t in data["stale_claims"]], [stale])
+        self.assertEqual(data["stale_claims"], [])  # Released back to ready before the report ran.
+        self.assertEqual(self.js("show", stale)["task"]["status"], "ready")
         self.assertEqual([t["id"] for t in data["blocked"]], [blocked])
         self.assertEqual([c["id"] for c in data["waiting_on_developer"]["questions"]], [question])
         self.assertEqual([t["id"] for t in data["waiting_on_developer"]["tasks"]], [review])
@@ -1850,7 +1854,10 @@ class Hub(Base):
         self.assertIsNone(self.js("show", task)["hub"])
 
     def test_mapping_of_fields(self):
-        task = self.add("Crash on save", "--kind", "bug", "--pri", "P0", "--side", "docs", "--tag", "ui", "--tag", "save")
+        task = self.add(
+            "Crash on save", "--kind", "bug", "--pri", "P0", "--side", "docs", "--tag", "ui", "--tag", "save",
+            "--body", BUG_BODY,
+        )
         for text in ("first", "second", "third"):
             self.js("todo", task, "add", text)
         self.js("todo", task, "done", "2")
@@ -2173,6 +2180,393 @@ class HubSchema(Base):
         self.assertEqual(self.add("new"), "APP-2")
         export = Path(self.js("backup")["jsonl"]).read_text(encoding="utf-8")
         self.assertIn("APP-1", export)
+
+
+PAST = "2000-01-01T00:00:00Z"
+
+
+def hours_from_now(hours):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Leases(Base):
+    def test_activity_by_the_holder_extends_the_claim(self):
+        task = self.add()
+        self.js("claim", task, "--ttl-hours", "3", agent="alice")
+        soon = hours_from_now(0.1)
+        self.sql("UPDATE tasks SET claim_expires_at = ? WHERE id = ?", soon, task)
+        self.js("comment", task, "someone else", agent="bob")
+        self.assertEqual(self.js("show", task)["task"]["claim_expires_at"], soon)
+        self.js("todo", task, "add", "step", agent="alice")
+        later = self.js("show", task)["task"]
+        self.assertGreater(later["claim_expires_at"], hours_from_now(2.9))
+        self.assertIsNotNone(later["claim_active_at"])
+
+    def test_expired_claim_goes_back_to_its_lane_with_an_event(self):
+        planned, parked = self.add("planned"), self.add("parked", "--status", "backlog")
+        for task in (planned, parked):
+            self.js("claim", task, agent="alice")
+            self.sql("UPDATE tasks SET claim_expires_at = ? WHERE id = ?", PAST, task)
+        self.ls()  # Any command releases expired claims first.
+        for task, lane in ((planned, "ready"), (parked, "backlog")):
+            data = self.js("show", task)
+            self.assertEqual(data["task"]["status"], lane)
+            self.assertIsNone(data["task"]["claimed_by"])
+            released = [e for e in data["events"] if e["field"] == "auto_released"]
+            self.assertEqual([(e["actor"], e["old"]) for e in released], [("qtask", "alice")])
+
+    def test_expired_claim_keeps_review_and_open_questions(self):
+        review, asked = self.add("review"), self.add("asked")
+        for task in (review, asked):
+            self.js("claim", task, agent="alice")
+        self.js("set", review, "--status", "needs_review", agent="alice")
+        self.js("ask", asked, "q?", "--to", "developer", agent="alice")
+        self.sql("UPDATE tasks SET claim_expires_at = ?", PAST)
+        self.assertEqual(self.js("show", review)["task"]["status"], "needs_review")
+        self.assertEqual(self.js("show", asked)["task"]["status"], "needs_confirm")
+
+    def test_release_returns_to_the_lane_it_came_from(self):
+        task = self.add("later", "--status", "backlog")
+        self.assertEqual(self.js("claim", task, agent="alice")["task"]["claimed_from"], "backlog")
+        self.js("claim", task, agent="alice")  # Renewing keeps the lane.
+        self.assertEqual(self.js("release", task, agent="alice")["task"]["status"], "backlog")
+
+    def test_report_lists_idle_claims(self):
+        idle, busy = self.add("idle"), self.add("busy")
+        self.js("claim", idle, "--ttl-hours", "72", agent="alice")
+        self.js("claim", busy, agent="bob")
+        self.sql("UPDATE tasks SET claim_active_at = '2000-01-01T00:00:00Z' WHERE id = ?", idle)
+        report = self.js("report", "--project", self.project)
+        self.assertEqual([t["id"] for t in report["idle_claims"]], [idle])
+        self.assertIn("idle for more than 24 h", self.run_qtask("report", "--project", self.project).stdout)
+
+    def test_wip_warning_on_claim(self):
+        tasks = [self.add(f"t{n}") for n in range(3)]
+        self.assertEqual(self.js("claim", tasks[0], agent="alice")["warnings"], [])
+        self.js("claim", tasks[1], agent="alice")
+        warning = self.js("claim", tasks[2], agent="alice")["warnings"]
+        self.assertEqual(len(warning), 1)
+        self.assertIn(tasks[0], warning[0])
+
+
+class Lanes(Base):
+    def test_ready_shows_planned_then_backlog_with_a_footer(self):
+        later = self.add("later", "--status", "backlog", "--pri", "P0", "--side", "be")
+        now_ = self.add("now", "--side", "fe")
+        data = self.js("ready", "--project", self.project)
+        self.assertEqual([(t["id"], t["lane"]) for t in data["tasks"]], [(now_, "planned"), (later, "backlog")])
+        self.assertEqual(data["counts"]["by_lane"], {"planned": 1, "backlog": 1})
+        self.assertEqual(data["counts"]["by_side"], {"fe": 1, "be": 1})
+        self.assertEqual(self.ls("ready", "--planned"), [now_])
+        self.assertEqual(self.ls("ready", "--backlog"), [later])
+        text = self.run_qtask("ready", "--project", self.project).stdout
+        self.assertIn("Lanes: planned 1, backlog 1", text)
+        self.assertTrue(text.startswith("planned "))
+        self.assertEqual(self.run_qtask("ready", "--planned", "--backlog", "--project", self.project).returncode, 2)
+
+    def test_limit_keeps_the_footer_counts(self):
+        for n in range(3):
+            self.add(f"t{n}")
+        data = self.js("ready", "--project", self.project, "--limit", "1")
+        self.assertEqual((data["count"], data["total"]), (1, 3))
+
+
+class Requests(Base):
+    def test_fields_default_date_and_filters(self):
+        asked = self.js(
+            "add", "asked", "--project", self.project, "--requested-by", "manager", "--requester", "Sara",
+            "--audience", "students",
+        )["task"]
+        self.assertEqual((asked["requested_by"], asked["requested_name"], asked["audience"]), ("manager", "Sara", "students"))
+        self.assertRegex(asked["requested_on"], r"^\d{4}-\d{2}-\d{2}$")
+        plain = self.add("plain")
+        self.js("set", plain, "--requested-by", "stakeholder")
+        self.assertEqual(self.js("show", plain)["task"]["requested_on"], self.js("show", plain)["task"]["created_at"][:10])
+        self.assertEqual(self.ls("ls", "--requested-by", "manager"), [asked["id"]])
+        self.assertEqual(self.ls("ls", "--audience", "students"), [asked["id"]])
+        self.js("set", plain, "--requested-by", "")
+        self.assertIsNone(self.js("show", plain)["task"]["requested_by"])
+        self.assertEqual(self.run_qtask("add", "x", "--project", self.project, "--audience", "aliens").returncode, 2)
+        self.assertEqual(self.run_qtask("add", "x", "--project", self.project, "--requested-on", "tomorrow").returncode, 2)
+
+    def test_impact_order(self):
+        plain = self.add("plain", "--pri", "P0")
+        team = self.add("team", "--audience", "team")
+        students = self.add("students", "--audience", "students")
+        bug = self.add("bug", "--kind", "bug", "--body", BUG_BODY)
+        asked = self.add("asked", "--requested-by", "manager", "--pri", "P3")
+        self.assertEqual(self.ls("ready"), [asked, bug, students, team, plain])
+        self.assertEqual(self.ls("ready", "--sort", "priority"), [plain, team, students, bug, asked])
+        self.assertEqual(self.ls("ready", "--sort", "oldest"), [plain, team, students, bug, asked])
+        self.assertEqual(self.ls("ls", "--sort", "impact"), [asked, bug, students, team, plain])
+        self.assertEqual(self.ls("ls"), [plain, team, students, bug, asked])
+        self.assertEqual(self.run_qtask("ls", "--sort", "random", "--project", self.project).returncode, 2)
+
+
+class ParkedAndReview(Base):
+    def test_parked_status_needs_a_reason(self):
+        task = self.add()
+        error = self.js("set", task, "--status", "blocked", expect=4)["error"]
+        self.assertEqual(error["code"], "waiting_on_required")
+        self.assertEqual(self.js("add", "x", "--project", self.project, "--status", "needs_confirm", expect=4)["error"]["code"], "waiting_on_required")
+        self.js("set", task, "--status", "blocked", "--waiting-on", "external", "--waiting-note", "vendor reply")
+        shown = self.js("show", task)["task"]
+        self.assertEqual((shown["waiting_on"], shown["waiting_note"]), ("external", "vendor reply"))
+        self.js("set", task, "--status", "ready")
+        self.assertIsNone(self.js("show", task)["task"]["waiting_on"])
+        blocker = self.add("blocker")
+        self.js("link", blocker, "--blocks", task)
+        self.js("set", task, "--status", "blocked")  # An open blocker is reason enough.
+
+    def test_decisions_group_by_who_must_act_and_report_parked_without_reason(self):
+        asked, waits, silent = self.add("asked"), self.add("waits"), self.add("silent")
+        question = self.js("ask", asked, "Keep the old URL?", "--to", "developer", agent="alice")["comment"]["id"]
+        self.js("set", waits, "--status", "needs_confirm", "--waiting-on", "manager", "--waiting-note", "approve copy")
+        self.sql("UPDATE tasks SET status = 'blocked' WHERE id = ?", silent)
+        data = self.js("decisions", "--project", self.project)
+        self.assertEqual(list(data["groups"]), ["developer", "manager", "unknown"])
+        self.assertEqual(data["groups"]["developer"][0]["commands"], [f'qtask answer {question} "the answer" --as developer'])
+        self.assertEqual(data["groups"]["manager"][0]["task_id"], waits)
+        self.assertEqual(list(self.js("decisions", "--for", "manager", "--project", self.project)["groups"]), ["manager"])
+        report = self.js("report", "--project", self.project)
+        self.assertEqual([p["task_id"] for p in report["parked_no_reason"]], [silent])
+        # Answering the question does not unpark a task that also waits on someone.
+        self.js("set", asked, "--waiting-on", "person", "--waiting-note", "Omar")
+        self.js("answer", str(question), "yes", agent="developer")
+        self.assertEqual(self.js("show", asked)["task"]["status"], "needs_confirm")
+
+    def test_review_queue_approve_and_reject(self):
+        first, second = self.add("first"), self.add("second")
+        self.js("set", second, "--status", "needs_review", agent="bob")
+        self.js("set", first, "--status", "needs_review", agent="alice")
+        self.sql("UPDATE events SET at = '2001-01-01T00:00:00Z' WHERE task_id = ? AND new = 'needs_review'", first)
+        queue = self.js("review", "--project", self.project)
+        self.assertEqual([t["id"] for t in queue["tasks"]], [first, second])
+        self.assertEqual(queue["tasks"][0]["submitted_by"], "alice")
+        rejected = self.js("reject", first, "--reason", "add a test", agent="developer")
+        self.assertEqual((rejected["task"]["status"], rejected["notified"]), ("in_progress", "alice"))
+        inbox = self.js("inbox", "--for", "alice", "--project", self.project)["comments"]
+        self.assertEqual([(c["kind"], c["body"]) for c in inbox], [("review", "Rejected: add a test")])
+        self.assertEqual(self.js("reject", first, "--reason", "x", expect=4)["error"]["code"], "not_in_review")
+        stranded = self.js("report", "--project", self.project)["in_progress_unclaimed"]
+        self.assertEqual([t["id"] for t in stranded], [first])
+        self.assertEqual(self.js("approve", first, "--evidence", "x", expect=4)["error"]["code"], "not_in_review")
+        self.assertEqual(self.js("approve", second, expect=4)["error"]["code"], "evidence_required")
+        self.assertEqual(self.js("reject", second, expect=4)["error"]["code"], "reason_required")
+        done = self.js("approve", second, "--evidence", "read the diff, ran the tests", agent="developer")["task"]
+        self.assertEqual((done["status"], done["evidence"]), ("done", "read the diff, ran the tests"))
+        review = [c for c in self.js("show", second)["comments"] if c["kind"] == "review"]
+        self.assertEqual([(c["to_agent"], c["body"]) for c in review], [("bob", "Approved: read the diff, ran the tests")])
+
+
+class BriefAndHandback(Base):
+    def test_brief_holds_what_an_agent_needs(self):
+        blocker = self.add("the blocker")
+        task = self.add("main work", "--body", "B" * 5000, "--plan", "/plans/x.md", "--branch", "feat/x")
+        self.js("link", blocker, "--blocks", task)
+        self.js("set", task, "--next", "write the migration", "--worktree", "/wt/x")
+        self.js("todo", task, "add", "open step")
+        self.js("todo", task, "add", "closed step")
+        self.js("todo", task, "done", "2")
+        self.js("ask", task, "Which table?", "--to", "developer")
+        data = self.js("brief", task)
+        text = data["text"]
+        for needle in ("Next: write the migration", "Plan: /plans/x.md", "Branch: feat/x", "Worktree: /wt/x",
+                       "1. open step", "Which table?", blocker, "Body:"):
+            self.assertIn(needle, text)
+        self.assertNotIn("closed step", text)
+        self.assertLessEqual(len(text.encode("utf-8")), 2100)
+        self.assertEqual(self.run_qtask("brief", task).stdout.strip(), text)
+
+    def test_handback_needs_three_parts_and_sets_the_summary(self):
+        task = self.add()
+        error = self.js("comment", task, "Summary: done\nChecks run: pytest", "--kind", "handback", expect=2)["error"]
+        self.assertEqual(error["code"], "handback_incomplete")
+        self.assertIn("Left", error["message"])
+        body = "Summary: Moved the check\ninto the parser.\nChecks run: pytest, 12 passed\nLeft: nothing"
+        data = self.js("comment", task, body, "--kind", "handback")
+        self.assertEqual(data["task"]["summary"], "Moved the check\ninto the parser.")
+        self.assertEqual(data["handback"]["Left"], "nothing")
+        self.js("set", task, "--summary", "by hand")
+        self.assertEqual(self.js("show", task)["task"]["summary"], "by hand")
+
+
+class Areas(Base):
+    def test_tree_counts_filters_and_report(self):
+        self.js("area", "add", "admin", "--project", self.project)
+        self.js("area", "add", "content", "--parent", "admin", "--project", self.project, "--note", "question bank")
+        self.js("area", "add", "videos", "--parent", "content", "--project", self.project)
+        top = self.add("top", "--area", "admin")
+        video = self.add("video", "--area", "videos", "--requested-by", "manager")
+        closed = self.add("closed", "--area", "content")
+        self.js("done", closed, "--evidence", "e")
+        loose = self.add("loose")
+        self.assertEqual(self.ls("ls", "--area", "admin"), [top, video])
+        self.assertEqual(self.ls("ls", "--area", "videos"), [video])
+        self.assertEqual(self.ls("ready", "--area", "content"), [video])
+        data = self.js("area", "ls", "--tree", "--project", self.project)
+        admin = data["areas"][0]
+        self.assertEqual((admin["name"], admin["open"], admin["total"], admin["open_direct"]), ("admin", 2, 3, 1))
+        self.assertEqual((admin["children"][0]["open"], admin["children"][0]["total"]), (1, 2))
+        self.assertEqual(data["no_area"], {"open": 1, "total": 1})
+        text = self.run_qtask("area", "--tree", "--project", self.project).stdout
+        self.assertIn("\n  content  open 1/2", text)
+        self.assertEqual(self.js("add", "x", "--area", "nope", "--project", self.project, expect=2)["error"]["code"], "unknown_area")
+        self.assertEqual(self.js("ls", "--area", "nope", "--project", self.project, expect=2)["error"]["code"], "unknown_area")
+        self.assertEqual(
+            self.js("area", "add", "admin", "--parent", "videos", "--project", self.project, expect=2)["error"]["code"],
+            "area_cycle",
+        )
+        self.js("set", loose, "--area", "content")
+        self.js("set", loose, "--area", "")
+        self.assertIsNone(self.js("show", loose)["task"]["area"])
+        by_area = self.js("report", "--by", "area", "--project", self.project)["by"]
+        self.assertEqual([(r["area"], r["open"]) for r in by_area], [("admin", 2), ("content", 1), ("videos", 1), (None, 1)])
+        by_who = self.js("report", "--by", "requester", "--project", self.project)["by"]
+        self.assertEqual([(r["label"], r["open"]) for r in by_who], [("manager", 1), ("none", 2)])
+
+
+class NextStep(Base):
+    def test_next_lists_inbox_claims_then_the_top_ready_task(self):
+        mine, idle, expired, top = self.add("mine"), self.add("idle"), self.add("expired"), self.add("top", "--pri", "P0")
+        self.js("comment", mine, "please check", "--to", "alice", agent="bob")
+        self.js("claim", idle, "--ttl-hours", "72", agent="alice")
+        self.sql("UPDATE tasks SET claim_active_at = '2000-01-01T00:00:00Z' WHERE id = ?", idle)
+        self.js("claim", expired, agent="alice")
+        self.sql("UPDATE tasks SET claim_expires_at = ? WHERE id = ?", PAST, expired)
+        data = self.js("next", "--project", self.project, agent="alice")
+        self.assertEqual(
+            [(s["what"], s["task_id"]) for s in data["steps"]],
+            [("inbox", mine), ("idle_claim", idle), ("expired_claim", expired), ("ready", top)],
+        )
+        self.assertIn(f"qtask claim {top}", data["steps"][-1]["commands"])
+        self.assertEqual(self.js("next", "--project", self.project)["steps"][0]["what"], "name")
+
+
+class HandOffPack(GitBase):
+    def test_prompt_context_and_export(self):
+        task = self.add("ship it", "--plan", "/plans/p.md")
+        self.assertEqual(self.js("prompt", task, expect=2)["error"]["code"], "agent_required")
+        self.q("project", "set-setup", "bash scripts/worktree-setup.sh")
+        self.js("set", task, "--worktree", "/wt/ship")
+        note = Path(self.home, "notes.md")
+        note.write_text("x", encoding="utf-8")
+        added = self.js("context", task, "add", str(note), "--note", "read first")
+        self.assertTrue(added["exists"])
+        self.js("context", task, "add", "missing/file.py")
+        self.js("context", task, "rm", "2")
+        self.assertEqual(self.js("context", task, "rm", "2", expect=5)["error"]["code"], "context_not_found")
+        self.assertEqual([f["n"] for f in self.js("context", task)["files"]], [1])
+        prompt = self.js("prompt", task, agent="be-7")["prompt"]
+        for needle in ("You are agent be-7", "cd /wt/ship", "bash scripts/worktree-setup.sh", "/plans/p.md",
+                       f"qtask claim {task}", "qtask scan --staged", "--kind handback", "read first"):
+            self.assertIn(needle, prompt)
+        self.assertEqual(prompt.encode("ascii", "replace").decode("ascii"), prompt)
+        refused = self.js("export", task, "--pack", str(Path(self.repo, "pack")), expect=4)["error"]
+        self.assertEqual(refused["code"], "pack_in_repo")
+        outside = Path(self.home, "packs-out")
+        path = Path(self.js("export", task, "--pack", str(outside), agent="be-7")["path"])
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("## Context files", text)
+        self.assertIn("read first", text)
+        self.assertIn("You are agent be-7", text)
+        default = Path(self.js("export", task, "--pack")["path"])
+        self.assertTrue(str(default).replace("\\", "/").endswith(f"packs/app/{task}/pack.md"))
+
+
+class Extras(Base):
+    def test_new_sides_and_kinds(self):
+        task = self.add("x", "--side", "mobile", "--kind", "content")
+        self.js("set", task, "--side", "qa", "--kind", "research")
+        self.js("comment", task, "Summary: a\nChecks run: b\nLeft: c", "--kind", "handback")
+
+    def test_split_and_take(self):
+        parent = self.add("feature", "--requested-by", "manager", "--audience", "students")
+        data = self.js("split", parent, "--part", "be", "--part", "fe", "--part", "be")
+        self.assertEqual(len(data["created"]), 2)
+        children = data["children"]
+        self.assertEqual([(c["side"], c["parent_id"], c["requested_by"]) for c in children],
+                         [("be", parent, "manager"), ("fe", parent, "manager")])
+        again = self.js("split", parent, "--part", "fe")
+        self.assertEqual((again["created"], again["existing"]), ([], [children[1]["id"]]))
+        taken = self.js("take", parent, "--part", "fe", agent="alice")["task"]
+        self.assertEqual((taken["id"], taken["claimed_by"]), (children[1]["id"], "alice"))
+        self.assertEqual(self.js("take", parent, "--part", "1", agent="bob")["task"]["id"], children[0]["id"])
+        self.assertEqual(self.js("take", parent, "--part", "qa", agent="bob", expect=5)["error"]["code"], "part_not_found")
+        self.assertEqual(self.js("split", children[0]["id"], "--part", "fe", expect=2)["error"]["code"], "parent_too_deep")
+
+    def test_similar_titles_on_add(self):
+        first = self.add("Fix the login redirect for old links")
+        data = self.js("add", "Login redirect for old links breaks", "--project", self.project)
+        self.assertEqual([s["id"] for s in data["similar"]], [first])
+        self.assertIn("Similar open tasks", self.run_qtask("add", "login redirect old links", "--project", self.project).stdout)
+        self.assertEqual(self.js("similar", "something else entirely", "--project", self.project)["count"], 0)
+
+    def test_bug_template(self):
+        error = self.js("add", "crash", "--kind", "bug", "--body", "Steps: a", "--project", self.project, expect=2)["error"]
+        self.assertEqual(error["code"], "bug_template")
+        self.assertIn("Expected", error["message"])
+        self.add("crash", "--kind", "bug", "--body", BUG_BODY)
+        template = self.js("template", "bug")["template"]
+        self.assertIn("Expected:", template)
+        self.assertEqual(self.run_qtask("template", "nope").returncode, 2)
+
+
+class AgentSchema(Base):
+    def test_migration_from_schema_six_keeps_data_and_upgrades_it(self):
+        qtask = load_qtask()
+        conn = sqlite3.connect(Path(self.home, "qtask.db"), isolation_level=None)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        for version in range(1, 7):
+            qtask.MIGRATIONS[version](conn)
+            conn.execute("INSERT INTO schema_version VALUES (?, 'x')", (version,))
+        conn.execute(
+            "INSERT INTO projects(name, prefix, next_n, created_at, short_name) "
+            f"VALUES ('{self.project}', 'APP', 4, '2026-01-01T00:00:00Z', 'app')"
+        )
+        rows = [
+            ("APP-1", "tagged", '["manager-list-1112", "ui"]', None, None),
+            ("APP-2", "claimed", "[]", "alice", "2999-01-01T00:00:00Z"),
+            ("APP-3", "expired", "[]", "bob", "2000-01-01T00:00:00Z"),
+        ]
+        for task_id, title, tags, holder, until in rows:
+            status = "in_progress" if holder else "ready"
+            conn.execute(
+                "INSERT INTO tasks(id, project, title, tags, status, claimed_by, claim_expires_at, created_by, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (task_id, self.project, title, tags, status, holder, until),
+            )
+        conn.execute(
+            "INSERT INTO events(task_id, actor, field, old, new, at) VALUES "
+            "('APP-2', 'alice', 'status', 'backlog', 'in_progress', '2026-01-02T00:00:00Z'), "
+            "('APP-3', 'bob', 'status', 'backlog', 'in_progress', '2026-01-02T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO comments(task_id, author, kind, body, created_at) VALUES ('APP-1', 'old', 'note', 'n', 'x')"
+        )
+        conn.close()
+        tagged = self.js("show", "APP-1")
+        self.assertEqual(self.sql("SELECT version FROM schema_version"), [(n,) for n in range(1, LATEST_SCHEMA + 1)])
+        self.assertEqual(self.sql("PRAGMA integrity_check"), [("ok",)])
+        task = tagged["task"]
+        self.assertEqual((task["requested_by"], task["requested_on"]), ("manager", "2026-11-12"))
+        self.assertEqual(task["tags"], ["manager-list-1112", "ui"])
+        self.assertIn(("qtask", "requested_by"), [(e["actor"], e["field"]) for e in tagged["events"]])
+        claimed = self.js("show", "APP-2")["task"]
+        self.assertEqual((claimed["claimed_from"], claimed["claim_active_at"]), ("backlog", "2026-01-02T00:00:00Z"))
+        expired = self.js("show", "APP-3")["task"]
+        self.assertEqual((expired["status"], expired["claimed_by"]), ("backlog", None))
+        # Wider CHECK lists take the new values; old values and bad values behave as before.
+        self.js("comment", "APP-1", "Summary: a\nChecks run: b\nLeft: c", "--kind", "handback")
+        self.js("set", "APP-1", "--side", "mobile", "--kind", "chore")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.sql("UPDATE tasks SET side = 'nope' WHERE id = 'APP-1'")
+        self.assertEqual(self.add("new"), "APP-4")
+        self.assertEqual([c["body"] for c in self.js("search", "n", "--all")["comments"]][:1], ["n"])
+        self.js("context", "APP-1", "add", "a.md")
+        export = Path(self.js("backup")["jsonl"]).read_text(encoding="utf-8")
+        self.assertIn("context_files", {json.loads(line)["table"] for line in export.splitlines()})
 
 
 class Version(Base):

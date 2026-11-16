@@ -8,11 +8,13 @@ Exit codes:
   0    success
   1    unexpected, file, git or database error
   2    bad usage or invalid value, or not in a git repo when the command needs one
+       (also an unknown area, a bug without Steps/Expected/Actual, an incomplete handback)
   3    another agent holds a valid claim
   4    a rule refused the action (closed, blocked, open question, child or checklist item,
        no evidence, prefix taken, task IDs found by scan, text blocked from publishing,
-       already published, a hub command that needs a terminal)
-  5    task, comment, checklist item or commit not found
+       already published, a hub command that needs a terminal, a parked status with no
+       reason, a review action on a task not in review, a hand-off pack inside a repo)
+  5    task, comment, checklist item, commit, context file or part not found
   130  stopped with Ctrl-C
 
 Needs SQLite 3.24 or newer with JSON functions, and git 2.31 or newer to detect projects,
@@ -52,7 +54,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -62,16 +64,40 @@ EXIT_REFUSED = 4
 EXIT_NOT_FOUND = 5
 EXIT_INTERRUPTED = 130
 
-KINDS = ("task", "bug", "decision", "question", "improvement", "review")
+# The *_V1 tuples are the CHECK lists schema 1 wrote. Schema 8 widens them to the full tuples.
+KINDS_V1 = ("task", "bug", "decision", "question", "improvement", "review")
+KINDS = KINDS_V1 + ("feature", "chore", "content", "research")
 STATUSES = (
     "backlog", "ready", "in_progress", "blocked",
     "needs_review", "needs_confirm", "done", "dropped",
 )
 CLOSED = ("done", "dropped")
+PARKED = ("needs_confirm", "blocked")
+LANES = {"ready": "planned", "backlog": "backlog"}
 PRIORITIES = ("P0", "P1", "P2", "P3")
-SIDES = ("fe", "be", "infra", "docs", "other")
+SIDES_V1 = ("fe", "be", "infra", "docs", "other")
+SIDES = SIDES_V1 + ("mobile", "content", "qa")
 VISIBILITIES = ("local", "public")
-COMMENT_KINDS = ("note", "question", "answer", "decision", "review")
+COMMENT_KINDS_V1 = ("note", "question", "answer", "decision", "review")
+COMMENT_KINDS = COMMENT_KINDS_V1 + ("handback",)
+REQUESTERS = ("manager", "stakeholder", "developer", "scan", "agent")
+AUDIENCES = ("students", "teachers", "parents", "managers", "admins", "team")
+WAITING_ON = ("developer", "manager", "person", "external")
+SORTS = ("impact", "oldest", "priority")
+HANDBACK_LABELS = ("Summary", "Checks run", "Left")
+TEMPLATES = {
+    "bug": "Steps:\n1. \n\nExpected:\n\nActual:\n",
+    "feature": "Goal:\n\nUsers:\n\nDone when:\n- \n",
+    "chore": "What:\n\nWhy now:\n\nDone when:\n- \n",
+    "content": "Content:\n\nSource:\n\nReview by:\n",
+    "research": "Question:\n\nOptions:\n- \n\nAnswer by:\n",
+}
+BUG_SECTIONS = ("Steps", "Expected", "Actual")
+SYSTEM_ACTOR = "qtask"
+DEFAULT_TTL_HOURS = 2.0
+IDLE_HOURS = 24
+WIP_LIMIT = 2
+BRIEF_BYTES = 2048
 DEPLOY_STATES = ("none", "staging", "production")
 TODO_ACTIONS = ("add", "done", "undo", "rm")
 DEVELOPER = "developer"
@@ -85,7 +111,7 @@ MIN_SQLITE = (3, 24, 0)
 BACKUPS_KEPT = 7
 BACKUP_TABLES = (
     "schema_version", "meta", "projects", "tasks", "comments", "links", "events", "commits", "todos",
-    "hub_links",
+    "hub_links", "areas", "context_files",
 )
 GIT_TIMEOUT = 15
 SCAN_TIMEOUT = 120
@@ -129,10 +155,10 @@ SCHEMA_V1 = [
         parent_id TEXT REFERENCES tasks(id),
         title TEXT NOT NULL,
         body TEXT,
-        kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN {KINDS!r}),
+        kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN {KINDS_V1!r}),
         status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN {STATUSES!r}),
         priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN {PRIORITIES!r}),
-        side TEXT CHECK (side IS NULL OR side IN {SIDES!r}),
+        side TEXT CHECK (side IS NULL OR side IN {SIDES_V1!r}),
         tags TEXT NOT NULL DEFAULT '[]',
         owner TEXT,
         claimed_by TEXT,
@@ -155,7 +181,7 @@ SCHEMA_V1 = [
         task_id TEXT NOT NULL REFERENCES tasks(id),
         author TEXT NOT NULL,
         to_agent TEXT,
-        kind TEXT NOT NULL DEFAULT 'note' CHECK (kind IN {COMMENT_KINDS!r}),
+        kind TEXT NOT NULL DEFAULT 'note' CHECK (kind IN {COMMENT_KINDS_V1!r}),
         body TEXT NOT NULL,
         resolved INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
@@ -545,7 +571,135 @@ def migrate_6(conn):
     )
 
 
-MIGRATIONS = {1: migrate_1, 2: migrate_2, 3: migrate_3, 4: migrate_4, 5: migrate_5, 6: migrate_6}
+def migrate_7(conn):
+    """
+    Leases that follow activity. claimed_from is the lane a claim came from, so a release or an
+    expired lease puts the task back there. claim_active_at is the holder's last event.
+    """
+    conn.execute("ALTER TABLE tasks ADD COLUMN claimed_from TEXT")
+    conn.execute("ALTER TABLE tasks ADD COLUMN claim_ttl_hours REAL")
+    conn.execute("ALTER TABLE tasks ADD COLUMN claim_active_at TEXT")
+    # Open claims: the lane is the status before the last move to in_progress, else ready.
+    conn.execute(
+        f"""UPDATE tasks AS t SET
+            claimed_from = coalesce((
+                SELECT e.old FROM events e
+                WHERE e.task_id = t.id AND e.field = 'status' AND e.new = 'in_progress'
+                  AND e.old IN ('ready', 'backlog')
+                ORDER BY e.id DESC LIMIT 1), 'ready'),
+            claim_active_at = coalesce((
+                SELECT max(e.at) FROM events e WHERE e.task_id = t.id AND e.actor = t.claimed_by), t.updated_at)
+            WHERE t.claimed_by IS NOT NULL AND t.status NOT IN {SQL_CLOSED}"""
+    )
+
+
+def widen_checks(conn, changes):
+    """
+    Add values to CHECK (x IN (...)) lists, the way the SQLite docs allow for relaxing a
+    constraint: edit the stored CREATE TABLE text and bump schema_version. Existing rows stay
+    valid, and no table is rebuilt. changes: (table, old tuple, new tuple).
+    """
+    version = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.execute("PRAGMA writable_schema = ON")
+    try:
+        for table, old, new in changes:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone()[0]
+            before, after = f"IN {old!r}", f"IN {new!r}"
+            if sql.count(before) != 1:
+                raise QtaskError(
+                    "schema_unexpected",
+                    f"The {table} table does not look the way qtask made it, so qtask left it alone. "
+                    "Restore a backup or report this.",
+                )
+            conn.execute(
+                "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+                (sql.replace(before, after), table),
+            )
+        conn.execute(f"PRAGMA schema_version = {version + 1}")
+    finally:
+        conn.execute("PRAGMA writable_schema = OFF")
+
+
+MANAGER_TAG_RE = re.compile(r"^manager-list(?:-(\d{2})(\d{2}))?", re.IGNORECASE)
+
+
+def migrate_8(conn):
+    """
+    Who asked for a task and for whom, what it waits on, its next step and summary, its area.
+    Widens kinds, sides and comment kinds. Tasks tagged manager-list* get requested_by manager;
+    the tags stay.
+    """
+    for column in (
+        "requested_by", "requested_name", "requested_on", "audience", "waiting_on", "waiting_note",
+        "next_step", "summary", "area",
+    ):
+        conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+    widen_checks(conn, [
+        ("tasks", KINDS_V1, KINDS),
+        ("tasks", SIDES_V1, SIDES),
+        ("comments", COMMENT_KINDS_V1, COMMENT_KINDS),
+    ])
+    at = now()
+    rows = conn.execute(
+        "SELECT t.id, t.created_at, j.value FROM tasks t, json_each(t.tags) j "
+        "WHERE j.value LIKE 'manager-list%' ORDER BY t.id, j.value"
+    ).fetchall()
+    seen = set()
+    for task_id, created_at, tag in rows:
+        match = MANAGER_TAG_RE.match(tag)
+        if task_id in seen or not match:
+            continue
+        seen.add(task_id)
+        day = None
+        if match.group(1):
+            with contextlib.suppress(ValueError):
+                day = datetime.strptime(f"{created_at[:4]}-{match.group(1)}-{match.group(2)}", "%Y-%m-%d")
+                day = day.strftime("%Y-%m-%d")
+        changed = conn.execute(
+            "UPDATE tasks SET requested_by = 'manager', requested_on = ? WHERE id = ? AND requested_by IS NULL",
+            (day, task_id),
+        ).rowcount
+        if changed:
+            conn.execute(
+                "INSERT INTO events(task_id, actor, field, old, new, at) VALUES (?, ?, 'requested_by', NULL, ?, ?)",
+                (task_id, SYSTEM_ACTOR, f"manager, from the tag {tag}", at),
+            )
+    conn.execute("CREATE INDEX idx_tasks_area ON tasks(project, area)")
+
+
+def migrate_9(conn):
+    """Areas of a project as a tree, and file links kept on a task for hand-offs."""
+    conn.execute(
+        """CREATE TABLE areas (
+            project TEXT NOT NULL REFERENCES projects(name),
+            name TEXT NOT NULL,
+            parent TEXT,
+            note TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (project, name)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE context_files (
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            n INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            note TEXT,
+            added_by TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            removed_at TEXT,
+            PRIMARY KEY (task_id, n)
+        )"""
+    )
+
+
+MIGRATIONS = {
+    1: migrate_1, 2: migrate_2, 3: migrate_3, 4: migrate_4, 5: migrate_5, 6: migrate_6, 7: migrate_7,
+    8: migrate_8, 9: migrate_9,
+}
 
 
 def schema_version(conn):
@@ -629,6 +783,8 @@ class Ctx:
         self.backup_due = False
         self.committed = False
         self.sent = False  # A request changed the hub, so running the command again would repeat it.
+        self.auto_released = []
+        self.warnings = []
 
     def project(self):
         """Project from --project or cwd. Raises outside a repo."""
@@ -688,11 +844,77 @@ def write_tx(ctx):
         raise
 
 
+def parse_iso(text):
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
 def log_event(ctx, task_id, field, old, new, at=None):
+    """Log a change. An event by the claim holder also extends the claim: the lease follows activity."""
+    at = at or now()
     ctx.conn.execute(
         "INSERT INTO events(task_id, actor, field, old, new, at) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, ctx.agent, field, old, new, at or now()),
+        (task_id, ctx.agent, field, old, new, at),
     )
+    if ctx.agent in (UNKNOWN_AGENT, SYSTEM_ACTOR):
+        return
+    row = ctx.conn.execute(
+        "SELECT claimed_by, claim_expires_at, claim_ttl_hours FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row and row["claimed_by"] == ctx.agent and row["claim_expires_at"] and row["claim_expires_at"] > at:
+        hours = row["claim_ttl_hours"] or DEFAULT_TTL_HOURS
+        until = iso(parse_iso(at) + timedelta(hours=hours))
+        ctx.conn.execute(
+            "UPDATE tasks SET claim_active_at = ?, claim_expires_at = max(claim_expires_at, ?) WHERE id = ?",
+            (at, until, task_id),
+        )
+
+
+def release_status(conn, row):
+    """The status a task takes when its claim ends: the lane it came from, unless it waits on someone."""
+    status = row["status"]
+    if status in ("needs_review", "blocked", "backlog", "ready"):
+        return status
+    if status == "needs_confirm" and (open_question_ids(conn, row["id"]) or row["waiting_on"]):
+        return status
+    return row["claimed_from"] if row["claimed_from"] in LANES else "ready"
+
+
+def release_expired(ctx):
+    """
+    Release every claim whose lease ran out, back to the lane it came from, with an auto_released
+    event by qtask. Runs before each command in its own short transaction.
+    """
+    conn = ctx.conn
+    at = now()
+    expired = f"t.claimed_by IS NOT NULL AND (t.claim_expires_at IS NULL OR t.claim_expires_at <= ?)"
+    if not conn.execute(f"SELECT 1 FROM tasks t WHERE {expired} LIMIT 1", (at,)).fetchone():
+        return []
+    released = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for row in conn.execute(f"SELECT * FROM tasks t WHERE {expired} ORDER BY t.id", (at,)).fetchall():
+            closed = row["status"] in CLOSED
+            status = row["status"] if closed else release_status(conn, row)
+            conn.execute(
+                "UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL, claim_ttl_hours = NULL, "
+                "claimed_from = NULL, status = ?, updated_at = ? WHERE id = ?",
+                (status, at, row["id"]),
+            )
+            events = [("auto_released", row["claimed_by"], f"lease ended {row['claim_expires_at'] or 'unset'}")]
+            if status != row["status"]:
+                events.append(("status", row["status"], status))
+            conn.executemany(
+                "INSERT INTO events(task_id, actor, field, old, new, at) VALUES (?, ?, ?, ?, ?, ?)",
+                [(row["id"], SYSTEM_ACTOR, f, o, n, at) for f, o, n in events],
+            )
+            released.append({"id": row["id"], "claimed_by": row["claimed_by"], "status": status})
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+        raise
+    return released
 
 
 def apply_changes(ctx, row, changes):
@@ -790,7 +1012,7 @@ def open_question_ids(conn, task_id):
 def settle_needs_confirm(ctx, task_id):
     """Move a needs_confirm task on once its last open question closes."""
     row = get_row(ctx.conn, task_id)
-    if row["status"] != "needs_confirm" or open_question_ids(ctx.conn, task_id):
+    if row["status"] != "needs_confirm" or open_question_ids(ctx.conn, task_id) or row["waiting_on"]:
         return
     apply_changes(ctx, row, {"status": "in_progress" if claim_is_valid(row) else "ready"})
 
@@ -955,6 +1177,16 @@ def build_filters(ctx, where, params):
     if a.parent:
         where.append("t.parent_id = ?")
         params.append(normalize_id(a.parent))
+    if getattr(a, "requested_by", None):
+        where.append("t.requested_by = ?")
+        params.append(choice(a.requested_by, REQUESTERS, "--requested-by"))
+    if getattr(a, "audience", None):
+        where.append("t.audience = ?")
+        params.append(choice(a.audience, AUDIENCES, "--audience"))
+    if getattr(a, "area", None):
+        names = area_subtree(ctx.conn, ctx.scope(), clean_area(a.area))
+        where.append(f"t.area IN ({','.join('?' * len(names))})")
+        params.extend(names)
     if a.search:
         task_ids, comment_ids = search_hits(ctx.conn, a.search)
         tasks = hit_table(ctx.conn, "hit_tasks", task_ids)
@@ -973,8 +1205,29 @@ def hit_table(conn, name, ids):
     return f"(SELECT id FROM temp.{name})"
 
 
-def select_tasks(ctx, where, params):
-    sql = f"{TASK_SELECT} WHERE {' AND '.join(where) if where else '1'} ORDER BY {SQL_ORDER}"
+SQL_AUDIENCE_RANK = (
+    "CASE t.audience " + " ".join(f"WHEN '{name}' THEN {n}" for n, name in enumerate(AUDIENCES))
+    + f" ELSE {len(AUDIENCES)} END"
+)
+SQL_IMPACT = (
+    "CASE WHEN t.requested_by IN ('manager', 'stakeholder') THEN 0 ELSE 1 END, "
+    f"CASE WHEN t.kind = 'bug' THEN 0 ELSE 1 END, {SQL_AUDIENCE_RANK}, {SQL_ORDER}"
+)
+SQL_OLDEST = "t.created_at, CAST(substr(t.id, instr(t.id, '-') + 1) AS INTEGER)"
+SQL_LANE = "CASE t.status WHEN 'ready' THEN 0 WHEN 'backlog' THEN 1 ELSE 2 END"
+
+
+def sort_order(name, lanes=False):
+    """
+    ORDER BY text. impact: manager and stakeholder requests, then bugs, then audience (students
+    first), then priority, then oldest. oldest: creation time. priority: priority, then oldest.
+    """
+    order = {"impact": SQL_IMPACT, "oldest": SQL_OLDEST, "priority": SQL_ORDER}[choice(name, SORTS, "--sort")]
+    return f"{SQL_LANE}, {order}" if lanes else order
+
+
+def select_tasks(ctx, where, params, order=SQL_ORDER):
+    sql = f"{TASK_SELECT} WHERE {' AND '.join(where) if where else '1'} ORDER BY {order}"
     limit = getattr(ctx.args, "limit", None)
     if limit is not None:
         if limit < 1:
@@ -993,12 +1246,20 @@ def task_line(task):
         parts.append(f"[todo {task['todo_progress']}]")
     if task.get("deployed", "none") != "none":
         parts.append(f"[on {task['deployed']}]")
+    if task.get("requested_by"):
+        parts.append(f"[from {task['requested_by']}]")
+    if task.get("audience"):
+        parts.append(f"[for {task['audience']}]")
+    if task.get("area"):
+        parts.append(f"[area {task['area']}]")
     if task["claim_valid"]:
         parts.append(f"[claimed by {task['claimed_by']}]")
     elif task["claimed_by"]:
         parts.append(f"[claim of {task['claimed_by']} expired]")
     if task["blocked_by"]:
         parts.append(f"[blocked by {', '.join(task['blocked_by'])}]")
+    if task.get("waiting_on") and task["status"] in PARKED:
+        parts.append(f"[waits on {task['waiting_on']}]")
     return " ".join(parts)
 
 
@@ -1126,6 +1387,105 @@ def run_backup(conn):
 # ------------------------------------------------------------------ commands
 
 
+def clean_day(value, flag):
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise usage_error(f"{flag} must look like YYYY-MM-DD. Got {value!r}.") from None
+
+
+def optional_choice(value, allowed, flag):
+    """An empty value clears the field."""
+    return choice(value, allowed, flag) if value.strip() else None
+
+
+def field_flags(a):
+    """The request, audience, waiting and hand-off fields passed on add or set. Empty clears."""
+    out = {}
+    if a.requested_by is not None:
+        out["requested_by"] = optional_choice(a.requested_by, REQUESTERS, "--requested-by")
+    if a.requester is not None:
+        out["requested_name"] = text_or_null(a.requester)
+    if a.requested_on is not None:
+        out["requested_on"] = clean_day(a.requested_on, "--requested-on") if a.requested_on.strip() else None
+    if a.audience is not None:
+        out["audience"] = optional_choice(a.audience, AUDIENCES, "--audience")
+    if a.waiting_on is not None:
+        out["waiting_on"] = optional_choice(a.waiting_on, WAITING_ON, "--waiting-on")
+    if a.waiting_note is not None:
+        out["waiting_note"] = text_or_null(a.waiting_note)
+    if a.next is not None:
+        out["next_step"] = text_or_null(a.next)
+    if getattr(a, "summary", None) is not None:
+        out["summary"] = text_or_null(a.summary)
+    return out
+
+
+def check_parked(conn, task_id, status, waiting_on):
+    """needs_confirm and blocked need a reason: an open question, an open blocker, or waiting_on."""
+    if status not in PARKED or waiting_on:
+        return
+    if task_id:
+        if status == "needs_confirm" and open_question_ids(conn, task_id):
+            return
+        if status == "blocked" and fetch_task(conn, task_id)["blocked_by"]:
+            return
+    shown = task_id or "the task"
+    raise refused(
+        "waiting_on_required",
+        f"Say who {shown} waits on before it moves to {status}: --waiting-on "
+        f"{'|'.join(WAITING_ON)} --waiting-note \"what for\". Or ask with qtask ask ID \"question\" --to WHO, "
+        "or link a blocker with qtask link OTHER --blocks ID.",
+        status=status,
+    )
+
+
+def missing_sections(body, sections):
+    found = {m.group(1).lower() for m in re.finditer(r"(?im)^\s*#*\s*([A-Za-z ]+?)\s*:", body or "")}
+    return [s for s in sections if s.lower() not in found]
+
+
+def check_template(kind, body):
+    if kind != "bug":
+        return
+    missing = missing_sections(body, BUG_SECTIONS)
+    if missing:
+        raise usage_error(
+            f"A bug needs Steps:, Expected: and Actual: lines in its body. Missing: {', '.join(missing)}. "
+            "Print the template with qtask template bug, fill it, and pass it with --body-file.",
+            "bug_template",
+        )
+
+
+def similar_tasks(conn, project, title, skip=None, limit=5):
+    """Open tasks of the project whose titles share most of their words with `title`."""
+    words = title_words(title)
+    if not words:
+        return []
+    found = []
+    for row in conn.execute(
+        f"SELECT id, title, status FROM tasks WHERE project = ? AND status NOT IN {SQL_CLOSED}", (project,)
+    ):
+        if row["id"] == skip:
+            continue
+        other = title_words(row["title"])
+        shared = words & other
+        if not shared:
+            continue
+        score = len(shared) / len(words | other)
+        if score >= 0.5 or (len(shared) >= 3 and score >= 0.34):
+            found.append({"id": row["id"], "title": row["title"], "status": row["status"], "score": round(score, 2)})
+    found.sort(key=lambda f: (-f["score"], f["id"]))
+    return found[:limit]
+
+
+STOP_WORDS = {"the", "and", "for", "with", "from", "into", "add", "fix", "use", "make", "new", "a", "an", "of", "to", "in", "on"}
+
+
+def title_words(title):
+    return {w for w in re.findall(r"\w+", title.casefold()) if len(w) > 1 and w not in STOP_WORDS}
+
+
 def cmd_add(ctx):
     a = ctx.args
     if a.all:
@@ -1138,6 +1498,11 @@ def cmd_add(ctx):
     status = open_status(a.status)
     side = choice(a.side, SIDES, "--side") if a.side else None
     tags = clean_tags(a.tag)
+    fields = field_flags(a)
+    check_template(kind, a.body)
+    if fields.get("requested_by") and "requested_on" not in fields:
+        fields["requested_on"] = datetime.now().strftime("%Y-%m-%d")
+    area = clean_area(a.area) if a.area else None
     parent_id = normalize_id(a.parent) if a.parent else None
     if parent_id and not a.project:
         project = get_row(ctx.conn, parent_id)["project"]
@@ -1149,23 +1514,50 @@ def cmd_add(ctx):
             if parent["project"] != project:
                 raise usage_error(f"Parent {parent_id} belongs to another project.")
             assert_parent_allowed(conn, parent)
+        check_parked(conn, None, status, fields.get("waiting_on"))
         row = ensure_project(conn, project)
+        if area:
+            require_area(conn, row["name"], area)
         task_id = f"{row['prefix']}-{row['next_n']}"
+        similar = similar_tasks(conn, row["name"], title)
         conn.execute("UPDATE projects SET next_n = next_n + 1 WHERE name = ?", (project,))
         at = now()
         conn.execute(
             "INSERT INTO tasks(id, project, parent_id, title, body, kind, status, priority, side, "
-            "tags, owner, plan_path, branch, pr, created_by, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "tags, owner, plan_path, branch, pr, created_by, created_at, updated_at, area) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id, row["name"], parent_id, title, a.body, kind, status, priority, side,
                 json.dumps(tags, ensure_ascii=False), a.owner, a.plan, a.branch, a.pr,
-                ctx.agent, at, at,
+                ctx.agent, at, at, area,
             ),
         )
+        if fields:
+            columns = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE tasks SET {columns} WHERE id = ?", (*fields.values(), task_id))
         log_event(ctx, task_id, "created", None, title, at)
     task = fetch_task(ctx.conn, task_id)
-    return {"task": task}, f"Created {task_id}: {title}"
+    text = f"Created {task_id}: {title}"
+    if similar:
+        text += "\nSimilar open tasks, check you did not add it twice:\n" + "\n".join(
+            f"  {s['id']} {s['status']}: {s['title']}" for s in similar
+        )
+    return {"task": task, "similar": similar}, text
+
+
+def cmd_similar(ctx):
+    title = ctx.args.title.strip()
+    if not title:
+        raise usage_error("similar needs a title.")
+    project = ctx.project()
+    found = similar_tasks(ctx.conn, project, title)
+    lines = [f"{s['id']} {s['status']} ({s['score']}): {s['title']}" for s in found]
+    return {"title": title, "similar": found, "count": len(found)}, "\n".join(lines) if lines else "No similar open tasks."
+
+
+def cmd_template(ctx):
+    kind = choice(ctx.args.kind, tuple(TEMPLATES), "kind")
+    return {"kind": kind, "template": TEMPLATES[kind]}, TEMPLATES[kind].rstrip("\n")
 
 
 def cmd_ls(ctx):
@@ -1182,7 +1574,7 @@ def cmd_ls(ctx):
     elif not a.include_closed and not a.deployed:
         # A deployed task is often done already, so --deployed lists closed tasks too.
         where.append(f"t.status NOT IN {SQL_CLOSED}")
-    tasks = select_tasks(ctx, where, params)
+    tasks = select_tasks(ctx, where, params, sort_order(a.sort or "priority"))
     return {"tasks": tasks, "count": len(tasks)}, tasks_text(tasks)
 
 
@@ -1194,21 +1586,83 @@ def stale_claims(ctx, project):
     return [task_dict(r) for r in ctx.conn.execute(sql, params).fetchall()]
 
 
-def cmd_ready(ctx):
-    at = now()
+def idle_claims(ctx, project, hours=IDLE_HOURS):
+    """Valid claims whose holder logged nothing for more than `hours`."""
+    cutoff = iso(utc_now() - timedelta(hours=hours))
     where = [
-        "t.status = 'ready'",
+        "t.claimed_by IS NOT NULL", "t.claim_expires_at > ?", f"t.status NOT IN {SQL_CLOSED}",
+        "coalesce(t.claim_active_at, t.updated_at) < ?",
+    ]
+    params = [now(), cutoff]
+    add_scope(where, params, project)
+    sql = f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY coalesce(t.claim_active_at, t.updated_at), t.id"
+    return [task_dict(r) for r in ctx.conn.execute(sql, params).fetchall()]
+
+
+def lane_of(task):
+    return LANES.get(task["status"], task["status"])
+
+
+def count_by(tasks, key, order):
+    counts = {k: 0 for k in order}
+    for task in tasks:
+        value = task.get(key) or "none"
+        counts[value] = counts.get(value, 0) + 1
+    return {k: v for k, v in counts.items() if v}
+
+
+def ready_where(ctx, lanes):
+    where = [
+        f"t.status IN ({','.join(repr(s) for s in lanes)})",
         f"NOT {SQL_HAS_BLOCKER}",
         "(t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?)",
     ]
-    params = [at]
+    params = [now()]
     build_filters(ctx, where, params)
-    tasks = select_tasks(ctx, where, params)
+    return where, params
+
+
+def cmd_ready(ctx):
+    a = ctx.args
+    if a.planned and a.backlog:
+        raise usage_error("Pass --planned or --backlog, not both. Without either, ready lists both.")
+    lanes = ("ready",) if a.planned else ("backlog",) if a.backlog else ("ready", "backlog")
+    where, params = ready_where(ctx, lanes)
+    every = [task_dict(r) for r in ctx.conn.execute(
+        f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order(a.sort or 'impact', lanes=True)}", params
+    ).fetchall()]
+    if a.limit is not None and a.limit < 1:
+        raise usage_error("--limit must be 1 or more.")
+    tasks = every[:a.limit] if a.limit else every
+    for task in tasks:
+        task["lane"] = lane_of(task)
     stale = [t["id"] for t in stale_claims(ctx, ctx.scope())]
-    text = tasks_text(tasks, "No ready tasks.")
+    footer = {
+        "by_lane": count_by([{**t, "lane": lane_of(t)} for t in every], "lane", LANES.values()),
+        "by_side": count_by(every, "side", SIDES),
+        "by_priority": count_by(every, "priority", PRIORITIES),
+    }
+    lines = [f"{t['lane']:<8} {task_line(t)}" for t in tasks] or ["No ready tasks."]
+    if len(tasks) < len(every):
+        lines.append(f"... {len(every) - len(tasks)} more. Raise --limit to see them.")
+    if every:
+        lines.append(
+            f"{len(every)} claimable. Lanes: {fmt_counts(footer['by_lane'])}. Sides: {fmt_counts(footer['by_side'])}. "
+            f"Priority: {fmt_counts(footer['by_priority'])}."
+        )
+    if ctx.auto_released:
+        lines.append("Released expired claims: " + ", ".join(r["id"] for r in ctx.auto_released))
     if stale:
-        text += f"\nExpired claims you can take over with claim: {', '.join(stale)}"
-    return {"tasks": tasks, "count": len(tasks), "stale_claims": stale}, text
+        lines.append(f"Expired claims you can take over with claim: {', '.join(stale)}")
+    data = {
+        "tasks": tasks, "count": len(tasks), "total": len(every), "counts": footer, "stale_claims": stale,
+        "auto_released": ctx.auto_released,
+    }
+    return data, "\n".join(lines)
+
+
+def fmt_counts(counts):
+    return ", ".join(f"{k} {v}" for k, v in counts.items()) or "none"
 
 
 def cmd_show(ctx):
@@ -1330,16 +1784,21 @@ def cmd_claim(ctx):
         old = get_row(conn, task_id)
         waiting = old["status"] == "needs_confirm" and open_question_ids(conn, task_id)
         new_status = "needs_confirm" if waiting else "in_progress"
+        if old["claimed_by"] == ctx.agent and old["claimed_from"]:
+            lane = old["claimed_from"]
+        else:
+            lane = old["status"] if old["status"] in LANES else (old["claimed_from"] or "ready")
         updated = conn.execute(
             f"""UPDATE tasks AS t
-                SET claimed_by = ?, claim_expires_at = ?, status = ?, updated_at = ?
+                SET claimed_by = ?, claim_expires_at = ?, status = ?, updated_at = ?,
+                    claimed_from = ?, claim_ttl_hours = ?, claim_active_at = ?
                 WHERE t.id = ?
                   AND t.status NOT IN {SQL_CLOSED}
                   AND t.status <> 'blocked'
                   AND NOT {SQL_HAS_BLOCKER}
                   AND (t.claimed_by IS NULL OR t.claimed_by = ?
                        OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?)""",
-            (ctx.agent, expires, new_status, at, task_id, me, at),
+            (ctx.agent, expires, new_status, at, lane, a.ttl_hours, at, task_id, me, at),
         ).rowcount
         if updated == 0:
             if old["status"] in CLOSED:
@@ -1363,7 +1822,33 @@ def cmd_claim(ctx):
         if old["status"] != new_status:
             log_event(ctx, task_id, "status", old["status"], new_status, at)
     task = fetch_task(ctx.conn, task_id)
-    return {"task": task}, f"Claimed {task_id} as {ctx.agent} until {expires}. Status: {new_status}."
+    text = f"Claimed {task_id} as {ctx.agent} until {expires}. Status: {new_status}."
+    warnings = wip_warnings(ctx, task_id)
+    if warnings:
+        text += "\n" + "\n".join(f"Warning: {w}" for w in warnings)
+    return {"task": task, "warnings": warnings}, text
+
+
+def held_claims(ctx, agent, project=None):
+    """Valid claims of an agent, oldest activity first."""
+    where = ["t.claimed_by = ?", "t.claim_expires_at > ?", f"t.status NOT IN {SQL_CLOSED}"]
+    params = [agent, now()]
+    add_scope(where, params, project)
+    sql = f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY coalesce(t.claim_active_at, t.updated_at), t.id"
+    return [task_dict(r) for r in ctx.conn.execute(sql, params).fetchall()]
+
+
+def wip_warnings(ctx, task_id):
+    """A warning when the agent now holds more than WIP_LIMIT claims. The claim still stands."""
+    if ctx.agent == UNKNOWN_AGENT:
+        return []
+    others = [t["id"] for t in held_claims(ctx, ctx.agent) if t["id"] != task_id]
+    if len(others) < WIP_LIMIT:
+        return []
+    return [
+        f"{ctx.agent} also holds {len(others)} other claims: {', '.join(others)}. "
+        "Finish or release one before you start more work."
+    ]
 
 
 def cmd_release(ctx):
@@ -1385,12 +1870,12 @@ def cmd_release(ctx):
             )
         if claim_is_valid(row) and not mine:
             log_event(ctx, task_id, "force", None, f"release --force, held by {row['claimed_by']}")
-        keep = row["status"] in ("needs_review", "blocked") or (
-            row["status"] == "needs_confirm" and open_question_ids(conn, task_id)
-        )
         apply_changes(
             ctx, row,
-            {"claimed_by": None, "claim_expires_at": None, "status": row["status"] if keep else "ready"},
+            {
+                "claimed_by": None, "claim_expires_at": None, "claim_ttl_hours": None, "claimed_from": None,
+                "status": release_status(conn, row),
+            },
         )
     task = fetch_task(ctx.conn, task_id)
     return {"task": task}, f"Released {task_id}. Status: {task['status']}."
@@ -1432,6 +1917,11 @@ def cmd_set(ctx):
         value = getattr(a, attr)
         if value is not None:
             changes[column] = text_or_null(value)
+    changes.update(field_flags(a))
+    area = None
+    if a.area is not None:
+        area = clean_area(a.area) if a.area.strip() else ""
+        changes["area"] = area or None
     add_tags = clean_tags(a.add_tag)
     remove_tags = clean_tags(a.remove_tag)
     if not changes and not add_tags and not remove_tags and a.parent is None:
@@ -1439,6 +1929,8 @@ def cmd_set(ctx):
     with write_tx(ctx) as conn:
         row = get_row(conn, a.id)
         task_id = row["id"]
+        if area:
+            require_area(conn, row["project"], area)
         if a.parent is not None:
             parent_id = normalize_id(a.parent) if a.parent.strip() else None
             if parent_id:
@@ -1453,6 +1945,14 @@ def cmd_set(ctx):
             changes["tags"] = json.dumps(tags, ensure_ascii=False)
         if "status" in changes and row["status"] in CLOSED:
             changes["closed_at"] = None
+        status = changes.get("status", row["status"])
+        if status != row["status"]:
+            check_parked(conn, task_id, status, changes.get("waiting_on", row["waiting_on"]))
+            if status not in PARKED:
+                changes.setdefault("waiting_on", None)
+                changes.setdefault("waiting_note", None)
+        if changes.get("requested_by") and not row["requested_on"] and "requested_on" not in changes:
+            changes["requested_on"] = row["created_at"][:10]
         apply_changes(ctx, row, changes)
     task = fetch_task(ctx.conn, task_id)
     return {"task": task}, f"Updated {task_id}."
@@ -1487,15 +1987,43 @@ def fetch_comment(conn, comment_id):
     return comment_dict(get_comment_row(conn, comment_id))
 
 
+def parse_handback(text):
+    """The Summary, Checks run and Left sections of a hand-back. Each runs until the next label."""
+    sections, current = {}, None
+    pattern = re.compile(r"^\s*(?:[-*]\s*)?#*\s*(" + "|".join(HANDBACK_LABELS) + r")\s*:\s*(.*)$", re.IGNORECASE)
+    for line in text.split("\n"):
+        match = pattern.match(line)
+        if match:
+            current = next(label for label in HANDBACK_LABELS if label.lower() == match.group(1).lower())
+            sections.setdefault(current, []).append(match.group(2))
+        elif current:
+            sections[current].append(line)
+    result = {label: "\n".join(lines).strip() for label, lines in sections.items()}
+    missing = [label for label in HANDBACK_LABELS if not result.get(label)]
+    if missing:
+        raise usage_error(
+            "A handback needs three filled lines: 'Summary: what changed', 'Checks run: commands and "
+            f"results', 'Left: what is still open, or nothing'. Missing or empty: {', '.join(missing)}.",
+            "handback_incomplete",
+        )
+    return result
+
+
 def cmd_comment(ctx):
     a = ctx.args
     kind = choice(a.kind, COMMENT_KINDS, "--kind")
     author = author_name(a)
+    handback = parse_handback(a.text) if kind == "handback" else None
     with write_tx(ctx) as conn:
         task_id = get_row(conn, a.id)["id"]
         comment_id = insert_comment(ctx, task_id, kind, a.text, text_or_null(a.to), author)
+        if handback:
+            apply_changes(ctx, get_row(conn, task_id), {"summary": handback["Summary"]})
     comment = fetch_comment(ctx.conn, comment_id)
-    return {"comment": comment, "task": fetch_task(ctx.conn, task_id)}, f"Comment #{comment_id} added to {task_id}."
+    text = f"Comment #{comment_id} added to {task_id}."
+    if handback:
+        text += " The task summary now reads the hand-back's Summary."
+    return {"comment": comment, "task": fetch_task(ctx.conn, task_id), "handback": handback}, text
 
 
 def cmd_resolve(ctx):
@@ -1657,17 +2185,28 @@ def cmd_unlink(ctx):
 
 def cmd_done(ctx):
     a = ctx.args
-    evidence = (a.evidence or "").strip()
+    return close_done(ctx, a.id, a.evidence, a.force)
+
+
+def close_done(ctx, raw_id, evidence, force, approve=False):
+    """Close a task with evidence. approve: the task must be in needs_review; the submitter gets a comment."""
+    evidence = (evidence or "").strip()
     if not evidence:
+        command = "approve" if approve else "done"
         raise refused(
             "evidence_required",
-            "done needs --evidence with the commands you ran and their results.",
+            f"{command} needs --evidence with the commands you ran and their results.",
         )
     with write_tx(ctx) as conn:
-        row = get_row(conn, a.id)
+        row = get_row(conn, raw_id)
         task_id = row["id"]
         if row["status"] in CLOSED:
             raise refused("task_closed", f"{task_id} is already {row['status']}.", status=row["status"])
+        if approve and row["status"] != "needs_review":
+            raise refused(
+                "not_in_review", f"{task_id} is {row['status']}, not needs_review. See the queue with qtask review.",
+                status=row["status"],
+            )
         questions = open_question_ids(conn, task_id)
         children = [
             r["id"]
@@ -1692,7 +2231,7 @@ def cmd_done(ctx):
             if todos:
                 detail.append("open checklist items " + ", ".join(map(str, todos)))
             joined = " and ".join(detail)
-            if not a.force:
+            if not force:
                 if questions or children:
                     code, fix = "done_refused", "Close them or pass --force."
                 else:
@@ -1709,12 +2248,33 @@ def cmd_done(ctx):
                     open_todos=todos,
                 )
             log_event(ctx, task_id, "force", None, f"done --force with {joined}")
+        if approve:
+            insert_comment(ctx, task_id, "review", f"Approved: {evidence}", submitter(conn, row))
+            if row["evidence"]:
+                evidence = f"{row['evidence']}\nApproved by {ctx.agent}: {evidence}"
+            row = get_row(conn, task_id)
         apply_changes(
             ctx, row,
-            {"status": "done", "evidence": evidence, "closed_at": now(), "claimed_by": None, "claim_expires_at": None},
+            {
+                "status": "done", "evidence": evidence, "closed_at": now(), "claimed_by": None,
+                "claim_expires_at": None, "waiting_on": None, "waiting_note": None,
+            },
         )
     task = fetch_task(ctx.conn, task_id)
-    return {"task": task}, f"Done {task_id}."
+    return {"task": task}, f"{'Approved and closed' if approve else 'Done'} {task_id}."
+
+
+def submitter(conn, row):
+    """Who sent the task to review: the actor of the last move to needs_review, else the holder or owner."""
+    found = conn.execute(
+        "SELECT actor FROM events WHERE task_id = ? AND field = 'status' AND new = 'needs_review' "
+        "ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    for name in (found["actor"] if found else None, row["claimed_by"], row["owner"], row["created_by"]):
+        if name and name not in (UNKNOWN_AGENT, SYSTEM_ACTOR, DEVELOPER):
+            return name
+    return None
 
 
 def cmd_drop(ctx):
@@ -1800,6 +2360,16 @@ def cmd_report(ctx):
         for r in conn.execute(f"{TASK_SELECT} {open_clause} AND {SQL_OPEN_TODOS} ORDER BY {SQL_ORDER}", params)
     ]
     left = sum(n for s, n in by_status.items() if s not in CLOSED)
+    idle = idle_claims(ctx, project)
+    unclaimed = [
+        task_dict(r) for r in conn.execute(
+            f"{TASK_SELECT} {open_clause} AND t.status = 'in_progress' "
+            f"AND (t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?) ORDER BY {SQL_ORDER}",
+            [*params, now()],
+        )
+    ]
+    parked = parked_without_reason(ctx, project)
+    breakdown = report_breakdown(ctx, project, ctx.args.by) if ctx.args.by else None
     data = {
         "project": project,
         "counts_by_status": by_status,
@@ -1812,7 +2382,12 @@ def cmd_report(ctx):
         "stale_claims": stale,
         "blocked": blocked,
         "waiting_on_developer": {"questions": questions, "tasks": waiting},
+        "idle_claims": idle,
+        "in_progress_unclaimed": unclaimed,
+        "parked_no_reason": parked,
     }
+    if breakdown is not None:
+        data["by"] = breakdown
     lines = [f"Project: {project or 'all'}", f"Tasks left: {left}"]
     lines.append("By status: " + ", ".join(f"{k} {v}" for k, v in by_status.items() if v))
     lines.append("Open by priority: " + ", ".join(f"{k} {v}" for k, v in by_priority.items()))
@@ -1827,13 +2402,55 @@ def cmd_report(ctx):
         lines += ["", "On staging, not on production:"] + [f"  {task_line(t)}" for t in on_staging]
     if stale:
         lines += ["", "Stale claims:"] + [f"  {task_line(t)}" for t in stale]
+    if idle:
+        lines += ["", f"Claims idle for more than {IDLE_HOURS} h:"]
+        lines += [f"  {task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]" for t in idle]
+    if unclaimed:
+        lines += ["", "In progress with nobody holding them (ready and next do not list these; claim or release):"]
+        lines += [f"  {task_line(t)}" for t in unclaimed]
+    if parked:
+        lines += ["", "Parked with no recorded reason (set one with --waiting-on):"]
+        lines += [f"  {p['task_id']}: {one_line(p['title'], 100)}" for p in parked]
     if blocked:
         lines += ["", "Blocked:"] + [f"  {task_line(t)}" for t in blocked]
     if questions or waiting:
         lines += ["", "Waiting on the developer:"]
         lines += [f"  {comment_line(c)}" for c in questions]
         lines += [f"  {task_line(t)}" for t in waiting]
+    if breakdown is not None:
+        lines += ["", f"Open tasks by {ctx.args.by}:"] + [f"  {row['label']}  open {row['open']}/{row['total']}" for row in breakdown]
     return data, "\n".join(lines)
+
+
+def report_breakdown(ctx, project, by):
+    """Open and total task counts by area (rolled up to parents) or by requester."""
+    by = choice(by, ("area", "requester"), "--by")
+    conn = ctx.conn
+    rows = []
+    if by == "requester":
+        where, params = [], []
+        add_scope(where, params, project)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        counts = {r["who"]: (r["open"] or 0, r["total"]) for r in conn.execute(
+            f"SELECT coalesce(t.requested_by, 'none') AS who, count(*) AS total, "
+            f"sum(t.status NOT IN {SQL_CLOSED}) AS open FROM tasks t {clause} GROUP BY 1",
+            params,
+        )}
+        for who in (*REQUESTERS, "none"):
+            if who in counts:
+                rows.append({"label": who, "open": counts[who][0], "total": counts[who][1]})
+        return rows
+    projects = [project] if project else [r["name"] for r in conn.execute("SELECT name FROM projects ORDER BY name")]
+    for name in projects:
+        roots, none = area_counts(conn, name)
+        prefix = "" if project else f"{name}: "
+        for depth, node in flat_areas(roots):
+            rows.append({
+                "project": name, "label": prefix + "  " * depth + node["name"], "area": node["name"],
+                "open": node["open"], "total": node["total"],
+            })
+        rows.append({"project": name, "label": prefix + "(no area)", "area": None, **none})
+    return rows
 
 
 def safe_segments(project):
@@ -2077,6 +2694,24 @@ def cmd_project(ctx):
     a = ctx.args
     if a.action == "set-prefix":
         return cmd_set_prefix(ctx)
+    if a.action == "set-setup":
+        if a.value is None:
+            raise usage_error('set-setup needs the command, such as: qtask project set-setup "bash scripts/setup.sh"')
+        if a.all:
+            raise usage_error("set-setup changes one project. Pass --project, not --all.")
+        project = ctx.project()
+        value = a.value.strip()
+        with write_tx(ctx) as conn:
+            project = ensure_project(conn, project)["name"]
+            if value:
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (setup_key(project), value),
+                )
+            else:
+                conn.execute("DELETE FROM meta WHERE key = ?", (setup_key(project),))
+        shown = value or "none"
+        return {"project": project, "setup": value or None}, f"Worktree setup for {project}: {shown}"
     if a.value is not None:
         raise usage_error("project show takes no value. To change the prefix: qtask project set-prefix QT")
     conn = ctx.conn
@@ -2588,6 +3223,719 @@ def cmd_todo(ctx):
 
 
 # -------------------------------------------------------------------- parser
+
+
+# --------------------------------------------------------------------- areas
+
+AREA_RE = re.compile(r"\w[\w.\-]*")
+
+
+def clean_area(raw):
+    name = raw.strip().lower()
+    if not AREA_RE.fullmatch(name) or len(name) > 60:
+        raise usage_error(
+            f"An area name uses letters, digits, dots, dashes and underscores, such as admin-content. Got {raw!r}.",
+            "bad_area",
+        )
+    return name
+
+
+def require_area(conn, project, name):
+    if not conn.execute("SELECT 1 FROM areas WHERE project = ? AND name = ?", (project, name)).fetchone():
+        raise usage_error(f"{project} has no area {name}. Add it with: qtask area add {name}", "unknown_area")
+
+
+def area_children(conn, project):
+    """Map (project, parent) to child names."""
+    where, params = ("WHERE project = ?", (project,)) if project is not None else ("", ())
+    children = {}
+    for row in conn.execute(f"SELECT project, name, parent FROM areas {where} ORDER BY name", params):
+        children.setdefault((row["project"], row["parent"]), []).append(row["name"])
+    return children
+
+
+def area_subtree(conn, project, name):
+    """The area and every area below it. With --all, the same name in each project."""
+    if project is not None:
+        require_area(conn, project, name)
+    children = area_children(conn, project)
+    found, stack = set(), [(p, name) for p in ({k[0] for k in children} | ({project} if project else set()))]
+    while stack:
+        proj, current = stack.pop()
+        if (proj, current) in found:
+            continue
+        found.add((proj, current))
+        stack += [(proj, child) for child in children.get((proj, current), [])]
+    return sorted({n for _, n in found})
+
+
+def area_counts(conn, project):
+    """Areas of a project with open and total task counts, direct and rolled up to the parents."""
+    rows = conn.execute(
+        "SELECT name, parent, note FROM areas WHERE project = ? ORDER BY name", (project,)
+    ).fetchall()
+    direct = {}
+    for row in conn.execute(
+        f"SELECT area, count(*) AS total, sum(status NOT IN {SQL_CLOSED}) AS open FROM tasks "
+        "WHERE project = ? GROUP BY area",
+        (project,),
+    ):
+        direct[row["area"]] = (row["open"] or 0, row["total"])
+    areas = {r["name"]: {"name": r["name"], "parent": r["parent"], "note": r["note"]} for r in rows}
+    kids = {}
+    for area in areas.values():
+        kids.setdefault(area["parent"] if area["parent"] in areas else None, []).append(area["name"])
+
+    def fill(name, seen):
+        area = areas[name]
+        own_open, own_total = direct.get(name, (0, 0))
+        area.update(open_direct=own_open, total_direct=own_total, children=[])
+        total_open, total = own_open, own_total
+        for child in kids.get(name, []):
+            if child in seen:
+                continue
+            node = fill(child, seen | {child})
+            area["children"].append(node)
+            total_open += node["open"]
+            total += node["total"]
+        area.update(open=total_open, total=total)
+        return area
+
+    roots = [fill(name, {name}) for name in kids.get(None, [])]
+    none_open, none_total = direct.get(None, (0, 0))
+    return roots, {"open": none_open, "total": none_total}
+
+
+def flat_areas(nodes, depth=0):
+    for node in nodes:
+        yield depth, node
+        yield from flat_areas(node["children"], depth + 1)
+
+
+def cmd_area(ctx):
+    a = ctx.args
+    if a.action == "add":
+        if not a.name:
+            raise usage_error("area add needs a name, such as: qtask area add admin-content --parent admin")
+        if a.all:
+            raise usage_error("area add needs one project. Pass --project, not --all.")
+        name = clean_area(a.name)
+        parent = clean_area(a.parent) if a.parent and a.parent.strip() else None
+        project = ctx.project()
+        with write_tx(ctx) as conn:
+            project = ensure_project(conn, project)["name"]
+            if parent:
+                require_area(conn, project, parent)
+                chain = parent
+                while chain:
+                    if chain == name:
+                        raise usage_error(f"{parent} is inside {name}, so it cannot be its parent.", "area_cycle")
+                    up = conn.execute(
+                        "SELECT parent FROM areas WHERE project = ? AND name = ?", (project, chain)
+                    ).fetchone()
+                    chain = up["parent"] if up else None
+            old = conn.execute("SELECT * FROM areas WHERE project = ? AND name = ?", (project, name)).fetchone()
+            if old is None:
+                conn.execute(
+                    "INSERT INTO areas(project, name, parent, note, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (project, name, parent, text_or_null(a.note), ctx.agent, now()),
+                )
+                text = f"Added area {name}" + (f" under {parent}." if parent else ".")
+            else:
+                note = text_or_null(a.note) if a.note is not None else old["note"]
+                conn.execute(
+                    "UPDATE areas SET parent = ?, note = ? WHERE project = ? AND name = ?",
+                    (parent if a.parent is not None else old["parent"], note, project, name),
+                )
+                text = f"Updated area {name}."
+        return {"project": project, "area": name, "parent": parent}, text
+    if a.name:
+        raise usage_error("area ls takes no name. To add one: qtask area add NAME")
+    project = ctx.scope()
+    projects = [project] if project else [r["name"] for r in ctx.conn.execute("SELECT name FROM projects ORDER BY name")]
+    data, lines = {"projects": []}, []
+    for name in projects:
+        roots, none = area_counts(ctx.conn, name)
+        data["projects"].append({"project": name, "areas": roots, "no_area": none})
+        if project is None:
+            lines.append(f"{name}:")
+        indent = "" if project else "  "
+        for depth, node in flat_areas(roots):
+            pad = "  " * depth if a.tree else ""
+            label = node["name"] if a.tree or not node["parent"] else f"{node['parent']}/{node['name']}"
+            line = f"{indent}{pad}{label}  open {node['open']}/{node['total']}"
+            if node["children"] and node["open"] != node["open_direct"]:
+                line += f" (direct {node['open_direct']}/{node['total_direct']})"
+            if node["note"]:
+                line += f"  {node['note']}"
+            lines.append(line)
+        lines.append(f"{indent}(no area)  open {none['open']}/{none['total']}")
+    if project is not None:
+        data = {"project": project, "areas": data["projects"][0]["areas"], "no_area": data["projects"][0]["no_area"]}
+    return data, "\n".join(lines)
+
+
+# -------------------------------------------------------------- review queue
+
+
+def entered_status(conn, task_id, status):
+    row = conn.execute(
+        "SELECT max(at) FROM events WHERE task_id = ? AND field = 'status' AND new = ?", (task_id, status)
+    ).fetchone()
+    return row[0]
+
+
+def age_text(since):
+    if not since:
+        return "unknown"
+    seconds = max(0, int((utc_now() - parse_iso(since)).total_seconds()))
+    days, rest = divmod(seconds, 86400)
+    return f"{days}d {rest // 3600}h" if days else f"{rest // 3600}h {rest % 3600 // 60}m"
+
+
+def cmd_review(ctx):
+    conn = ctx.conn
+    where, params = ["t.status = 'needs_review'"], []
+    add_scope(where, params, ctx.scope())
+    tasks = [task_dict(r) for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)}", params)]
+    for task in tasks:
+        task["in_review_since"] = entered_status(conn, task["id"], "needs_review") or task["updated_at"]
+        task["submitted_by"] = submitter(conn, get_row(conn, task["id"]))
+    tasks.sort(key=lambda t: (t["in_review_since"], t["id"]))
+    lines = []
+    for task in tasks:
+        lines.append(f"{task_line(task)} [in review {age_text(task['in_review_since'])}]")
+        if task["summary"]:
+            lines.append(f"  Summary: {one_line(task['summary'], 200)}")
+        lines.append(
+            f"  qtask approve {task['id']} --evidence \"what you checked\"   or   "
+            f"qtask reject {task['id']} --reason \"what to fix\""
+        )
+    return {"tasks": tasks, "count": len(tasks)}, "\n".join(lines) if lines else "No tasks wait for review."
+
+
+def cmd_approve(ctx):
+    a = ctx.args
+    return close_done(ctx, a.id, a.evidence, a.force, approve=True)
+
+
+def cmd_reject(ctx):
+    a = ctx.args
+    reason = (a.reason or "").strip()
+    if not reason:
+        raise refused("reason_required", "reject needs --reason with what to fix.")
+    with write_tx(ctx) as conn:
+        row = get_row(conn, a.id)
+        task_id = row["id"]
+        if row["status"] != "needs_review":
+            raise refused(
+                "not_in_review", f"{task_id} is {row['status']}, not needs_review. See the queue with qtask review.",
+                status=row["status"],
+            )
+        to = submitter(conn, row)
+        comment_id = insert_comment(ctx, task_id, "review", f"Rejected: {reason}", to)
+        apply_changes(ctx, get_row(conn, task_id), {"status": "in_progress"})
+    task = fetch_task(ctx.conn, task_id)
+    sent = f" Comment #{comment_id} went to {to}'s inbox." if to else f" Comment #{comment_id} added."
+    return (
+        {"task": task, "comment": fetch_comment(ctx.conn, comment_id), "notified": to},
+        f"Rejected {task_id}. Status: in_progress.{sent}",
+    )
+
+
+# ----------------------------------------------------------------- decisions
+
+
+def one_line(text, limit=160):
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def waits_on_groups(ctx, project):
+    """Open items grouped by who must act: question targets, waiting_on, blocker tasks, unknown."""
+    conn = ctx.conn
+    groups = {}
+
+    def add(who, item):
+        groups.setdefault(who, []).append(item)
+
+    where, params = ["c.kind = 'question'", "c.resolved = 0", f"t.status NOT IN {SQL_CLOSED}"], []
+    add_scope(where, params, project)
+    for row in conn.execute(
+        "SELECT c.id, c.task_id, c.to_agent, c.author, c.body, t.title FROM comments c "
+        f"JOIN tasks t ON t.id = c.task_id WHERE {' AND '.join(where)} ORDER BY c.id",
+        params,
+    ):
+        who = row["to_agent"] or "anyone"
+        as_flag = f" --as {who}" if who not in ("anyone", ctx.agent) else ""
+        add(who, {
+            "task_id": row["task_id"], "title": row["title"], "comment_id": row["id"], "kind": "question",
+            "asked_by": row["author"], "text": row["body"],
+            "commands": [f'qtask answer {row["id"]} "the answer"{as_flag}'],
+        })
+    where, params = [f"t.status IN {PARKED!r}", f"t.status NOT IN {SQL_CLOSED}"], []
+    add_scope(where, params, project)
+    for task in (task_dict(r) for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params)):
+        questions = open_question_ids(conn, task["id"])
+        if task["waiting_on"]:
+            who = task["waiting_on"]
+            add(who, {
+                "task_id": task["id"], "title": task["title"], "kind": "waiting", "text": task["waiting_note"],
+                "commands": [
+                    f'qtask comment {task["id"]} "their answer" --kind answer --as {who}',
+                    f'qtask set {task["id"]} --status ready',
+                ],
+            })
+        elif task["blocked_by"]:
+            add("other tasks", {
+                "task_id": task["id"], "title": task["title"], "kind": "blocked", "text": ", ".join(task["blocked_by"]),
+                "commands": [f"qtask show {b}" for b in task["blocked_by"]],
+            })
+        elif not questions:
+            add("unknown", {
+                "task_id": task["id"], "title": task["title"], "kind": "no_reason", "text": None,
+                "commands": [f'qtask set {task["id"]} --waiting-on {"|".join(WAITING_ON)} --waiting-note "what for"'],
+            })
+    order = list(WAITING_ON) + sorted(k for k in groups if k not in WAITING_ON + ("other tasks", "unknown", "anyone"))
+    order += ["anyone", "other tasks", "unknown"]
+    return {who: groups[who] for who in order if who in groups}
+
+
+def parked_without_reason(ctx, project):
+    return [item for item in waits_on_groups(ctx, project).get("unknown", [])]
+
+
+def cmd_decisions(ctx):
+    groups = waits_on_groups(ctx, ctx.scope())
+    wanted = ctx.args.for_who
+    if wanted:
+        groups = {k: v for k, v in groups.items() if k == wanted.strip()}
+    lines = []
+    for who, items in groups.items():
+        lines.append(f"Waiting on {who} ({len(items)}):")
+        for item in items:
+            head = f"#{item['comment_id']} " if item.get("comment_id") else ""
+            text = f": {one_line(item['text'])}" if item["text"] else ""
+            lines.append(f"  {item['task_id']} {head}{item['kind']}{text}")
+            lines.append(f"    task: {one_line(item['title'], 100)}")
+            lines += [f"    {command}" for command in item["commands"]]
+    data = {"groups": groups, "count": sum(len(v) for v in groups.values())}
+    return data, "\n".join(lines) if lines else "Nothing waits on a decision."
+
+
+# --------------------------------------------------------------------- brief
+
+
+def fetch_context(conn, task_id):
+    rows = conn.execute(
+        "SELECT n, path, note, added_by, added_at FROM context_files WHERE task_id = ? AND removed_at IS NULL ORDER BY n",
+        (task_id,),
+    )
+    return [{k: r[k] for k in r.keys()} for r in rows]
+
+
+def brief_data(conn, task_id):
+    task = fetch_task(conn, task_id)
+    todos = [t for t in fetch_todos(conn, task_id) if not t["done"]]
+    questions = [
+        comment_dict(r) for r in conn.execute(
+            "SELECT * FROM comments WHERE task_id = ? AND kind = 'question' AND resolved = 0 ORDER BY id", (task_id,)
+        )
+    ]
+    blockers = [
+        {"id": r["id"], "status": r["status"], "title": r["title"]}
+        for r in conn.execute(
+            "SELECT b.id, b.status, b.title FROM links l JOIN tasks b ON b.id = l.from_id "
+            f"WHERE l.to_id = ? AND l.type = 'blocks' AND b.status NOT IN {SQL_CLOSED} ORDER BY b.id",
+            (task_id,),
+        )
+    ]
+    return {
+        "task": task, "open_todos": todos, "open_questions": questions, "blockers": blockers,
+        "context": fetch_context(conn, task_id),
+    }
+
+
+def brief_text(data, budget=BRIEF_BYTES):
+    """About 2 KB of what an agent needs to start: the fixed facts first, the body last."""
+    task = data["task"]
+    lines = [task_line(task), f"Project: {task['project']}"]
+    facts = []
+    if task["area"]:
+        facts.append(f"Area: {task['area']}")
+    if task["requested_by"]:
+        who = ", ".join(x for x in (task["requested_name"], task["requested_on"]) if x)
+        facts.append(f"From: {task['requested_by']}" + (f" ({who})" if who else ""))
+    if task["audience"]:
+        facts.append(f"For: {task['audience']}")
+    if facts:
+        lines.append(". ".join(facts) + ".")
+    if task["claim_valid"]:
+        lines.append(f"Claim: {task['claimed_by']} until {task['claim_expires_at']}, from {task['claimed_from'] or 'ready'}")
+    else:
+        lines.append("Claim: none")
+    if task["waiting_on"]:
+        lines.append(f"Waiting on: {task['waiting_on']}" + (f": {one_line(task['waiting_note'], 200)}" if task["waiting_note"] else ""))
+    lines.append(f"Next: {one_line(task['next_step'], 300)}" if task["next_step"] else "Next: not set")
+    if task["summary"]:
+        lines.append(f"Summary: {one_line(task['summary'], 400)}")
+    for label, key in (("Plan", "plan_path"), ("Branch", "branch"), ("Worktree", "worktree"), ("PR", "pr")):
+        if task[key]:
+            lines.append(f"{label}: {task[key]}")
+    for title, items, render in (
+        (f"Open checklist, {task['todo_progress']} done:" if task["todo_progress"] else "", data["open_todos"],
+         lambda t: f"  {t['n']}. {one_line(t['body'], 160)}"),
+        ("Open questions:", data["open_questions"],
+         lambda c: f"  #{c['id']} to {c['to_agent'] or 'anyone'}: {one_line(c['body'], 200)}"),
+        ("Blocked by:", data["blockers"], lambda b: f"  {b['id']} {b['status']}: {one_line(b['title'], 120)}"),
+        ("Context files:", data["context"], lambda f: f"  {f['n']}. {f['path']}" + (f"  {one_line(f['note'], 120)}" if f["note"] else "")),
+    ):
+        if items:
+            shown = items[:8]
+            lines.append(title)
+            lines += [render(item) for item in shown]
+            if len(items) > len(shown):
+                lines.append(f"  ... {len(items) - len(shown)} more")
+    text = "\n".join(lines)
+    if task["body"]:
+        room = budget - len(text.encode("utf-8")) - 10
+        if room > 80:
+            body = task["body"].strip()
+            raw = body.encode("utf-8")
+            if len(raw) > room:
+                body = raw[: room - 40].decode("utf-8", "ignore").rstrip() + f"\n[... cut, see qtask show {task['id']}]"
+            text += "\nBody:\n" + body
+    return text
+
+
+def cmd_brief(ctx):
+    task_id = get_row(ctx.conn, ctx.args.id)["id"]
+    data = brief_data(ctx.conn, task_id)
+    text = brief_text(data)
+    return {**data, "text": text}, text
+
+
+# ---------------------------------------------------------------------- next
+
+
+def cmd_next(ctx):
+    conn = ctx.conn
+    me = (ctx.args.for_agent or ctx.agent).strip()
+    project = ctx.scope()
+    steps = []
+    if me == UNKNOWN_AGENT:
+        steps.append({"what": "name", "text": "Name yourself first: pass --agent NAME or set QTASK_AGENT.", "commands": []})
+    else:
+        where, params = ["c.resolved = 0", "c.to_agent = ?", f"t.status NOT IN {SQL_CLOSED}"], [me]
+        add_scope(where, params, project)
+        for c in conn.execute(
+            "SELECT c.*, t.title AS task_title FROM comments c JOIN tasks t ON t.id = c.task_id "
+            f"WHERE {' AND '.join(where)} ORDER BY c.id",
+            params,
+        ):
+            command = f'qtask answer {c["id"]} "your answer"' if c["kind"] == "question" else f"qtask resolve {c['id']}"
+            steps.append({
+                "what": "inbox", "task_id": c["task_id"], "comment_id": c["id"],
+                "text": f"#{c['id']} on {c['task_id']} [{c['kind']}] from {c['author']}: {one_line(c['body'])}",
+                "commands": [f"qtask brief {c['task_id']}", command],
+            })
+        cutoff = iso(utc_now() - timedelta(hours=IDLE_HOURS))
+        for task in held_claims(ctx, me, project):
+            idle = (task["claim_active_at"] or task["updated_at"]) < cutoff
+            note = f"idle since {task['claim_active_at'] or task['updated_at']}" if idle else f"until {task['claim_expires_at']}"
+            commands = [f"qtask brief {task['id']}"]
+            if idle:
+                commands += [f'qtask comment {task["id"]} "where it stands"', f"qtask release {task['id']}"]
+            steps.append({
+                "what": "idle_claim" if idle else "claim", "task_id": task["id"],
+                "text": f"Your claim {note}: {task_line(task)}", "commands": commands,
+            })
+        since = iso(utc_now() - timedelta(days=3))
+        where, params = ["e.field = 'auto_released'", "e.old = ?", "e.at >= ?", f"t.status NOT IN {SQL_CLOSED}",
+                         "t.claimed_by IS NULL"], [me, since]
+        add_scope(where, params, project)
+        for row in conn.execute(
+            f"SELECT DISTINCT t.id FROM events e JOIN tasks t ON t.id = e.task_id WHERE {' AND '.join(where)} ORDER BY t.id",
+            params,
+        ):
+            task = fetch_task(conn, row["id"])
+            steps.append({
+                "what": "expired_claim", "task_id": task["id"],
+                "text": f"Your claim expired and qtask released it: {task_line(task)}",
+                "commands": [f"qtask brief {task['id']}", f"qtask claim {task['id']}"],
+            })
+    where = [
+        "t.status IN ('ready', 'backlog')", f"NOT {SQL_HAS_BLOCKER}",
+        "(t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?)",
+    ]
+    params = [now()]
+    add_scope(where, params, project)
+    row = conn.execute(
+        f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order('impact', lanes=True)} LIMIT 1", params
+    ).fetchone()
+    top = task_dict(row) if row else None
+    if top:
+        steps.append({
+            "what": "ready", "task_id": top["id"], "text": f"Top ready task by impact: {task_line(top)}",
+            "commands": [f"qtask brief {top['id']}", f"qtask claim {top['id']}"],
+        })
+    lines = []
+    for n, step in enumerate(steps, 1):
+        lines.append(f"{n}. {step['text']}")
+        lines += [f"   {command}" for command in step["commands"]]
+    if not top:
+        lines.append("No ready task. See qtask decisions for what waits on people.")
+    return {"for": me, "steps": steps, "next_task": top}, "\n".join(lines)
+
+
+# ------------------------------------------------------------ hand-off pack
+
+
+def setup_key(project):
+    return f"setup:{project}"
+
+
+def project_setup(conn, project):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (setup_key(project),)).fetchone()
+    return row["value"] if row else None
+
+
+def prompt_text(ctx, task_id, agent, setup=None, base="main"):
+    conn = ctx.conn
+    data = brief_data(conn, task_id)
+    task = data["task"]
+    setup = setup or project_setup(conn, task["project"])
+    lines = [
+        f"You are agent {agent}. Your task is {task_id} in the project {task['project']}.",
+        f"Run every qtask command with --agent {agent}, or set QTASK_AGENT={agent} first.",
+        "",
+        "Where to work:",
+    ]
+    if task["worktree"]:
+        lines.append(f"  cd {task['worktree']}")
+    else:
+        lines.append(
+            f"  Work in a git worktree on a new branch, then record it: qtask set {task_id} --worktree PATH --branch NAME"
+        )
+    if setup:
+        lines.append(f"  Then run: {setup}")
+    if task["branch"]:
+        lines.append(f"  Branch: {task['branch']}")
+    if task["plan_path"]:
+        lines.append(f"  Read the plan first: {task['plan_path']}")
+    lines += ["", f"Brief (qtask brief {task_id}):"]
+    lines += [f"  {line}" for line in brief_text(data).split("\n")]
+    lines += [
+        "",
+        "Rules:",
+        f"1. Claim first: qtask claim {task_id}. Exit 3 means another agent holds it: stop and report that.",
+        "   Each qtask command you run on the task renews your claim. An expired claim goes back to its lane.",
+        f"2. Keep findings on the task: qtask comment {task_id} \"text\". Steps go in the checklist: "
+        f"qtask todo {task_id} add \"text\", then qtask todo {task_id} done N. Record the next step: "
+        f"qtask set {task_id} --next \"text\".",
+        f"3. Ask for what needs a person: qtask ask {task_id} \"question\" --to developer. Do not guess.",
+        "4. Before each commit, stage the changes and run: qtask scan --staged --message \"the message\". "
+        f"After each commit: qtask commit {task_id}. Before a push: qtask scan --range origin/{base}..HEAD",
+        "5. Never write a task ID, a qtask path or qtask's notes in a commit, branch name, code, test, repo doc, "
+        "PR or issue. Name the work itself.",
+        "6. Before you stop, hand back: write a file with three labelled parts, 'Summary:', 'Checks run:' and "
+        f"'Left:', then run: qtask comment {task_id} --kind handback --body-file FILE",
+        f"7. Then close it with qtask done {task_id} --evidence \"commands and results\", send it to review "
+        f"with qtask set {task_id} --status needs_review, or give it back with qtask release {task_id}.",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_prompt(ctx):
+    a = ctx.args
+    agent = ctx.agent
+    if agent == UNKNOWN_AGENT:
+        raise usage_error("prompt needs --agent NAME: the name the new session will use, such as be-fix-7.", "agent_required")
+    task_id = get_row(ctx.conn, a.id)["id"]
+    text = prompt_text(ctx, task_id, agent, text_or_null(a.setup), a.base)
+    return {"task_id": task_id, "agent": agent, "prompt": text}, text
+
+
+def resolve_path(raw):
+    """(absolute posix path, True) when the file exists, else (raw, False)."""
+    for candidate in (raw, msys_to_windows(raw), git_bash_path(raw)):
+        if candidate and Path(candidate).exists():
+            return Path(candidate).resolve().as_posix(), True
+    return raw.strip(), False
+
+
+def cmd_context(ctx):
+    a = ctx.args
+    if a.action is None:
+        if a.values or a.note is not None:
+            raise usage_error("Pass an action: qtask context ID add PATH --note TEXT, or qtask context ID rm N.")
+        task_id = get_row(ctx.conn, a.id)["id"]
+        files = fetch_context(ctx.conn, task_id)
+        lines = [f"{f['n']}. {f['path']}" + (f"  {f['note']}" if f["note"] else "") for f in files]
+        return {"task_id": task_id, "files": files}, "\n".join(lines) if lines else f"{task_id} has no context files."
+    if a.action == "add":
+        if len(a.values) != 1:
+            raise usage_error("context add takes one path: qtask context ID add PATH --note TEXT")
+        path, exists = resolve_path(a.values[0])
+        with write_tx(ctx) as conn:
+            task_id = get_row(conn, a.id)["id"]
+            same = conn.execute(
+                "SELECT n FROM context_files WHERE task_id = ? AND path = ? AND removed_at IS NULL", (task_id, path)
+            ).fetchone()
+            if same:
+                n = same["n"]
+                if a.note is not None:
+                    conn.execute("UPDATE context_files SET note = ? WHERE task_id = ? AND n = ?", (text_or_null(a.note), task_id, n))
+            else:
+                n = conn.execute("SELECT coalesce(max(n), 0) + 1 FROM context_files WHERE task_id = ?", (task_id,)).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO context_files(task_id, n, path, note, added_by, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, n, path, text_or_null(a.note), ctx.agent, now()),
+                )
+                log_event(ctx, task_id, "context", None, f"{n} {path}")
+                touch(ctx, task_id)
+        text = f"Context file {n} on {task_id}: {path}" + ("" if exists else " (no such file here yet)")
+        return {"task_id": task_id, "n": n, "path": path, "exists": exists, "files": fetch_context(ctx.conn, task_id)}, text
+    if not a.values or not all(v.isdigit() for v in a.values):
+        raise usage_error("context rm takes item numbers: qtask context ID rm 2")
+    with write_tx(ctx) as conn:
+        task_id = get_row(conn, a.id)["id"]
+        for value in a.values:
+            n = int(value)
+            removed = conn.execute(
+                "UPDATE context_files SET removed_at = ? WHERE task_id = ? AND n = ? AND removed_at IS NULL", (now(), task_id, n)
+            ).rowcount
+            if not removed:
+                raise QtaskError("context_not_found", f"{task_id} has no context file {n}.", EXIT_NOT_FOUND, n=n)
+            log_event(ctx, task_id, "context", str(n), None)
+        touch(ctx, task_id)
+    return {"task_id": task_id, "files": fetch_context(ctx.conn, task_id)}, f"Removed {', '.join(a.values)} from {task_id}."
+
+
+def inside_repo(folder):
+    probe = folder
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    result = git_result("-C", str(probe), "rev-parse", "--show-toplevel")
+    return result is not None and result.returncode == 0 and bool(result.stdout.strip())
+
+
+def cmd_export(ctx):
+    a = ctx.args
+    row = get_row(ctx.conn, a.id)
+    task_id = row["id"]
+    if a.pack is None:
+        raise usage_error("export needs --pack [DIR]: qtask export ID --pack writes a hand-off pack.")
+    if a.pack:
+        raw = a.pack.strip()
+        absolute = [c for c in (raw, msys_to_windows(raw), git_bash_path(raw)) if c and Path(c).is_absolute()]
+        folder = Path(absolute[0] if absolute else raw).resolve()
+    else:
+        short = ctx.conn.execute("SELECT short_name FROM projects WHERE name = ?", (row["project"],)).fetchone()[0]
+        folder = qtask_home() / "packs" / short / task_id
+    if inside_repo(folder):
+        raise refused(
+            "pack_in_repo",
+            f"{folder.as_posix()} is inside a git repo, and the pack holds task IDs and private notes. "
+            "Pick a folder outside every repo, or leave DIR out to use the qtask data folder.",
+        )
+    data = brief_data(ctx.conn, task_id)
+    task = data["task"]
+    lines = [f"# {task_id}: {task['title']}", "", "## Brief", "", "```text", brief_text(data), "```", ""]
+    lines += ["## Context files", ""]
+    for f in data["context"]:
+        target = f["path"]
+        link = Path(target).as_uri() if Path(target).is_absolute() else target
+        lines.append(f"{f['n']}. [{target}]({link})" + (f": {f['note']}" if f["note"] else ""))
+    if not data["context"]:
+        lines.append(f"None yet. Add one with: qtask context {task_id} add PATH --note TEXT")
+    if task["plan_path"]:
+        lines += ["", "## Plan", "", task["plan_path"]]
+    lines += ["", "## Session prompt", ""]
+    if ctx.agent != UNKNOWN_AGENT:
+        lines += ["```text", prompt_text(ctx, task_id, ctx.agent), "```"]
+    else:
+        lines.append(f"Run qtask prompt {task_id} --agent NAME, or export again with --agent NAME.")
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "pack.md"
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return {"task_id": task_id, "path": path.as_posix(), "context": data["context"]}, path.as_posix()
+
+
+# ------------------------------------------------------------- split, take
+
+
+def cmd_split(ctx):
+    a = ctx.args
+    parts = []
+    for raw in a.part:
+        part = choice(raw, SIDES, "--part")
+        if part not in parts:
+            parts.append(part)
+    created, existing = [], []
+    with write_tx(ctx) as conn:
+        parent = get_row(conn, a.id)
+        task_id = parent["id"]
+        if parent["status"] in CLOSED:
+            raise refused("task_closed", f"{task_id} is {parent['status']}.", status=parent["status"])
+        assert_parent_allowed(conn, parent)
+        sides = {r["side"]: r["id"] for r in conn.execute(
+            f"SELECT id, side FROM tasks WHERE parent_id = ? AND status NOT IN {SQL_CLOSED}", (task_id,)
+        )}
+        project = conn.execute("SELECT * FROM projects WHERE name = ?", (parent["project"],)).fetchone()
+        status = parent["status"] if parent["status"] in LANES else "ready"
+        for part in parts:
+            if part in sides:
+                existing.append(sides[part])
+                continue
+            n = conn.execute("SELECT prefix, next_n FROM projects WHERE name = ?", (project["name"],)).fetchone()
+            child = f"{n['prefix']}-{n['next_n']}"
+            conn.execute("UPDATE projects SET next_n = next_n + 1 WHERE name = ?", (project["name"],))
+            at = now()
+            conn.execute(
+                "INSERT INTO tasks(id, project, parent_id, title, kind, status, priority, side, tags, owner, "
+                "created_by, created_at, updated_at, requested_by, requested_name, requested_on, audience, area) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    child, parent["project"], task_id, f"{parent['title']} ({part})", parent["kind"], status,
+                    parent["priority"], part, parent["tags"], parent["owner"], ctx.agent, at, at,
+                    parent["requested_by"], parent["requested_name"], parent["requested_on"], parent["audience"],
+                    parent["area"],
+                ),
+            )
+            log_event(ctx, child, "created", None, f"part {part} of {task_id}", at)
+            created.append(child)
+        if created:
+            log_event(ctx, task_id, "split", None, ", ".join(created))
+            touch(ctx, task_id)
+    children = [fetch_task(ctx.conn, c) for c in created + existing]
+    lines = [f"Split {task_id}:" if created else f"{task_id} already has these parts:"]
+    lines += [f"  {task_line(c)}" for c in children]
+    lines.append(f"Take one with: qtask take {task_id} --part {parts[0]}")
+    return {"task_id": task_id, "created": created, "existing": existing, "children": children}, "\n".join(lines)
+
+
+def cmd_take(ctx):
+    a = ctx.args
+    parent = get_row(ctx.conn, a.id)
+    children = ctx.conn.execute(
+        f"SELECT id, side FROM tasks WHERE parent_id = ? AND status NOT IN {SQL_CLOSED} "
+        "ORDER BY CAST(substr(id, instr(id, '-') + 1) AS INTEGER)",
+        (parent["id"],),
+    ).fetchall()
+    part = a.part.strip().lower()
+    if part.isdigit():
+        picked = children[int(part) - 1]["id"] if 0 < int(part) <= len(children) else None
+    else:
+        picked = next((c["id"] for c in children if c["side"] == part), None)
+    if picked is None:
+        names = ", ".join(f"{n} {c['side'] or '-'}" for n, c in enumerate(children, 1)) or "none"
+        raise QtaskError(
+            "part_not_found", f"{parent['id']} has no open part {a.part}. Open parts: {names}.", EXIT_NOT_FOUND
+        )
+    a.id = picked
+    return cmd_claim(ctx)
 
 
 # ------------------------------------------------------------------- team hub
@@ -3144,7 +4492,7 @@ def add_global_flags(parser, top_level):
     parser.add_argument("--agent", default=default(None), help="agent name, else QTASK_AGENT, else unknown")
 
 
-def add_filters(parser):
+def add_filters(parser, default_sort):
     parser.add_argument("--kind")
     parser.add_argument("--pri", "--priority", dest="pri")
     parser.add_argument("--side")
@@ -3154,6 +4502,29 @@ def add_filters(parser):
     parser.add_argument("--parent")
     parser.add_argument("--search")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--requested-by", help=", ".join(REQUESTERS))
+    parser.add_argument("--audience", help=", ".join(AUDIENCES))
+    parser.add_argument("--area", help="an area; includes the areas below it")
+    parser.add_argument("--sort", help=f"{', '.join(SORTS)}; default {default_sort}")
+
+
+def add_field_flags(parser, on_set=False):
+    """Flags for who asked, for whom, what the task waits on and its next step."""
+    parser.add_argument("--requested-by", help=f"who asked: {', '.join(REQUESTERS)}")
+    parser.add_argument("--requester", metavar="NAME", help="the name of the person who asked")
+    parser.add_argument(
+        "--requested-on", metavar="YYYY-MM-DD",
+        help="when they asked; default today on add, the task's creation day on set",
+    )
+    parser.add_argument("--audience", help=f"who the work is for: {', '.join(AUDIENCES)}")
+    parser.add_argument("--area", help="an area made with qtask area add")
+    parser.add_argument(
+        "--waiting-on", help=f"for needs_confirm or blocked with no open question or blocker: {', '.join(WAITING_ON)}"
+    )
+    parser.add_argument("--waiting-note", metavar="TEXT", help="what the task waits for")
+    parser.add_argument("--next", metavar="TEXT", help="the next step, shown by brief and prompt")
+    if on_set:
+        parser.add_argument("--summary", metavar="TEXT", help="where the work stands; a handback comment sets it too")
 
 
 def add_text(parser, help_text):
@@ -3190,17 +4561,24 @@ def build_parser():
     p.add_argument("--owner")
     p.add_argument("--branch")
     p.add_argument("--pr")
+    add_field_flags(p)
 
     p = command("ls", cmd_ls, "List tasks. Hides done and dropped unless asked.")
-    add_filters(p)
+    add_filters(p, "priority")
     p.add_argument("--status", action="append", help="repeatable")
     p.add_argument("--include-closed", action="store_true")
     p.add_argument(
         "--deployed", help=f"{', '.join(DEPLOY_STATES)}; lists closed tasks too unless --status is given"
     )
 
-    p = command("ready", cmd_ready, "List tasks an agent can claim now.")
-    add_filters(p)
+    p = command(
+        "ready", cmd_ready,
+        "List tasks an agent can claim now: the planned lane (status ready), then the backlog, by impact.",
+    )
+    add_filters(p, "impact")
+    lanes = p.add_mutually_exclusive_group()
+    lanes.add_argument("--planned", action="store_true", help="only status ready")
+    lanes.add_argument("--backlog", action="store_true", help="only status backlog")
 
     p = command("show", cmd_show, "Show a task with its checklist, children, links, commits, comments and events.")
     p.add_argument("id")
@@ -3208,11 +4586,15 @@ def build_parser():
     p = command("search", cmd_search, "Search tasks and comments.")
     p.add_argument("text")
 
-    p = command("claim", cmd_claim, "Claim a task. Exit 3 when another agent holds it.")
+    p = command(
+        "claim", cmd_claim,
+        "Claim a task. Exit 3 when another agent holds it. Each later event of yours on the task renews the "
+        "lease; an expired lease goes back to the lane it came from.",
+    )
     p.add_argument("id")
-    p.add_argument("--ttl-hours", type=float, default=2.0)
+    p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
 
-    p = command("release", cmd_release, "Clear the claim and return the task to ready.")
+    p = command("release", cmd_release, "Clear the claim and return the task to the lane it was claimed from.")
     p.add_argument("id")
     p.add_argument("--force", action="store_true", help="release another agent's valid claim")
 
@@ -3239,12 +4621,16 @@ def build_parser():
     p.add_argument("--parent")
     p.add_argument("--add-tag", action="append", help="repeatable")
     p.add_argument("--remove-tag", action="append", help="repeatable")
+    add_field_flags(p, on_set=True)
 
     p = command("comment", cmd_comment, "Add a comment to a task.")
     p.add_argument("id")
     add_text(p, "comment text")
     p.add_argument("--to", help="address the comment to an agent")
-    p.add_argument("--kind", default="note", help=", ".join(COMMENT_KINDS))
+    p.add_argument(
+        "--kind", default="note",
+        help=f"{', '.join(COMMENT_KINDS)}; handback needs Summary:, Checks run: and Left: lines",
+    )
     p.add_argument("--as", dest="as_name", metavar="NAME", help="write down what NAME said; NAME is the author")
 
     p = command("resolve", cmd_resolve, "Mark a comment resolved.")
@@ -3287,7 +4673,11 @@ def build_parser():
     p.add_argument("id")
     p.add_argument("--reason", help="required")
 
-    command("report", cmd_report, "Counts, stale claims, blocked tasks and what waits on the developer.")
+    p = command(
+        "report", cmd_report,
+        "Counts, idle claims, blocked and parked tasks, and what waits on the developer.",
+    )
+    p.add_argument("--by", help="add open counts by area or requester")
 
     p = command("plan-path", cmd_plan_path, "Create the dated plan file and print its path.")
     p.add_argument("topic")
@@ -3307,8 +4697,14 @@ def build_parser():
         "Show the project: name, short name, ID prefix and next ID. --all lists every project. "
         "set-prefix PREFIX changes the prefix of new IDs; existing IDs stay as they are.",
     )
-    p.add_argument("action", nargs="?", choices=("show", "set-prefix"), help="show (default) or set-prefix")
-    p.add_argument("value", nargs="?", metavar="PREFIX", help="for set-prefix: 1 to 6 letters, such as QT")
+    p.add_argument(
+        "action", nargs="?", choices=("show", "set-prefix", "set-setup"), help="show (default), set-prefix or set-setup"
+    )
+    p.add_argument(
+        "value", nargs="?", metavar="VALUE",
+        help="for set-prefix: 1 to 6 letters, such as QT; for set-setup: the command a new worktree runs, "
+        "printed by prompt (empty clears)",
+    )
 
     p = command(
         "commit", cmd_commit,
@@ -3386,6 +4782,99 @@ def build_parser():
     )
     p.add_argument("action", nargs="?", choices=("list", "set-url"), help="list (default) or set-url")
     p.add_argument("value", nargs="?", metavar="URL", help="for set-url: the hub base URL, such as https://host/api")
+
+    command("review", cmd_review, "The needs_review queue, oldest first, with the approve and reject commands.")
+
+    p = command("approve", cmd_approve, "Close a task in needs_review as done. The submitter gets a review comment.")
+    p.add_argument("id")
+    p.add_argument("--evidence", help="what you checked and the results; required")
+    p.add_argument("--force", action="store_true", help="close despite open questions, children or checklist items")
+
+    p = command(
+        "reject", cmd_reject,
+        "Send a task in needs_review back to in_progress. The submitter gets the reason in their inbox.",
+    )
+    p.add_argument("id")
+    p.add_argument("--reason", help="what to fix; required")
+
+    p = command(
+        "decisions", cmd_decisions,
+        "Open questions and parked tasks, grouped by who must act, with the exact command for each.",
+    )
+    p.add_argument("--for", dest="for_who", metavar="WHO", help="one group only, such as developer or manager")
+
+    p = command(
+        "brief", cmd_brief,
+        "About 2 KB to start work: status, claim, next step, plan, branch, worktree, open checklist items, "
+        "open questions, blockers, summary, context files, then the body.",
+    )
+    p.add_argument("id")
+
+    p = command(
+        "next", cmd_next,
+        "What to do now: comments addressed to you, your claims (idle or expired), then the top ready task.",
+    )
+    p.add_argument("--for", dest="for_agent", help="agent name, default the current agent")
+
+    p = command(
+        "prompt", cmd_prompt,
+        "Print a session prompt for another agent: brief, rules, plan, worktree and setup. "
+        "--agent names the agent that will run it.",
+    )
+    p.add_argument("id")
+    p.add_argument("--setup", metavar="CMD", help="setup command for the worktree, else the project's set-setup")
+    p.add_argument("--base", default="main", help="base branch for the scan before a push, default main")
+
+    p = command(
+        "context", cmd_context,
+        "Files to read for a task. 'context ID' lists them; 'context ID add PATH --note TEXT' and "
+        "'context ID rm N' change them.",
+    )
+    p.add_argument("id")
+    p.add_argument("action", nargs="?", choices=("add", "rm"), help="leave out to list")
+    p.add_argument("values", nargs="*", metavar="PATH_OR_N")
+    p.add_argument("--note", help="for add: why the file matters")
+
+    p = command(
+        "export", cmd_export,
+        "Write a hand-off pack (brief, context file links, plan, session prompt) as pack.md. "
+        "Refuses a folder inside a git repo.",
+    )
+    p.add_argument("id")
+    p.add_argument(
+        "--pack", nargs="?", const="", metavar="DIR",
+        help="folder for pack.md; default QTASK_HOME/packs/<project>/<ID>",
+    )
+
+    p = command(
+        "area", cmd_area,
+        "Areas of the project as a tree. 'area' or 'area ls' lists them with open/total counts rolled up to "
+        "parents; 'area add NAME [--parent P] [--note TEXT]' adds or moves one.",
+    )
+    p.add_argument("action", nargs="?", choices=("ls", "add"), default="ls")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--parent", help="for add: the parent area; empty moves it to the top")
+    p.add_argument("--note")
+    p.add_argument("--tree", action="store_true", help="indent children under their parent")
+
+    p = command(
+        "split", cmd_split,
+        "Make one subtask per part, such as --part be --part fe. Each child copies the parent's fields "
+        "and gets that side.",
+    )
+    p.add_argument("id")
+    p.add_argument("--part", action="append", required=True, help=f"repeatable: {', '.join(SIDES)}")
+
+    p = command("take", cmd_take, "Claim one part of a split task, by side or by number.")
+    p.add_argument("id")
+    p.add_argument("--part", required=True, help="a side such as be, or the part's number")
+    p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
+
+    p = command("similar", cmd_similar, "Open tasks of the project with a similar title. add runs it too.")
+    p.add_argument("title")
+
+    p = command("template", cmd_template, "Print the body template of a kind.")
+    p.add_argument("kind", help=", ".join(TEMPLATES))
     return parser
 
 
@@ -3408,6 +4897,7 @@ def execute(args):
         try:
             conn = open_db()
             ctx = Ctx(conn, args)
+            ctx.auto_released = release_expired(ctx)
             result = args.func(ctx)
             if ctx.backup_due:
                 try:

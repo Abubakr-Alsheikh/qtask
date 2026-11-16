@@ -14,7 +14,15 @@ Done in 0.3.0: `publish` and `hub-pull` for a TaskFlow team hub. See [CHANGELOG.
 - **`gh sync`**: keep the status of promoted tasks and their issues in step, both ways.
 - **HTML board**: one read-only page with columns by status, written to a file you open in a browser. No server.
 
-## 0.4: easier to install and find
+## 0.4: hand work to agent sessions
+
+Done in 0.4.0: leases that follow activity and release themselves, planned and backlog lanes sorted by impact, requester and audience, a review queue, parked tasks with a reason, `decisions`, `brief`, hand-back comments, areas, `next`, `prompt`, context files and hand-off packs, `split` and `take`, `similar`, kind templates, WIP warnings. See [CHANGELOG.md](CHANGELOG.md).
+
+- **Lease length per kind**: a research task may want a longer lease than a bug fix.
+- **`next` for the developer**: the decisions and the review queue in one list, oldest first.
+- **Pack from a template**: let a project add its own rules to the `prompt` text.
+
+## 0.5: easier to install and find
 
 - **PyPI**: publish as `qtask-cli` (the name `qtask` is taken), so `pipx install qtask-cli` works.
 - **Claude Code plugin**: package the skill as a plugin, so installing it is one command.
