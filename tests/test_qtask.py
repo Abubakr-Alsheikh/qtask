@@ -2853,6 +2853,23 @@ class PickWork(Base):
         step = self.js("next", "--project", self.project, "--expand", agent="a")["steps"][-1]
         self.assertIn("Claim: none", step["brief"])
 
+    def test_facets(self):
+        self.add("a", "--side", "be", "--pri", "P1")
+        self.add("b", "--side", "be", "--status", "backlog")
+        done = self.add("c", "--side", "fe")
+        self.js("done", done, "--evidence", "x")
+        claimed = self.add("d", "--side", "fe")
+        self.js("claim", claimed, agent="bob")
+        data = self.js("facets", "--project", self.project)
+        self.assertEqual((data["total"], data["claimable"]), (3, 2))
+        self.assertEqual(data["facets"]["side"], {"fe": 1, "be": 2})
+        self.assertEqual(data["facets"]["lane"], {"backlog": 1, "planned": 1, "in_progress": 1})
+        ready = self.js("facets", "--project", self.project, "--ready")
+        self.assertEqual((ready["total"], ready["facets"]["priority"]), (2, {"P1": 1, "P2": 1}))
+        self.assertEqual(self.js("facets", "--project", self.project, "--side", "fe", "--include-closed")["total"], 2)
+        self.assertIn("total 3  claimable 2", self.run_qtask("facets", "--project", self.project).stdout)
+        self.js("facets", "--project", self.project, "--ready", "--status", "done", expect=2)
+
 
 class Version(Base):
     def test_version_matches_the_package(self):

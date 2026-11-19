@@ -1824,6 +1824,47 @@ def cmd_template(ctx):
     return {"kind": kind, "template": TEMPLATES[kind]}, TEMPLATES[kind].rstrip("\n")
 
 
+FACETS = (
+    ("lane", None), ("status", STATUSES), ("priority", PRIORITIES), ("kind", KINDS), ("side", SIDES),
+    ("audience", AUDIENCES), ("requested_by", REQUESTERS), ("area", None),
+)
+
+
+def cmd_facets(ctx):
+    a = ctx.args
+    lanes = ("ready", "backlog")
+    claim_where, claim_params = ready_where(ctx, lanes)
+    if a.ready:
+        if a.status or a.include_closed:
+            raise usage_error("--ready counts claimable tasks, so it takes no --status or --include-closed.")
+        where, params = claim_where, claim_params
+    else:
+        where, params = [], []
+        build_filters(ctx, where, params)
+        if a.status:
+            statuses = [choice(x, STATUSES, "--status") for x in a.status]
+            where.append(f"t.status IN ({','.join('?' * len(statuses))})")
+            params.extend(statuses)
+        elif not a.include_closed:
+            where.append(f"t.status NOT IN {SQL_CLOSED}")
+    tasks = select_tasks(ctx, where, params)
+    claimable = {t["id"] for t in select_tasks(ctx, claim_where, claim_params)}
+    for task in tasks:
+        task["lane"] = lane_of(task)
+    facets = {}
+    for key, order in FACETS:
+        counts = count_by(tasks, key, order or ())
+        if order is None:
+            counts = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        facets[key] = counts
+    total = len(tasks)
+    in_reach = sum(1 for t in tasks if t["id"] in claimable)
+    lines = [f"total {total}  claimable {in_reach}"]
+    lines += [f"{key}: {fmt_counts(counts)}" for key, counts in facets.items() if counts]
+    lines.append("Filter a list the same way: qtask ls --side be --pri P1, or qtask ready --area NAME")
+    return {"total": total, "claimable": in_reach, "facets": facets}, "\n".join(lines)
+
+
 def cmd_ls(ctx):
     a = ctx.args
     where, params = [], []
@@ -5364,6 +5405,21 @@ def build_parser():
 
     p = command("similar", cmd_similar, "Open tasks of the project with a similar title. add runs it too.")
     p.add_argument("title")
+
+    p = command(
+        "facets", cmd_facets,
+        "Counts of open tasks by lane, status, priority, kind, side, audience, requester and area. "
+        "--ready counts claimable tasks only. Takes the filters of ls.",
+    )
+    for flag in ("--kind", "--side", "--owner", "--claimed-by", "--parent", "--search", "--area"):
+        p.add_argument(flag)
+    p.add_argument("--pri", "--priority", dest="pri")
+    p.add_argument("--tag", action="append")
+    p.add_argument("--requested-by", help=", ".join(REQUESTERS))
+    p.add_argument("--audience", help=", ".join(AUDIENCES))
+    p.add_argument("--status", action="append", help="repeatable")
+    p.add_argument("--include-closed", action="store_true")
+    p.add_argument("--ready", action="store_true", help="only tasks an agent can claim now")
 
     p = command("template", cmd_template, "Print the body template of a kind.")
     p.add_argument("kind", help=", ".join(TEMPLATES))
