@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Pick the right work in one call.
+
+- `next` skips parents that have open subtasks, so it offers a subtask, and prints `why first:` with the reasons of the impact order (`manager request, bug, for students, P3, planned`). `--side`, `--kind` and `--pri` take comma lists, `--area` includes the areas below, `--limit N` lists up to 10 candidates. `QTASK_SIDES=be,infra` is your default `--side`. `--expand` prints whole inbox comments and the brief of the top task. JSON adds `candidates` and a `why` field. **Change:** `next` can pick a different task than 0.5 did, a subtask in place of its parent.
+- Task rows carry `lock` and `lock_reason`: `free`, `claimed`, `blocked`, `needs_decision`, `in_review`, `has_subtasks` or `closed`. `lock` is one of the short `--json` fields; `ready` marks a parent with `[has N open subtasks: take one]`.
+- Text that another agent wrote prints between `<<<text by NAME>>>` and `<<<end>>>` in `show`, `brief`, `prompt`, `export --pack`, `next --expand` and `search --expand`. Text by the reader, the developer or qtask prints bare. Markers inside the text are defused. `prompt` tells the new session what the fences mean. JSON keeps the plain text.
+- `facets [--ready]` counts tasks by lane, status, priority, kind, side, audience, requester and area, with the filters of `ls`.
+- `similar` scores 0 to 100 on the title, its words found in the other task's title and body, and the area, with simple English stems (crash and crashes match). `--body-file` and `--area` add to the score. **Change:** `score` runs 0 to 100, no longer 0 to 1. `add` exits 4 with `duplicate_likely` when an open task scores 90 or more and the title has three words or more; `--duplicate-reason TEXT` adds it anyway and logs the reason, `--no-similar` skips the check. From 75 it warns.
+
 ## 0.5.0 (unreleased)
 
 Bound the output, so an agent reads a list without filling its context.
