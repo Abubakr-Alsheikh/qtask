@@ -213,7 +213,7 @@ class Claims(Base):
         self.sql("UPDATE tasks SET claim_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?", task)
         result = self.js("claim", task, agent="bob")["task"]
         self.assertEqual(result["claimed_by"], "bob")
-        events = self.js("show", task)["events"]
+        events = self.js("show", task, "--events")["events"]
         released = [(e["actor"], e["old"]) for e in events if e["field"] == "auto_released"]
         self.assertEqual(released, [("qtask", "alice")])
         claimed = [e for e in events if e["field"] == "claimed_by" and e["new"] == "bob"]
@@ -322,7 +322,7 @@ class Done(Base):
         self.assertEqual(len(error["open_questions"]), 1)
         done = self.js("done", task, "--evidence", "ran it", "--force", agent="a")["task"]
         self.assertEqual(done["status"], "done")
-        forced = [e for e in self.js("show", task)["events"] if e["field"] == "force"]
+        forced = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "force"]
         self.assertEqual(len(forced), 1)
         self.assertEqual(forced[0]["actor"], "a")
 
@@ -586,7 +586,7 @@ class Fields(Base):
         self.js("comment", parent, "note")
         data = self.js("show", parent.lower())
         self.assertEqual(
-            set(data), {"ok", "task", "children", "todos", "comments", "links", "commits", "events", "hub"}
+            set(data), {"ok", "schema", "task", "children", "todos", "comments", "comment_count", "links", "commits", "event_count", "hub"}
         )
         self.assertIsNone(data["hub"])
         self.assertEqual([c["id"] for c in data["children"]], [child])
@@ -651,7 +651,7 @@ class EventsAndSearch(Base):
         self.js("unlink", task, "--blocks", other, agent="alice")
         self.js("release", task, agent="alice")
         self.js("done", task, "--evidence", "ran", agent="alice")
-        events = self.js("show", task)["events"]
+        events = self.js("show", task, "--events")["events"]
         fields = [e["field"] for e in events]
         for expected in (
             "created", "priority", "tags", "claimed_by", "claim_expires_at", "status",
@@ -664,10 +664,10 @@ class EventsAndSearch(Base):
 
     def test_refused_write_logs_nothing(self):
         task = self.add()
-        count = len(self.js("show", task)["events"])
+        count = len(self.js("show", task, "--events")["events"])
         self.js("done", task, expect=4)
         self.js("set", task, "--pri", "PX", expect=2)
-        self.assertEqual(len(self.js("show", task)["events"]), count)
+        self.assertEqual(len(self.js("show", task, "--events")["events"]), count)
 
     @unittest.skipUnless(HAS_FTS5, "this Python's SQLite has no FTS5")
     def test_fts_finds_comment_text_and_stays_current(self):
@@ -842,7 +842,7 @@ class Subtasks(Base):
         self.assertIn("[1/2]", self.run_qtask("ls", "--project", self.project).stdout)
         listed = self.js("ls", "--project", self.project)["tasks"]
         self.assertEqual(next(t for t in listed if t["id"] == parent)["progress"], "1/2")
-        self.assertIsNone(next(t for t in listed if t["id"] == kids[2])["progress"])
+        self.assertIsNone(next(t for t in listed if t["id"] == kids[2]).get("progress"))
         report = self.js("report", "--project", self.project)
         self.assertEqual([(t["id"], t["progress"]) for t in report["parents"]], [(parent, "1/2")])
         self.assertIn("[1/2]", self.run_qtask("report", "--project", self.project).stdout)
@@ -895,7 +895,7 @@ class Plans(Base):
         self.assertIn(f"**Task:** {task}\n", text)
         self.assertTrue(data["plan_path_set"])
         self.assertEqual(self.js("show", task)["task"]["plan_path"], data["path"])
-        self.assertIn("plan_path", [e["field"] for e in self.js("show", task)["events"]])
+        self.assertIn("plan_path", [e["field"] for e in self.js("show", task, "--events")["events"]])
 
     def test_task_with_a_plan_path_keeps_it_and_existing_file_survives(self):
         task = self.add("t", "--plan", "D:/repo/plan.md")
@@ -1167,7 +1167,7 @@ class Hardening(Base):
                 conn.executemany(f"INSERT INTO comments({', '.join(names)}) VALUES (?, ?, ?, ?, ?)", rows)
         finally:
             conn.close()
-        self.assertEqual(len(self.js("search", "needle", "--project", self.project)["comments"]), 33_000)
+        self.assertEqual(len(self.js("search", "needle", "--project", self.project, "--all-pages")["comments"]), 33_000)
         self.assertEqual(self.ls("ls", "--search", "needle"), [task])
 
     def test_bad_ttl_is_a_usage_error(self):
@@ -1316,7 +1316,7 @@ class Commits(GitBase):
         )
         self.assertEqual(commits[2]["note"], "the follow-up")
         self.assertRegex(commits[0]["authored_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        events = [e for e in self.js("show", task)["events"] if e["field"] == "commit"]
+        events = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "commit"]
         self.assertEqual([e["new"] for e in events], [base, second, third])
         text = self.run_qtask("show", task).stdout
         self.assertIn(f"Commits:\n  {base[:7]} Add the base (main)", text)
@@ -1378,7 +1378,7 @@ class Commits(GitBase):
         self.assertEqual(
             sorted((m["old_sha"], m["sha"]) for m in moved), sorted([(feature, new_feature), (kept, new_kept)])
         )
-        show = self.js("show", task)
+        show = self.js("show", task, "--events")
         self.assertEqual({c["sha"] for c in show["commits"]}, {new_feature, new_kept})
         events = [(e["old"], e["new"], e["actor"]) for e in show["events"] if e["field"] == "commit" and e["old"]]
         self.assertIn((feature, new_feature, "fixer"), events)
@@ -1548,7 +1548,7 @@ class Deploys(Base):
         self.assertEqual(self.js("report", "--project", self.project)["on_staging"], [])
         self.js("set", task, "--deployed", "prod", expect=2)
         self.js("ls", "--project", self.project, "--deployed", "x", expect=2)
-        fields = [e["field"] for e in self.js("show", task)["events"]]
+        fields = [e["field"] for e in self.js("show", task, "--events")["events"]]
         self.assertIn("deployed", fields)
         self.assertIn("deploy_note", fields)
 
@@ -1578,9 +1578,9 @@ class Todos(Base):
         text = self.run_qtask("show", task).stdout
         self.assertIn("Checklist, 1/3 done:\n  1. [x] write the migration\n  2. [ ] " + ARABIC, text)
         self.assertIn("[todo 1/3]", self.run_qtask("ls", "--project", self.project).stdout)
-        listed = self.js("ls", "--project", self.project)["tasks"][0]
+        listed = self.js("ls", "--project", self.project, "--full-json")["tasks"][0]
         self.assertEqual((listed["todo_progress"], listed["todos_done"], listed["todos_total"]), ("1/3", 1, 3))
-        events = [(e["field"], e["old"], e["new"], e["actor"]) for e in self.js("show", task)["events"]]
+        events = [(e["field"], e["old"], e["new"], e["actor"]) for e in self.js("show", task, "--events")["events"]]
         self.assertIn(("todo", None, "1 added: write the migration", "a"), events)
         self.assertIn(("todo", "3 done", "3 open", "unknown"), events)
         self.assertIn(("todo", "3 open: update the docs", "3 removed", "unknown"), events)
@@ -1600,7 +1600,7 @@ class Todos(Base):
         self.assertEqual((error["code"], error["open_todos"]), ("done_refused", [2]))
         done = self.js("done", task, "--evidence", "ran", "--force", agent="closer")["task"]
         self.assertEqual(done["status"], "done")
-        forced = [e for e in self.js("show", task)["events"] if e["field"] == "force"]
+        forced = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "force"]
         self.assertIn("open checklist items 2", forced[0]["new"])
         self.assertEqual(self.todo(task, "add", "late", expect=4)["error"]["code"], "task_closed")
         self.todo(task, "done", "2")
@@ -1640,7 +1640,7 @@ class AnswerAs(Base):
         )
         comments = self.js("show", task)["comments"]
         self.assertTrue(comments[0]["resolved"])
-        event = [e for e in self.js("show", task)["events"] if e["field"] == "comment"][-1]
+        event = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "comment"][-1]
         self.assertEqual((event["actor"], event["new"]), ("alice", f"#{data['comment']['id']} answer as developer"))
         self.assertEqual(self.js("inbox", "--for", "developer", "--project", self.project)["comments"], [])
 
@@ -1651,7 +1651,7 @@ class AnswerAs(Base):
         self.assertEqual(self.js("comment", task, "x", "--as", " ", expect=2)["error"]["code"], "bad_usage")
         mine = self.js("comment", task, "mine", agent="bot")["comment"]
         self.assertEqual(mine["author"], "bot")
-        events = [e["new"] for e in self.js("show", task)["events"] if e["field"] == "comment"]
+        events = [e["new"] for e in self.js("show", task, "--events")["events"] if e["field"] == "comment"]
         self.assertEqual(events, [f"#{comment['id']} note as Product Owner", f"#{mine['id']} note"])
 
 
@@ -1974,7 +1974,7 @@ class Hub(Base):
         self.assertEqual(request["headers"]["X-Agent"], "agent-a")
         self.assertNotIn("BODY-SECRET-TEXT", json.dumps(request["body"]))
         self.assertNotIn(task, json.dumps(request["body"]))
-        shown = self.js("show", task)
+        shown = self.js("show", task, "--events")
         self.assertEqual((shown["hub"]["hub_task_id"], shown["hub"]["link"]), (7, board))
         self.assertEqual(shown["hub"]["external_ref"], request["body"]["fingerprint"].removeprefix("ext:"))
         self.assertEqual(shown["hub"]["published_by"], "agent-a")
@@ -2210,7 +2210,7 @@ class Leases(Base):
             self.sql("UPDATE tasks SET claim_expires_at = ? WHERE id = ?", PAST, task)
         self.ls()  # Any command releases expired claims first.
         for task, lane in ((planned, "ready"), (parked, "backlog")):
-            data = self.js("show", task)
+            data = self.js("show", task, "--events")
             self.assertEqual(data["task"]["status"], lane)
             self.assertIsNone(data["task"]["claimed_by"])
             released = [e for e in data["events"] if e["field"] == "auto_released"]
@@ -2546,7 +2546,7 @@ class AgentSchema(Base):
             "INSERT INTO comments(task_id, author, kind, body, created_at) VALUES ('APP-1', 'old', 'note', 'n', 'x')"
         )
         conn.close()
-        tagged = self.js("show", "APP-1")
+        tagged = self.js("show", "APP-1", "--events")
         self.assertEqual(self.sql("SELECT version FROM schema_version"), [(n,) for n in range(1, LATEST_SCHEMA + 1)])
         self.assertEqual(self.sql("PRAGMA integrity_check"), [("ok",)])
         task = tagged["task"]
@@ -2567,6 +2567,218 @@ class AgentSchema(Base):
         self.js("context", "APP-1", "add", "a.md")
         export = Path(self.js("backup")["jsonl"]).read_text(encoding="utf-8")
         self.assertIn("context_files", {json.loads(line)["table"] for line in export.splitlines()})
+
+
+class Lists(Base):
+    """Paging, short JSON rows, --fields, --max-chars and snippets (0.5.0)."""
+
+    def bulk(self, n, title="bulk", **columns):
+        """Add n tasks straight into the database: fast, and the same rows qtask reads."""
+        first = self.add(f"{title} 0")
+        prefix = first.split("-")[0]
+        names = ["id", "project", "title", "created_by", "created_at", "updated_at", *columns]
+        rows = [
+            (f"{prefix}-{k}", self.project, f"{title} {k - 1}", "test", f"2026-01-01T00:00:{k % 60:02d}Z",
+             "2026-01-01T00:00:00Z", *columns.values())
+            for k in range(2, n + 1)
+        ]
+        conn = sqlite3.connect(Path(self.home) / "qtask.db", timeout=15)
+        try:
+            with conn:
+                conn.executemany(
+                    f"INSERT INTO tasks({', '.join(names)}) VALUES ({', '.join('?' * len(names))})", rows
+                )
+                conn.execute("UPDATE projects SET next_n = ? WHERE name = ?", (n + 1, self.project))
+                conn.execute("UPDATE tasks SET created_at = '2025-12-31T00:00:00Z' WHERE id = ?", (first,))
+        finally:
+            conn.close()
+        return [first] + [r[0] for r in rows]
+
+    def text(self, *args, env=None):
+        result = self.run_qtask(*args, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout.rstrip("\n").split("\n")
+
+    def test_ls_pages_with_a_header_and_the_next_command(self):
+        ids = self.bulk(45)
+        lines = self.text("ls", "--project", self.project)
+        self.assertEqual(lines[0], "showing 1-20 of 45 (page 1 of 3)")
+        self.assertEqual(lines[-1], "more: qtask ls --project acme/app --page 2")
+        self.assertEqual(len(lines), 22)
+        data = self.js("ls", "--project", self.project, "--page", "2")
+        self.assertEqual((data["count"], data["total"]), (20, 45))
+        self.assertEqual(
+            data["page"],
+            {"page": 2, "pages": 3, "limit": 20, "offset": 20, "total": 45,
+             "next": "qtask ls --project acme/app --json --page 3"},
+        )
+        self.assertEqual([t["id"] for t in data["tasks"]], ids[20:40])
+        last = self.text("ls", "--project", self.project, "--page", "3")
+        self.assertEqual(last[0], "showing 41-45 of 45 (page 3 of 3)")
+        self.assertFalse(last[-1].startswith("more:"))
+        by_offset = self.text("ls", "--project", self.project, "--offset", "40", "--limit", "3")
+        self.assertEqual(by_offset[-1], "more: qtask ls --project acme/app --limit 3 --offset 43")
+        past = self.js("ls", "--project", self.project, "--page", "9")
+        self.assertEqual((past["tasks"], past["page"]["next"]), ([], None))
+
+    def test_one_page_prints_no_header(self):
+        self.bulk(3)
+        lines = self.text("ls", "--project", self.project)
+        self.assertEqual(len(lines), 3)
+        self.assertIsNone(self.js("ls", "--project", self.project)["page"]["next"])
+
+    def test_limit_page_and_offset_are_checked(self):
+        self.add()
+        for flags, text in (
+            (("--limit", "0"), "--limit takes 1 to 100. For more rows use --page or --all-pages."),
+            (("--limit", "101"), "--limit takes 1 to 100"),
+            (("--page", "0"), "--page starts at 1"),
+            (("--offset", "-1"), "--offset must be 0 or more"),
+            (("--page", "2", "--offset", "3"), "--page or --offset"),
+            (("--all-pages", "--limit", "5"), "--all-pages"),
+        ):
+            error = self.js("ls", "--project", self.project, *flags, expect=2)["error"]
+            self.assertIn(text, error["message"])
+            self.assertEqual(error["exit_code"], 2)
+
+    def test_all_pages_and_qtask_limit(self):
+        self.bulk(25)
+        result = self.run_qtask("ls", "--project", self.project, "--all-pages")
+        self.assertEqual(len(result.stdout.strip().split("\n")), 25)
+        self.assertIn("note: --all-pages lists all 25 rows", result.stderr)
+        unbounded = self.text("ls", "--project", self.project, env={**self.env, "QTASK_LIMIT": "0"})
+        self.assertEqual(len(unbounded), 25)
+        self.assertTrue(unbounded[0].startswith("APP-1 "))
+        five = self.js("ls", "--project", self.project, env={**self.env, "QTASK_LIMIT": "5"})
+        self.assertEqual((five["count"], five["page"]["pages"]), (5, 5))
+        seven = self.js("ls", "--project", self.project, "--limit", "7", env={**self.env, "QTASK_LIMIT": "5"})
+        self.assertEqual(seven["count"], 7)
+        bad = self.js("ls", "--project", self.project, env={**self.env, "QTASK_LIMIT": "lots"}, expect=2)
+        self.assertIn("QTASK_LIMIT takes 0", bad["error"]["message"])
+
+    def test_ready_keeps_counts_over_every_row(self):
+        self.bulk(30)
+        lines = self.text("ready", "--project", self.project, "--limit", "5")
+        self.assertEqual(lines[0], "showing 1-5 of 30 (page 1 of 6)")
+        self.assertIn("30 claimable. Lanes: planned 30.", lines[-2])
+        self.assertEqual(lines[-1], "more: qtask ready --project acme/app --limit 5 --page 2")
+        data = self.js("ready", "--project", self.project, "--limit", "5")
+        self.assertEqual((data["count"], data["total"], data["counts"]["by_lane"]), (5, 30, {"planned": 30}))
+
+    def test_other_lists_page_too(self):
+        ids = self.bulk(25, status="needs_review")
+        search = self.js("search", "bulk", "--project", self.project, "--limit", "10")
+        self.assertEqual((len(search["tasks"]), search["total"], search["page"]["pages"]), (10, 25, 3))
+        review = self.js("review", "--project", self.project)
+        self.assertEqual((review["count"], review["total"]), (20, 24))
+        self.assertIn(
+            "more: qtask review --project acme/app --page 2", self.run_qtask("review", "--project", self.project).stdout
+        )
+        for n in range(3):
+            self.js("comment", ids[n], f"note {n}", "--to", "bob")
+        inbox = self.js("inbox", "--for", "bob", "--project", self.project, "--limit", "2")
+        self.assertEqual((len(inbox["comments"]), inbox["total"]), (2, 3))
+        self.sql("UPDATE tasks SET parent_id = ? WHERE id IN (?, ?)", ids[0], ids[1], ids[2])
+        self.sql("UPDATE tasks SET parent_id = ? WHERE id = ?", ids[3], ids[4])
+        tree = self.js("tree", "--project", self.project, "--limit", "1")
+        self.assertEqual((tree["count"], tree["total"], tree["tree"][0]["id"]), (1, 2, ids[0]))
+        self.assertEqual(self.js("tree", ids[0])["count"], 1)
+        self.js("tree", ids[0], "--page", "2", expect=2)
+
+    def test_json_rows_are_short_unless_asked(self):
+        self.add("full", "--body", "a body", "--tag", "x", "--side", "be")
+        data = self.js("ls", "--project", self.project)
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(
+            data["tasks"][0],
+            {"id": "APP-1", "title": "full", "status": "ready", "priority": "P2", "kind": "task", "side": "be"},
+        )
+        for flag in ("--full-json", "--raw-json"):
+            full = self.js("ls", "--project", self.project, flag)["tasks"][0]
+            self.assertEqual((full["body"], full["tags"], full["claim_valid"]), ("a body", ["x"], False))
+        picked = self.js("ready", "--project", self.project, "--fields", "id,lane,body")["tasks"][0]
+        self.assertEqual(picked, {"id": "APP-1", "lane": "planned", "body": "a body"})
+        self.assertEqual(self.text("ls", "--project", self.project, "--fields", "id,title,tags"), ["APP-1  full  x"])
+        error = self.js("ls", "--project", self.project, "--fields", "id,nope", expect=2)["error"]
+        self.assertEqual(error["code"], "unknown_field")
+        self.assertIn("title", error["message"])
+        self.assertEqual(self.js("show", "NOPE-1", expect=5)["schema"], 1)
+        compact = self.run_qtask("ls", "--project", self.project, "--json", "--compact").stdout
+        self.assertEqual(compact.count("\n"), 1)
+        self.assertTrue(compact.startswith('{"ok":true,"schema":1,'))
+        top = self.js("next", "--project", self.project, agent="a")["next_task"]
+        self.assertNotIn("body", top)
+        self.assertEqual(top["id"], "APP-1")
+
+    def test_search_cuts_comment_hits_to_a_snippet(self):
+        task = self.add()
+        long = ("word " * 60 + "needle in the middle " + "tail " * 60).strip()
+        self.js("comment", task, long)
+        hit = self.js("search", "needle", "--project", self.project)["comments"][0]
+        self.assertTrue(hit["body_cut"])
+        self.assertLessEqual(len(hit["body"]), 166)
+        self.assertIn("needle in the middle", hit["body"])
+        self.assertTrue(hit["body"].startswith("...") and hit["body"].endswith("..."))
+        whole = self.js("search", "needle", "--project", self.project, "--expand")["comments"][0]
+        self.assertEqual(whole["body"], long)
+        self.assertNotIn("body_cut", whole)
+        line = self.text("search", "needle", "--project", self.project)[0]
+        self.assertLess(len(line), 230)
+
+    def test_max_chars_cuts_long_text_and_says_so(self):
+        task = self.add("t", "--body", "b" * 300)
+        self.js("comment", task, "c" * 300)
+        show = self.js("show", task, "--max-chars", "50")
+        self.assertEqual(show["task"]["body"], "b" * 50 + " [... 250 more chars cut by --max-chars]")
+        self.assertTrue(show["comments"][0]["body"].endswith("[... 250 more chars cut by --max-chars]"))
+        self.assertIn("b" * 300, self.run_qtask("show", task).stdout)
+        brief = self.run_qtask("brief", task, "--max-chars", "50").stdout
+        self.assertNotIn("b" * 100, brief)
+        self.assertIn("cut, see qtask show", brief)
+        self.js("show", task, "--max-chars", "0", expect=2)
+
+
+class ShowAndReport(Base):
+    def test_show_leaves_out_events_and_old_comments(self):
+        task = self.add()
+        for n in range(12):
+            self.js("comment", task, f"comment {n}")
+        text = self.run_qtask("show", task).stdout
+        self.assertIn(f"Comments, the last 10 of 12 (all: qtask show {task} --full):", text)
+        self.assertNotIn("comment 1\n", text)
+        self.assertIn("comment 11", text)
+        self.assertRegex(text, rf"Events: \d+ \(qtask show {task} --events\)")
+        self.assertNotIn(" -> ", text)
+        data = self.js("show", task)
+        self.assertNotIn("events", data)
+        self.assertEqual((len(data["comments"]), data["comment_count"]), (10, 12))
+        self.assertGreater(data["event_count"], 0)
+        events = self.js("show", task, "--events")
+        self.assertEqual(len(events["events"]), events["event_count"])
+        self.assertIn(" -> ", self.run_qtask("show", task, "--events").stdout)
+        full = self.js("show", task, "--full")
+        self.assertEqual((len(full["comments"]), "events" in full), (12, True))
+
+    def test_report_shows_five_rows_a_section(self):
+        ids = [self.add(f"t{n}") for n in range(7)]
+        for task in ids:
+            self.js("set", task, "--deployed", "staging")
+        text = self.run_qtask("report", "--project", self.project).stdout
+        self.assertIn("On staging, not on production (7):", text)
+        self.assertIn("  +2 more: qtask report --project acme/app --section staging", text)
+        self.assertNotIn(ids[6], text)
+        data = self.js("report", "--project", self.project)
+        self.assertEqual(len(data["on_staging"]), 5)
+        self.assertEqual(
+            data["sections"]["staging"],
+            {"key": "on_staging", "total": 7, "shown": 5,
+             "more": "qtask report --project acme/app --json --section staging"},
+        )
+        one = self.js("report", "--project", self.project, "--section", "staging")
+        self.assertEqual((len(one["on_staging"]), list(one["sections"])), (7, ["staging"]))
+        self.assertIn(ids[6], self.run_qtask("report", "--project", self.project, "--full").stdout)
+        error = self.js("report", "--project", self.project, "--section", "nope", expect=2)["error"]
+        self.assertEqual(error["code"], "unknown_section")
 
 
 class Version(Base):

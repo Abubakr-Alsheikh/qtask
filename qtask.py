@@ -8,7 +8,8 @@ Exit codes:
   0    success
   1    unexpected, file, git or database error
   2    bad usage or invalid value, or not in a git repo when the command needs one
-       (also an unknown area, a bug without Steps/Expected/Actual, an incomplete handback)
+       (also an unknown area, a bug without Steps/Expected/Actual, an incomplete handback,
+       an unknown --fields name or report section)
   3    another agent holds a valid claim
   4    a rule refused the action (closed, blocked, open question, child or checklist item,
        no evidence, prefix taken, task IDs found by scan, text blocked from publishing,
@@ -26,6 +27,8 @@ localhost only.
 Environment:
   QTASK_HOME    data folder, an absolute path, default ~/.qtask
   QTASK_AGENT   agent name when --agent is absent, default "unknown"
+  QTASK_LIMIT   rows per page of a list when --limit is absent, 1 to 100, default 20;
+                0 prints every row
   QTASK_NO_FTS  when set while the database is created, skips FTS5 and search
                 uses LIKE. The tests use it to cover the fallback.
   QTASK_HUB_URL    hub base URL, such as https://hub.example.com/api, when --hub-url is
@@ -54,7 +57,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -102,6 +105,21 @@ DEPLOY_STATES = ("none", "staging", "production")
 TODO_ACTIONS = ("add", "done", "undo", "rm")
 DEVELOPER = "developer"
 UNKNOWN_AGENT = "unknown"
+JSON_SCHEMA = 1
+PAGE_DEFAULT = 20
+PAGE_MAX = 100
+SNIPPET_CHARS = 160
+SHOW_COMMENTS = 10
+REPORT_ROWS = 5
+# The fields of a task row in list output with --json. --full-json prints every field.
+LIST_FIELDS = (
+    "id", "title", "status", "lane", "priority", "kind", "side", "area", "audience", "requested_by",
+    "claimed_by", "claim_valid", "blocked_by", "progress", "todo_progress", "parent_id", "deployed",
+)
+COMPUTED_FIELDS = (
+    "blocked_by", "children_count", "children_done", "children_total", "todos_total", "todos_done",
+    "claim_valid", "progress", "todo_progress", "lane",
+)
 
 BUSY_MS = 15000
 RETRY_SECONDS = 60
@@ -1228,12 +1246,6 @@ def sort_order(name, lanes=False):
 
 def select_tasks(ctx, where, params, order=SQL_ORDER):
     sql = f"{TASK_SELECT} WHERE {' AND '.join(where) if where else '1'} ORDER BY {order}"
-    limit = getattr(ctx.args, "limit", None)
-    if limit is not None:
-        if limit < 1:
-            raise usage_error("--limit must be 1 or more.")
-        sql += " LIMIT ?"
-        params = [*params, limit]
     return [task_dict(r) for r in ctx.conn.execute(sql, params).fetchall()]
 
 
@@ -1265,6 +1277,205 @@ def task_line(task):
 
 def tasks_text(tasks, empty="No tasks."):
     return "\n".join(task_line(t) for t in tasks) if tasks else empty
+
+
+# ------------------------------------------------------------------- output
+
+
+def shell_word(word):
+    """Quote one argument so a copied command runs the same in bash and PowerShell."""
+    if word and not re.search(r"[\s\"'$`;&|<>(){}*?!#%\\]", word):
+        return word
+    return '"' + word.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def rerun_command(ctx, drop=(), drop_values=(), add=()):
+    """
+    The command line of this run as `qtask ...`, without the flags in `drop` (flags alone) and
+    `drop_values` (flags with a value), plus the words in `add`.
+    """
+    words, skip = [], False
+    for word in getattr(ctx.args, "argv", None) or []:
+        if skip:
+            skip = False
+            continue
+        flag = word.split("=", 1)[0]
+        if flag in drop:
+            continue
+        if flag in drop_values:
+            skip = "=" not in word
+            continue
+        words.append(word)
+    return " ".join(["qtask", *(shell_word(w) for w in [*words, *add])])
+
+
+def page_limit(ctx):
+    """Rows per page: --limit, else QTASK_LIMIT, else 20. None means every row."""
+    a = ctx.args
+    if getattr(a, "all_pages", False):
+        return None
+    if getattr(a, "limit", None) is not None:
+        if not 1 <= a.limit <= PAGE_MAX:
+            raise usage_error(f"--limit takes 1 to {PAGE_MAX}. For more rows use --page or --all-pages.")
+        return a.limit
+    raw = os.environ.get("QTASK_LIMIT", "").strip()
+    if not raw:
+        return PAGE_DEFAULT
+    if not raw.isdigit() or int(raw) > PAGE_MAX:
+        raise usage_error(f"QTASK_LIMIT takes 0 (no limit) to {PAGE_MAX}. Got {raw!r}.")
+    return int(raw) or None
+
+
+class Page:
+    """One page of a list: which rows to print, the header line, and the command for the next page."""
+
+    def __init__(self, ctx, total):
+        a = ctx.args
+        page, offset = getattr(a, "page", None), getattr(a, "offset", None)
+        if page is not None and offset is not None:
+            raise usage_error("Pass --page or --offset, not both.")
+        if getattr(a, "all_pages", False) and (page is not None or offset is not None or a.limit is not None):
+            raise usage_error("--all-pages prints every row, so it takes no --page, --offset or --limit.")
+        if page is not None and page < 1:
+            raise usage_error("--page starts at 1.")
+        if offset is not None and offset < 0:
+            raise usage_error("--offset must be 0 or more.")
+        self.ctx, self.total, self.limit = ctx, total, page_limit(ctx)
+        self.by_offset = offset is not None
+        if self.limit is None:
+            self.offset, self.page, self.pages = 0, 1, 1
+        else:
+            self.offset = offset if offset is not None else ((page or 1) - 1) * self.limit
+            self.page = self.offset // self.limit + 1
+            self.pages = max(1, math.ceil(total / self.limit))
+        if getattr(a, "all_pages", False):
+            print(f"note: --all-pages lists all {total} rows", file=sys.stderr)
+
+    def rows(self, items):
+        items = list(items)
+        return items[self.offset:] if self.limit is None else items[self.offset:self.offset + self.limit]
+
+    def shown(self):
+        end = self.total if self.limit is None else min(self.total, self.offset + self.limit)
+        return max(0, end - self.offset)
+
+    def next_command(self):
+        if self.limit is None or self.offset + self.limit >= self.total:
+            return None
+        flag = ["--offset", str(self.offset + self.limit)] if self.by_offset else ["--page", str(self.page + 1)]
+        return rerun_command(self.ctx, drop=("--all-pages",), drop_values=("--page", "--offset"), add=flag)
+
+    def header(self):
+        """None when one page holds every row."""
+        if self.limit is None or (self.offset == 0 and self.total <= self.limit):
+            return None
+        shown = self.shown()
+        if not shown:
+            return f"showing 0 of {self.total}: page {self.page} is past the last page ({self.pages})."
+        return (
+            f"showing {self.offset + 1}-{self.offset + shown} of {self.total} (page {self.page} of {self.pages})"
+        )
+
+    def wrap(self, lines, footer=()):
+        head, more = self.header(), self.next_command()
+        return "\n".join([*([head] if head else []), *lines, *footer, *([f"more: {more}"] if more else [])])
+
+    def info(self):
+        return {
+            "page": self.page, "pages": self.pages, "limit": self.limit, "offset": self.offset,
+            "total": self.total, "next": self.next_command(),
+        }
+
+
+def field_names(conn, extra=()):
+    columns = [r["name"] for r in conn.execute("PRAGMA table_info(tasks)")]
+    return (*columns, *COMPUTED_FIELDS, *extra)
+
+
+def wanted_fields(ctx, extra=()):
+    """The fields --fields asks for, or None. Exit 2 on an unknown one."""
+    raw = getattr(ctx.args, "fields", None)
+    if raw is None:
+        return None
+    cache = ctx.__dict__.setdefault("fields_cache", {})
+    if extra not in cache:
+        cache[extra] = parse_fields(ctx, raw, extra)
+    return cache[extra]
+
+
+def parse_fields(ctx, raw, extra):
+    fields = [f.strip() for f in raw.split(",") if f.strip()]
+    valid = field_names(ctx.conn, extra)
+    unknown = [f for f in fields if f not in valid]
+    if unknown or not fields:
+        raise usage_error(
+            f"--fields takes a comma list of {', '.join(dict.fromkeys(valid))}. Got {raw!r}.", "unknown_field"
+        )
+    return tuple(dict.fromkeys(fields))
+
+
+def shape_task(ctx, task, extra=()):
+    """A task row for list JSON: --fields, else every field with --full-json, else LIST_FIELDS without empty values."""
+    fields = wanted_fields(ctx, extra)
+    if fields:
+        return {f: task.get(f) for f in fields}
+    if getattr(ctx.args, "full_json", False):
+        return task
+    row = {}
+    for key in (*LIST_FIELDS, *extra):
+        value = task.get(key)
+        if value in (None, "", [], False) or (key == "deployed" and value == "none"):
+            continue
+        row[key] = value
+    return row
+
+
+def shape_tasks(ctx, tasks, extra=()):
+    return [shape_task(ctx, t, extra) for t in tasks]
+
+
+def field_value(value):
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value) or "-"
+    return " ".join(str(value).split())
+
+
+def row_line(ctx, task, default=None, extra=()):
+    """The text line of a task: the --fields columns, else `default`, else task_line."""
+    fields = wanted_fields(ctx, extra)
+    if fields:
+        return "  ".join(field_value(task.get(f)) for f in fields)
+    return default if default is not None else task_line(task)
+
+
+def cut_text(ctx, text):
+    """Cut free text to --max-chars and say so. Text stays whole without the flag."""
+    limit = getattr(ctx.args, "max_chars", None)
+    if limit is None or text is None or len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f" [... {len(text) - limit} more chars cut by --max-chars]"
+
+
+def cut_comment(ctx, comment):
+    return {**comment, "body": cut_text(ctx, comment["body"])}
+
+
+def snippet(text, query, limit=SNIPPET_CHARS):
+    """About `limit` characters of `text` around the first word of `query` it holds, on one line."""
+    flat = " ".join((text or "").split())
+    if len(flat) <= limit:
+        return flat, False
+    low = flat.casefold()
+    hits = [low.find(w.casefold()) for w in query.split()]
+    at = min((h for h in hits if h >= 0), default=0)
+    room = limit - 6
+    start = max(0, min(at - room // 3, len(flat) - room))
+    piece = flat[start:start + room].strip()
+    return ("..." if start else "") + piece + ("..." if start + room < len(flat) else ""), True
 
 
 def comment_line(comment):
@@ -1574,8 +1785,12 @@ def cmd_ls(ctx):
     elif not a.include_closed and not a.deployed:
         # A deployed task is often done already, so --deployed lists closed tasks too.
         where.append(f"t.status NOT IN {SQL_CLOSED}")
-    tasks = select_tasks(ctx, where, params, sort_order(a.sort or "priority"))
-    return {"tasks": tasks, "count": len(tasks)}, tasks_text(tasks)
+    every = select_tasks(ctx, where, params, sort_order(a.sort or "priority"))
+    page = Page(ctx, len(every))
+    tasks = page.rows(every)
+    data = {"tasks": shape_tasks(ctx, tasks), "count": len(tasks), "total": len(every), "page": page.info()}
+    lines = [row_line(ctx, t) for t in tasks] or (["No tasks."] if not every else [])
+    return data, page.wrap(lines)
 
 
 def stale_claims(ctx, project):
@@ -1631,34 +1846,34 @@ def cmd_ready(ctx):
     every = [task_dict(r) for r in ctx.conn.execute(
         f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order(a.sort or 'impact', lanes=True)}", params
     ).fetchall()]
-    if a.limit is not None and a.limit < 1:
-        raise usage_error("--limit must be 1 or more.")
-    tasks = every[:a.limit] if a.limit else every
-    for task in tasks:
+    for task in every:
         task["lane"] = lane_of(task)
+    page = Page(ctx, len(every))
+    tasks = page.rows(every)
     stale = [t["id"] for t in stale_claims(ctx, ctx.scope())]
     footer = {
-        "by_lane": count_by([{**t, "lane": lane_of(t)} for t in every], "lane", LANES.values()),
+        "by_lane": count_by(every, "lane", LANES.values()),
         "by_side": count_by(every, "side", SIDES),
         "by_priority": count_by(every, "priority", PRIORITIES),
     }
-    lines = [f"{t['lane']:<8} {task_line(t)}" for t in tasks] or ["No ready tasks."]
-    if len(tasks) < len(every):
-        lines.append(f"... {len(every) - len(tasks)} more. Raise --limit to see them.")
+    lines = [row_line(ctx, t, f"{t['lane']:<8} {task_line(t)}") for t in tasks]
+    if not every:
+        lines = ["No ready tasks."]
+    tail = []
     if every:
-        lines.append(
+        tail.append(
             f"{len(every)} claimable. Lanes: {fmt_counts(footer['by_lane'])}. Sides: {fmt_counts(footer['by_side'])}. "
             f"Priority: {fmt_counts(footer['by_priority'])}."
         )
     if ctx.auto_released:
-        lines.append("Released expired claims: " + ", ".join(r["id"] for r in ctx.auto_released))
+        tail.append("Released expired claims: " + ", ".join(r["id"] for r in ctx.auto_released))
     if stale:
-        lines.append(f"Expired claims you can take over with claim: {', '.join(stale)}")
+        tail.append(f"Expired claims you can take over with claim: {', '.join(stale)}")
     data = {
-        "tasks": tasks, "count": len(tasks), "total": len(every), "counts": footer, "stale_claims": stale,
-        "auto_released": ctx.auto_released,
+        "tasks": shape_tasks(ctx, tasks), "count": len(tasks), "total": len(every), "page": page.info(),
+        "counts": footer, "stale_claims": stale, "auto_released": ctx.auto_released,
     }
-    return data, "\n".join(lines)
+    return data, page.wrap(lines, tail)
 
 
 def fmt_counts(counts):
@@ -1717,6 +1932,8 @@ def cmd_show(ctx):
         lines.append(f"Hub: {hub['hub_id']} {hub['link']}")
     lines.append(f"Visibility: {task['visibility']}")
     lines.append(f"Created: {task['created_at']} by {task['created_by']}")
+    full = ctx.args.full
+    task = {**task, "body": cut_text(ctx, task["body"]), "summary": cut_text(ctx, task["summary"])}
     if task["body"]:
         lines += ["", task["body"]]
     if todos:
@@ -1727,14 +1944,26 @@ def cmd_show(ctx):
         lines += ["", "Links:"] + [f"  {k}: {', '.join(v)}" for k, v in links.items() if v]
     if commits:
         lines += ["", "Commits:"] + [f"  {commit_line(c, task['project'])}" for c in commits]
+    shown = comments if full else comments[-SHOW_COMMENTS:]
+    shown = [cut_comment(ctx, c) for c in shown]
     if comments:
-        lines += ["", "Comments:"] + [f"  {comment_line(c)}" for c in comments]
-    lines += ["", "Events:"]
-    lines += [f"  {e['at']} {e['actor']} {e['field']}: {e['old']} -> {e['new']}" for e in events]
+        head = "Comments:"
+        if len(shown) < len(comments):
+            head = f"Comments, the last {len(shown)} of {len(comments)} (all: qtask show {task_id} --full):"
+        lines += ["", head] + [f"  {comment_line(c)}" for c in shown]
+    with_events = full or ctx.args.events
+    if with_events:
+        lines += ["", "Events:"]
+        lines += [f"  {e['at']} {e['actor']} {e['field']}: {e['old']} -> {e['new']}" for e in events]
+    elif events:
+        lines += ["", f"Events: {len(events)} (qtask show {task_id} --events)"]
     data = {
-        "task": task, "children": children, "todos": todos, "comments": comments, "links": links,
-        "commits": commits, "events": events, "hub": hub,
+        "task": task, "children": children if full else shape_tasks(ctx, children), "todos": todos,
+        "comments": shown, "comment_count": len(comments), "links": links, "commits": commits,
+        "event_count": len(events), "hub": hub,
     }
+    if with_events:
+        data["events"] = events
     return data, "\n".join(lines)
 
 
@@ -1764,11 +1993,27 @@ def cmd_search(ctx):
             params,
         ).fetchall()
         comments = [comment_dict(r) for r in rows]
-    lines = [task_line(t) for t in tasks] + [comment_line(c) for c in comments]
-    return (
-        {"query": text, "tasks": tasks, "comments": comments},
-        "\n".join(lines) if lines else "No matches.",
-    )
+    page = Page(ctx, len(tasks) + len(comments))
+    hits = page.rows([("task", t) for t in tasks] + [("comment", c) for c in comments])
+    tasks = [t for kind, t in hits if kind == "task"]
+    comments = []
+    for kind, comment in hits:
+        if kind != "comment":
+            continue
+        if ctx.args.expand:
+            comment = cut_comment(ctx, comment)
+        else:
+            body, cut = snippet(comment["body"], text)
+            comment = {**comment, "body": body, **({"body_cut": True} if cut else {})}
+        comments.append(comment)
+    lines = [row_line(ctx, t) for t in tasks] + [comment_line(c) for c in comments]
+    if not page.total:
+        lines = ["No matches."]
+    data = {
+        "query": text, "tasks": shape_tasks(ctx, tasks), "comments": comments, "count": len(hits),
+        "total": page.total, "page": page.info(),
+    }
+    return data, page.wrap(lines)
 
 
 def cmd_claim(ctx):
@@ -2099,11 +2344,18 @@ def cmd_inbox(ctx):
         task_dict(r)
         for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params)
     ]
-    lines = [comment_line(c) for c in comments] + [task_line(t) for t in tasks]
-    return (
-        {"for": agent, "comments": comments, "tasks": tasks},
-        "\n".join(lines) if lines else f"Inbox of {agent} is empty.",
-    )
+    page = Page(ctx, len(comments) + len(tasks))
+    items = page.rows([("comment", c) for c in comments] + [("task", t) for t in tasks])
+    comments = [cut_comment(ctx, c) for kind, c in items if kind == "comment"]
+    tasks = [t for kind, t in items if kind == "task"]
+    lines = [comment_line(c) for c in comments] + [row_line(ctx, t) for t in tasks]
+    if not page.total:
+        lines = [f"Inbox of {agent} is empty."]
+    data = {
+        "for": agent, "comments": comments, "tasks": shape_tasks(ctx, tasks), "count": len(items),
+        "total": page.total, "page": page.info(),
+    }
+    return data, page.wrap(lines)
 
 
 def assert_no_cycle(conn, from_id, to_id):
@@ -2370,21 +2622,37 @@ def cmd_report(ctx):
     ]
     parked = parked_without_reason(ctx, project)
     breakdown = report_breakdown(ctx, project, ctx.args.by) if ctx.args.by else None
+    # Sections in the order the developer acts on them: (name, JSON key, heading, rows).
+    sections = [
+        ("waiting", "waiting_on_developer", "Waiting on the developer",
+         [("comment", c) for c in questions] + [("task", t) for t in waiting]),
+        ("blocked", "blocked", "Blocked", [("task", t) for t in blocked]),
+        ("parked", "parked_no_reason", "Parked with no recorded reason (set one with --waiting-on)",
+         [("parked", p) for p in parked]),
+        ("idle", "idle_claims", f"Claims idle for more than {IDLE_HOURS} h", [("idle", t) for t in idle]),
+        ("stale", "stale_claims", "Stale claims", [("task", t) for t in stale]),
+        ("unclaimed", "in_progress_unclaimed",
+         "In progress with nobody holding them (ready and next do not list these; claim or release)",
+         [("task", t) for t in unclaimed]),
+        ("checklists", "open_checklists", "Open checklists", [("task", t) for t in checklists]),
+        ("staging", "on_staging", "On staging, not on production", [("task", t) for t in on_staging]),
+        ("parents", "parents", "Parents with progress", [("task", t) for t in parents]),
+    ]
+    names = [s[0] for s in sections]
+    wanted = ctx.args.section
+    if wanted is not None:
+        wanted = wanted.strip().lower()
+        if wanted not in names:
+            raise usage_error(f"--section takes one of {', '.join(names)}. Got {ctx.args.section!r}.", "unknown_section")
+        sections = [s for s in sections if s[0] == wanted]
+    cap = None if ctx.args.full or wanted else REPORT_ROWS
     data = {
         "project": project,
         "counts_by_status": by_status,
         "counts_by_priority": by_priority,
         "counts_by_deployed": by_deployed,
         "tasks_left": left,
-        "parents": parents,
-        "open_checklists": checklists,
-        "on_staging": on_staging,
-        "stale_claims": stale,
-        "blocked": blocked,
-        "waiting_on_developer": {"questions": questions, "tasks": waiting},
-        "idle_claims": idle,
-        "in_progress_unclaimed": unclaimed,
-        "parked_no_reason": parked,
+        "sections": {},
     }
     if breakdown is not None:
         data["by"] = breakdown
@@ -2394,29 +2662,29 @@ def cmd_report(ctx):
     deployed = [f"{k} {v}" for k, v in by_deployed.items() if v and k != "none"]
     if deployed:
         lines.append("Deployed: " + ", ".join(deployed))
-    if parents:
-        lines += ["", "Parents with progress:"] + [f"  {task_line(t)}" for t in parents]
-    if checklists:
-        lines += ["", "Open checklists:"] + [f"  {task_line(t)}" for t in checklists]
-    if on_staging:
-        lines += ["", "On staging, not on production:"] + [f"  {task_line(t)}" for t in on_staging]
-    if stale:
-        lines += ["", "Stale claims:"] + [f"  {task_line(t)}" for t in stale]
-    if idle:
-        lines += ["", f"Claims idle for more than {IDLE_HOURS} h:"]
-        lines += [f"  {task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]" for t in idle]
-    if unclaimed:
-        lines += ["", "In progress with nobody holding them (ready and next do not list these; claim or release):"]
-        lines += [f"  {task_line(t)}" for t in unclaimed]
-    if parked:
-        lines += ["", "Parked with no recorded reason (set one with --waiting-on):"]
-        lines += [f"  {p['task_id']}: {one_line(p['title'], 100)}" for p in parked]
-    if blocked:
-        lines += ["", "Blocked:"] + [f"  {task_line(t)}" for t in blocked]
-    if questions or waiting:
-        lines += ["", "Waiting on the developer:"]
-        lines += [f"  {comment_line(c)}" for c in questions]
-        lines += [f"  {task_line(t)}" for t in waiting]
+    render = {
+        "comment": lambda c: comment_line({**c, "body": one_line(c["body"], SNIPPET_CHARS)}),
+        "task": task_line,
+        "idle": lambda t: f"{task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]",
+        "parked": lambda p: f"{p['task_id']}: {one_line(p['title'], 100)}",
+    }
+    for name, key, heading, rows in sections:
+        shown = rows if cap is None else rows[:cap]
+        more = None
+        if len(shown) < len(rows):
+            more = rerun_command(ctx, drop=("--full",), drop_values=("--section", "--by"), add=["--section", name])
+        data["sections"][name] = {"key": key, "total": len(rows), "shown": len(shown), "more": more}
+        tasks = [shape_task(ctx, item, ("claim_active_at",) if kind == "idle" else ()) for kind, item in shown
+                 if kind in ("task", "idle")]
+        if name == "waiting":
+            data[key] = {"questions": [cut_comment(ctx, c) for kind, c in shown if kind == "comment"], "tasks": tasks}
+        else:
+            data[key] = [item for kind, item in shown] if name == "parked" else tasks
+        if not rows:
+            continue
+        lines += ["", f"{heading} ({len(rows)}):"] + [f"  {render[kind](item)}" for kind, item in shown]
+        if more:
+            lines.append(f"  +{len(rows) - len(shown)} more: {more}")
     if breakdown is not None:
         lines += ["", f"Open tasks by {ctx.args.by}:"] + [f"  {row['label']}  open {row['open']}/{row['total']}" for row in breakdown]
     return data, "\n".join(lines)
@@ -2599,12 +2867,15 @@ def cmd_plans(ctx):
         }
         found.append(((day, stat.st_mtime_ns, plan["path"]), plan))
     found.sort(key=lambda item: item[0], reverse=True)
-    plans = [plan for _, plan in found]
+    page = Page(ctx, len(found))
+    plans = page.rows(plan for _, plan in found)
     lines = []
     for plan in plans:
         link = f"{plan['task_id']} {plan['status']}" if plan["task_id"] else "-"
         lines.append(f"{plan['date']}  {link}  {plan['title']}  {plan['path']}")
-    return {"plans": plans, "count": len(plans)}, "\n".join(lines) if lines else "No plans."
+    if not found:
+        lines = ["No plans."]
+    return {"plans": plans, "count": len(plans), "total": len(found), "page": page.info()}, page.wrap(lines)
 
 
 def tree_node(conn, task, seen):
@@ -2614,16 +2885,22 @@ def tree_node(conn, task, seen):
     return {**task, "children": [tree_node(conn, child, seen) for child in children]}
 
 
-def tree_lines(node, depth=0):
-    lines = ["  " * depth + task_line(node)]
+def tree_lines(ctx, node, depth=0):
+    lines = ["  " * depth + row_line(ctx, node)]
     for child in node["children"]:
-        lines += tree_lines(child, depth + 1)
+        lines += tree_lines(ctx, child, depth + 1)
     return lines
+
+
+def shape_tree(ctx, node):
+    return {**shape_task(ctx, node), "children": [shape_tree(ctx, child) for child in node["children"]]}
 
 
 def cmd_tree(ctx):
     conn = ctx.conn
     if ctx.args.id:
+        if any(getattr(ctx.args, f, None) for f in ("page", "offset", "all_pages")):
+            raise usage_error("tree ID shows one task, so it takes no --page, --offset or --all-pages.")
         roots = [fetch_task(conn, get_row(conn, ctx.args.id)["id"])]
     else:
         where = [
@@ -2635,9 +2912,15 @@ def cmd_tree(ctx):
         add_scope(where, params, ctx.scope())
         rows = conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params)
         roots = [task_dict(r) for r in rows.fetchall()]
-    tree = [tree_node(conn, root, frozenset()) for root in roots]
-    lines = [line for node in tree for line in tree_lines(node)]
-    return {"tree": tree, "count": len(tree)}, "\n".join(lines) if lines else "No open parents."
+    page = Page(ctx, len(roots))
+    if ctx.args.id:
+        page.limit, page.pages = None, 1
+    tree = [tree_node(conn, root, frozenset()) for root in page.rows(roots)]
+    lines = [line for node in tree for line in tree_lines(ctx, node)]
+    if not roots:
+        lines = ["No open parents."]
+    data = {"tree": [shape_tree(ctx, node) for node in tree], "count": len(tree), "total": len(roots), "page": page.info()}
+    return data, page.wrap(lines)
 
 
 def cmd_backup(ctx):
@@ -3402,8 +3685,14 @@ def cmd_review(ctx):
         task["in_review_since"] = entered_status(conn, task["id"], "needs_review") or task["updated_at"]
         task["submitted_by"] = submitter(conn, get_row(conn, task["id"]))
     tasks.sort(key=lambda t: (t["in_review_since"], t["id"]))
+    page = Page(ctx, len(tasks))
+    every, tasks = tasks, page.rows(tasks)
+    extra = ("in_review_since", "submitted_by")
     lines = []
     for task in tasks:
+        if wanted_fields(ctx, extra):
+            lines.append(row_line(ctx, task, extra=extra))
+            continue
         lines.append(f"{task_line(task)} [in review {age_text(task['in_review_since'])}]")
         if task["summary"]:
             lines.append(f"  Summary: {one_line(task['summary'], 200)}")
@@ -3411,7 +3700,10 @@ def cmd_review(ctx):
             f"  qtask approve {task['id']} --evidence \"what you checked\"   or   "
             f"qtask reject {task['id']} --reason \"what to fix\""
         )
-    return {"tasks": tasks, "count": len(tasks)}, "\n".join(lines) if lines else "No tasks wait for review."
+    if not every:
+        lines = ["No tasks wait for review."]
+    data = {"tasks": shape_tasks(ctx, tasks, extra), "count": len(tasks), "total": len(every), "page": page.info()}
+    return data, page.wrap(lines)
 
 
 def cmd_approve(ctx):
@@ -3510,17 +3802,23 @@ def cmd_decisions(ctx):
     wanted = ctx.args.for_who
     if wanted:
         groups = {k: v for k, v in groups.items() if k == wanted.strip()}
+    total = sum(len(v) for v in groups.values())
+    flat = [(who, item) for who, items in groups.items() for item in items]
+    page = Page(ctx, total)
+    paged = {}
+    for who, item in page.rows(flat):
+        paged.setdefault(who, []).append(item)
     lines = []
-    for who, items in groups.items():
-        lines.append(f"Waiting on {who} ({len(items)}):")
+    for who, items in paged.items():
+        lines.append(f"Waiting on {who} ({len(groups[who])}):")
         for item in items:
             head = f"#{item['comment_id']} " if item.get("comment_id") else ""
             text = f": {one_line(item['text'])}" if item["text"] else ""
             lines.append(f"  {item['task_id']} {head}{item['kind']}{text}")
             lines.append(f"    task: {one_line(item['title'], 100)}")
             lines += [f"    {command}" for command in item["commands"]]
-    data = {"groups": groups, "count": sum(len(v) for v in groups.values())}
-    return data, "\n".join(lines) if lines else "Nothing waits on a decision."
+    data = {"groups": paged, "count": sum(len(v) for v in paged.values()), "total": total, "page": page.info()}
+    return data, page.wrap(lines) if total else "Nothing waits on a decision."
 
 
 # --------------------------------------------------------------------- brief
@@ -3556,7 +3854,7 @@ def brief_data(conn, task_id):
     }
 
 
-def brief_text(data, budget=BRIEF_BYTES):
+def brief_text(data, budget=BRIEF_BYTES, max_chars=None):
     """About 2 KB of what an agent needs to start: the fixed facts first, the body last."""
     task = data["task"]
     lines = [task_line(task), f"Project: {task['project']}"]
@@ -3599,6 +3897,8 @@ def brief_text(data, budget=BRIEF_BYTES):
     text = "\n".join(lines)
     if task["body"]:
         room = budget - len(text.encode("utf-8")) - 10
+        if max_chars is not None:
+            room = min(room, max_chars + 40)
         if room > 80:
             body = task["body"].strip()
             raw = body.encode("utf-8")
@@ -3611,7 +3911,8 @@ def brief_text(data, budget=BRIEF_BYTES):
 def cmd_brief(ctx):
     task_id = get_row(ctx.conn, ctx.args.id)["id"]
     data = brief_data(ctx.conn, task_id)
-    text = brief_text(data)
+    text = brief_text(data, max_chars=ctx.args.max_chars)
+    data["task"] = {**data["task"], "body": cut_text(ctx, data["task"]["body"])}
     return {**data, "text": text}, text
 
 
@@ -3685,7 +3986,7 @@ def cmd_next(ctx):
         lines += [f"   {command}" for command in step["commands"]]
     if not top:
         lines.append("No ready task. See qtask decisions for what waits on people.")
-    return {"for": me, "steps": steps, "next_task": top}, "\n".join(lines)
+    return {"for": me, "steps": steps, "next_task": shape_task(ctx, top) if top else None}, "\n".join(lines)
 
 
 # ------------------------------------------------------------ hand-off pack
@@ -4474,7 +4775,10 @@ def cmd_hub(ctx):
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         if "--json" in sys.argv[1:]:
-            payload = {"ok": False, "error": {"code": "bad_usage", "message": message, "exit_code": EXIT_USAGE}}
+            payload = {
+                "ok": False, "schema": JSON_SCHEMA,
+                "error": {"code": "bad_usage", "message": message, "exit_code": EXIT_USAGE},
+            }
             print(json.dumps(payload, ensure_ascii=False))
         else:
             self.print_usage(sys.stderr)
@@ -4490,6 +4794,41 @@ def add_global_flags(parser, top_level):
     parser.add_argument("--project", default=default(None), help="project name, for example owner/repo")
     parser.add_argument("--all", action="store_true", default=default(False), help="use every project")
     parser.add_argument("--agent", default=default(None), help="agent name, else QTASK_AGENT, else unknown")
+    parser.add_argument("--compact", action="store_true", default=default(False), help="with --json: one line, no indent")
+    parser.add_argument(
+        "--full-json", "--raw-json", dest="full_json", action="store_true", default=default(False),
+        help="with --json: every field of each task row in a list, not the short row",
+    )
+    parser.add_argument(
+        "--max-chars", type=positive_int("--max-chars"), metavar="N", default=default(None),
+        help="cut each long text (body, comment, summary) to N characters and say so",
+    )
+
+
+def positive_int(flag):
+    def parse(raw):
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value < 1:
+            raise argparse.ArgumentTypeError(f"{flag} takes a whole number of 1 or more. Got {raw!r}.")
+        return value
+    return parse
+
+
+def add_paging(parser, fields=True):
+    parser.add_argument(
+        "--limit", type=int, metavar="N",
+        help=f"rows per page, 1 to {PAGE_MAX}; default QTASK_LIMIT, else {PAGE_DEFAULT} (QTASK_LIMIT=0: every row)",
+    )
+    parser.add_argument("--page", type=int, metavar="N", help="page number, from 1")
+    parser.add_argument("--offset", type=int, metavar="N", help="skip N rows, in place of --page")
+    parser.add_argument("--all-pages", action="store_true", help="print every row")
+    if fields:
+        parser.add_argument(
+            "--fields", metavar="LIST", help="comma list of task fields to print, such as id,title,status",
+        )
 
 
 def add_filters(parser, default_sort):
@@ -4501,7 +4840,7 @@ def add_filters(parser, default_sort):
     parser.add_argument("--claimed-by")
     parser.add_argument("--parent")
     parser.add_argument("--search")
-    parser.add_argument("--limit", type=int)
+    add_paging(parser)
     parser.add_argument("--requested-by", help=", ".join(REQUESTERS))
     parser.add_argument("--audience", help=", ".join(AUDIENCES))
     parser.add_argument("--area", help="an area; includes the areas below it")
@@ -4580,11 +4919,22 @@ def build_parser():
     lanes.add_argument("--planned", action="store_true", help="only status ready")
     lanes.add_argument("--backlog", action="store_true", help="only status backlog")
 
-    p = command("show", cmd_show, "Show a task with its checklist, children, links, commits, comments and events.")
+    p = command(
+        "show", cmd_show,
+        f"Show a task with its checklist, children, links, commits and the last {SHOW_COMMENTS} comments. "
+        "The event log stays out unless asked.",
+    )
     p.add_argument("id")
+    p.add_argument("--events", action="store_true", help="add the event log")
+    p.add_argument("--full", action="store_true", help="every comment, the event log and full child rows")
 
-    p = command("search", cmd_search, "Search tasks and comments.")
+    p = command(
+        "search", cmd_search,
+        f"Search tasks and comments. A comment hit prints about {SNIPPET_CHARS} characters around the match.",
+    )
     p.add_argument("text")
+    p.add_argument("--expand", action="store_true", help="print each matching comment whole")
+    add_paging(p)
 
     p = command(
         "claim", cmd_claim,
@@ -4651,6 +5001,7 @@ def build_parser():
 
     p = command("inbox", cmd_inbox, "Questions and comments for an agent, plus owned tasks waiting on them.")
     p.add_argument("--for", dest="for_agent", help="agent name, default the current agent")
+    add_paging(p)
 
     for name, func, text in (
         ("link", cmd_link, "Link two tasks."),
@@ -4678,6 +5029,11 @@ def build_parser():
         "Counts, idle claims, blocked and parked tasks, and what waits on the developer.",
     )
     p.add_argument("--by", help="add open counts by area or requester")
+    p.add_argument(
+        "--section", metavar="NAME",
+        help="print one section whole: waiting, blocked, parked, idle, stale, unclaimed, checklists, staging, parents",
+    )
+    p.add_argument("--full", action="store_true", help="print every row of every section")
 
     p = command("plan-path", cmd_plan_path, "Create the dated plan file and print its path.")
     p.add_argument("topic")
@@ -4686,9 +5042,11 @@ def build_parser():
     p = command("plans", cmd_plans, "List plan files, newest first.")
     p.add_argument("--day", metavar="YYYY-MM-DD")
     p.add_argument("--search", metavar="TEXT")
+    add_paging(p, fields=False)
 
     p = command("tree", cmd_tree, "Show a parent and its subtasks, or all open parents in the project.")
     p.add_argument("id", nargs="?")
+    add_paging(p)
 
     command("backup", cmd_backup, "Write a database backup and a JSONL export.")
 
@@ -4783,7 +5141,8 @@ def build_parser():
     p.add_argument("action", nargs="?", choices=("list", "set-url"), help="list (default) or set-url")
     p.add_argument("value", nargs="?", metavar="URL", help="for set-url: the hub base URL, such as https://host/api")
 
-    command("review", cmd_review, "The needs_review queue, oldest first, with the approve and reject commands.")
+    p = command("review", cmd_review, "The needs_review queue, oldest first, with the approve and reject commands.")
+    add_paging(p)
 
     p = command("approve", cmd_approve, "Close a task in needs_review as done. The submitter gets a review comment.")
     p.add_argument("id")
@@ -4802,6 +5161,7 @@ def build_parser():
         "Open questions and parked tasks, grouped by who must act, with the exact command for each.",
     )
     p.add_argument("--for", dest="for_who", metavar="WHO", help="one group only, such as developer or manager")
+    add_paging(p, fields=False)
 
     p = command(
         "brief", cmd_brief,
@@ -4932,6 +5292,7 @@ def main(argv=None):
     if os.name != "nt":
         os.umask(0o077)  # Tasks, plans and backups are private: only this user may read them.
     args = build_parser().parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     args.agent = (args.agent or os.environ.get("QTASK_AGENT") or UNKNOWN_AGENT).strip() or UNKNOWN_AGENT
     try:
         load_inputs(args)
@@ -4949,7 +5310,7 @@ def main(argv=None):
         return fail(args, "unexpected", f"{type(exc).__name__}: {exc}", EXIT_ERROR, {})
     try:
         if args.json:
-            print(json.dumps({"ok": True, **data}, ensure_ascii=False, indent=2))
+            print(json_text(args, {"ok": True, "schema": JSON_SCHEMA, **data}))
         else:
             print(text)
         sys.stdout.flush()
@@ -4959,10 +5320,16 @@ def main(argv=None):
     return EXIT_OK
 
 
+def json_text(args, payload):
+    if getattr(args, "compact", False):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def fail(args, code, message, exit_code, extra):
     if args.json:
         error = {"code": code, "message": message, "exit_code": exit_code, **extra}
-        print(json.dumps({"ok": False, "error": error}, ensure_ascii=False, indent=2))
+        print(json_text(args, {"ok": False, "schema": JSON_SCHEMA, "error": error}))
     else:
         print(f"qtask: {message}", file=sys.stderr)
     return exit_code

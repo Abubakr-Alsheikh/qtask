@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+Bound the output, so an agent reads a list without filling its context.
+
+- Lists page: `ls`, `ready`, `search`, `review`, `inbox`, `tree` (with no ID), `plans` and `decisions` print 20 rows. `--limit N` (1 to 100), `--page N`, `--offset N` and `--all-pages`. A cut list starts with `showing 21-40 of 133 (page 2 of 7)` and ends with `more: <the next command>`. `--json` adds a `page` object and a `total`. `ready` keeps its footer counts over every claimable task. `QTASK_LIMIT` sets your default; `QTASK_LIMIT=0` prints every row, as before. **Change:** `--limit` above 100 now exits 2, and `ready` drops its `... N more` line for the `more:` line.
+- `--json` list rows carry 17 short fields and leave out empty ones. **Change:** a script that reads `body`, `tags`, `plan_path` or another long field from a list row now passes `--full-json` (alias `--raw-json`). `--fields id,title,status` picks fields in text and JSON; an unknown field exits 2 with `unknown_field`. `next --json` trims `next_task` the same way.
+- Every JSON answer, errors too, carries `"schema": 1`. `--compact` prints JSON on one line.
+- `--max-chars N` cuts each long body, comment and summary to N characters and says how much it cut.
+- `search` cuts each comment hit to about 160 characters around the match and marks it `body_cut`; `--expand` prints whole comments. `search` pages tasks and comments together.
+- **Change:** `show` leaves out the event log and prints the last 10 comments, with `Events: N (qtask show ID --events)`. `--events` adds the log, `--full` prints every comment, the log and full child rows. JSON gains `comment_count` and `event_count`, and has `events` only with one of the flags.
+- **Change:** `report` prints 5 rows a section, with the section's count and `+N more: qtask report --section NAME`, in the order you act on them: waiting on the developer, blocked, parked without a reason, idle claims, stale claims, in progress with nobody holding them, open checklists, staging, parents. `--section NAME` prints one section whole; `--full` prints all of them. JSON lists follow the same cap and add `sections` with `total`, `shown` and `more`.
+- The skill splits in two: `SKILL.md` (about 5 KB, down from 21 KB) with three rules, a start-here table, how to read output and the exit codes, and `reference.md` with the full tables.
+
 ## 0.4.0 (unreleased)
 
 Hand work to agent sessions and see what waits on whom.
