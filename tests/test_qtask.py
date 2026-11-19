@@ -2759,6 +2759,27 @@ class ShowAndReport(Base):
         full = self.js("show", task, "--full")
         self.assertEqual((len(full["comments"]), "events" in full), (12, True))
 
+    def test_report_shows_five_rows_a_section(self):
+        ids = [self.add(f"t{n}") for n in range(7)]
+        for task in ids:
+            self.js("set", task, "--deployed", "staging")
+        text = self.run_qtask("report", "--project", self.project).stdout
+        self.assertIn("On staging, not on production (7):", text)
+        self.assertIn("  +2 more: qtask report --project acme/app --section staging", text)
+        self.assertNotIn(ids[6], text)
+        data = self.js("report", "--project", self.project)
+        self.assertEqual(len(data["on_staging"]), 5)
+        self.assertEqual(
+            data["sections"]["staging"],
+            {"key": "on_staging", "total": 7, "shown": 5,
+             "more": "qtask report --project acme/app --json --section staging"},
+        )
+        one = self.js("report", "--project", self.project, "--section", "staging")
+        self.assertEqual((len(one["on_staging"]), list(one["sections"])), (7, ["staging"]))
+        self.assertIn(ids[6], self.run_qtask("report", "--project", self.project, "--full").stdout)
+        error = self.js("report", "--project", self.project, "--section", "nope", expect=2)["error"]
+        self.assertEqual(error["code"], "unknown_section")
+
 
 class Version(Base):
     def test_version_matches_the_package(self):

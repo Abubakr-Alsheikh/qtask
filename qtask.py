@@ -2622,21 +2622,37 @@ def cmd_report(ctx):
     ]
     parked = parked_without_reason(ctx, project)
     breakdown = report_breakdown(ctx, project, ctx.args.by) if ctx.args.by else None
+    # Sections in the order the developer acts on them: (name, JSON key, heading, rows).
+    sections = [
+        ("waiting", "waiting_on_developer", "Waiting on the developer",
+         [("comment", c) for c in questions] + [("task", t) for t in waiting]),
+        ("blocked", "blocked", "Blocked", [("task", t) for t in blocked]),
+        ("parked", "parked_no_reason", "Parked with no recorded reason (set one with --waiting-on)",
+         [("parked", p) for p in parked]),
+        ("idle", "idle_claims", f"Claims idle for more than {IDLE_HOURS} h", [("idle", t) for t in idle]),
+        ("stale", "stale_claims", "Stale claims", [("task", t) for t in stale]),
+        ("unclaimed", "in_progress_unclaimed",
+         "In progress with nobody holding them (ready and next do not list these; claim or release)",
+         [("task", t) for t in unclaimed]),
+        ("checklists", "open_checklists", "Open checklists", [("task", t) for t in checklists]),
+        ("staging", "on_staging", "On staging, not on production", [("task", t) for t in on_staging]),
+        ("parents", "parents", "Parents with progress", [("task", t) for t in parents]),
+    ]
+    names = [s[0] for s in sections]
+    wanted = ctx.args.section
+    if wanted is not None:
+        wanted = wanted.strip().lower()
+        if wanted not in names:
+            raise usage_error(f"--section takes one of {', '.join(names)}. Got {ctx.args.section!r}.", "unknown_section")
+        sections = [s for s in sections if s[0] == wanted]
+    cap = None if ctx.args.full or wanted else REPORT_ROWS
     data = {
         "project": project,
         "counts_by_status": by_status,
         "counts_by_priority": by_priority,
         "counts_by_deployed": by_deployed,
         "tasks_left": left,
-        "parents": parents,
-        "open_checklists": checklists,
-        "on_staging": on_staging,
-        "stale_claims": stale,
-        "blocked": blocked,
-        "waiting_on_developer": {"questions": questions, "tasks": waiting},
-        "idle_claims": idle,
-        "in_progress_unclaimed": unclaimed,
-        "parked_no_reason": parked,
+        "sections": {},
     }
     if breakdown is not None:
         data["by"] = breakdown
@@ -2646,29 +2662,29 @@ def cmd_report(ctx):
     deployed = [f"{k} {v}" for k, v in by_deployed.items() if v and k != "none"]
     if deployed:
         lines.append("Deployed: " + ", ".join(deployed))
-    if parents:
-        lines += ["", "Parents with progress:"] + [f"  {task_line(t)}" for t in parents]
-    if checklists:
-        lines += ["", "Open checklists:"] + [f"  {task_line(t)}" for t in checklists]
-    if on_staging:
-        lines += ["", "On staging, not on production:"] + [f"  {task_line(t)}" for t in on_staging]
-    if stale:
-        lines += ["", "Stale claims:"] + [f"  {task_line(t)}" for t in stale]
-    if idle:
-        lines += ["", f"Claims idle for more than {IDLE_HOURS} h:"]
-        lines += [f"  {task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]" for t in idle]
-    if unclaimed:
-        lines += ["", "In progress with nobody holding them (ready and next do not list these; claim or release):"]
-        lines += [f"  {task_line(t)}" for t in unclaimed]
-    if parked:
-        lines += ["", "Parked with no recorded reason (set one with --waiting-on):"]
-        lines += [f"  {p['task_id']}: {one_line(p['title'], 100)}" for p in parked]
-    if blocked:
-        lines += ["", "Blocked:"] + [f"  {task_line(t)}" for t in blocked]
-    if questions or waiting:
-        lines += ["", "Waiting on the developer:"]
-        lines += [f"  {comment_line(c)}" for c in questions]
-        lines += [f"  {task_line(t)}" for t in waiting]
+    render = {
+        "comment": lambda c: comment_line({**c, "body": one_line(c["body"], SNIPPET_CHARS)}),
+        "task": task_line,
+        "idle": lambda t: f"{task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]",
+        "parked": lambda p: f"{p['task_id']}: {one_line(p['title'], 100)}",
+    }
+    for name, key, heading, rows in sections:
+        shown = rows if cap is None else rows[:cap]
+        more = None
+        if len(shown) < len(rows):
+            more = rerun_command(ctx, drop=("--full",), drop_values=("--section", "--by"), add=["--section", name])
+        data["sections"][name] = {"key": key, "total": len(rows), "shown": len(shown), "more": more}
+        tasks = [shape_task(ctx, item, ("claim_active_at",) if kind == "idle" else ()) for kind, item in shown
+                 if kind in ("task", "idle")]
+        if name == "waiting":
+            data[key] = {"questions": [cut_comment(ctx, c) for kind, c in shown if kind == "comment"], "tasks": tasks}
+        else:
+            data[key] = [item for kind, item in shown] if name == "parked" else tasks
+        if not rows:
+            continue
+        lines += ["", f"{heading} ({len(rows)}):"] + [f"  {render[kind](item)}" for kind, item in shown]
+        if more:
+            lines.append(f"  +{len(rows) - len(shown)} more: {more}")
     if breakdown is not None:
         lines += ["", f"Open tasks by {ctx.args.by}:"] + [f"  {row['label']}  open {row['open']}/{row['total']}" for row in breakdown]
     return data, "\n".join(lines)
@@ -5013,6 +5029,11 @@ def build_parser():
         "Counts, idle claims, blocked and parked tasks, and what waits on the developer.",
     )
     p.add_argument("--by", help="add open counts by area or requester")
+    p.add_argument(
+        "--section", metavar="NAME",
+        help="print one section whole: waiting, blocked, parked, idle, stale, unclaimed, checklists, staging, parents",
+    )
+    p.add_argument("--full", action="store_true", help="print every row of every section")
 
     p = command("plan-path", cmd_plan_path, "Create the dated plan file and print its path.")
     p.add_argument("topic")
