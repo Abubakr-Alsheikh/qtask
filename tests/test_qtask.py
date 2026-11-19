@@ -73,7 +73,7 @@ HAS_FTS5 = sqlite_has_fts5()
 ARABIC ="إصلاح زر الإرسال «ذاكر» في الاختبار"
 RACE_ROUNDS = 5
 RACE_PROCESSES = 20
-LATEST_SCHEMA = 9
+LATEST_SCHEMA = 10
 BUG_BODY = "Steps: save a file\nExpected: it saves\nActual: it crashes"
 SCISSORS = "# ------------------------ >8 ------------------------"
 
@@ -1719,6 +1719,7 @@ class OldSchema(Base):
         self.assertEqual(self.add("new"), "APP-4")
         self.js("todo", "APP-1", "add", "x")
         self.js("set", "APP-1", "--deployed", "staging")
+        self.js("set", "APP-2", "--side", "design")
         export = Path(self.js("backup")["jsonl"]).read_text(encoding="utf-8")
         tables = {json.loads(line)["table"] for line in export.splitlines()}
         self.assertTrue({"todos", "tasks", "projects"} <= tables)
@@ -1872,6 +1873,10 @@ class Hub(Base):
             ("P2", "be", "improvement", ("medium", "be", "task")),
             ("P3", "infra", "decision", ("low", "infra", "task")),
             ("P2", "other", "question", ("medium", "other", "task")),
+            ("P2", "mobile", "feature", ("medium", "mobile", "feature")),
+            ("P2", "content", "content", ("medium", "content", "content")),
+            ("P2", "qa", "research", ("medium", "qa", "research")),
+            ("P2", "design", "chore", ("medium", "design", "chore")),
         ):
             other = self.add("x", "--pri", pri, "--side", side, "--kind", kind)
             payload = self.dry(other, "--fields", "title,scope,priority,side")["payload"]
@@ -2855,6 +2860,86 @@ class PickWork(Base):
         found = self.run_qtask("search", "theirs", "--project", self.project, "--expand", agent="a").stdout
         self.assertIn("<<<text by b>>>", found)
         self.assertEqual(self.js("show", task, agent="a")["comments"][1]["body"], "theirs")
+
+    def test_design_side(self):
+        task = self.add("Redesign the profile card", "--side", "design")
+        self.assertEqual(self.js("show", task)["task"]["side"], "design")
+        parent = self.add("Profile card")
+        sides = [c["side"] for c in self.js("split", parent, "--part", "design", "--part", "fe")["children"]]
+        self.assertEqual(sides, ["design", "fe"])
+
+    def test_filters_take_comma_lists_and_none(self):
+        self.js("area", "add", "admin", "--project", self.project)
+        self.js("area", "add", "content", "--parent", "admin", "--project", self.project)
+        self.js("area", "add", "exams", "--project", self.project)
+        be = self.add("a", "--side", "be", "--area", "content", "--audience", "students")
+        fe = self.add("b", "--side", "fe", "--area", "exams", "--status", "backlog")
+        bare = self.add("c")
+        design = self.add("d", "--side", "design", "--requested-by", "manager")
+        self.assertEqual(self.ls("ls", "--side", "be,fe"), [be, fe])
+        self.assertEqual(self.ls("ls", "--side", "none"), [bare])
+        self.assertEqual(self.ls("ls", "--side", "design,none"), [bare, design])
+        self.assertEqual(self.ls("ls", "--area", "none"), [bare, design])
+        self.assertEqual(self.ls("ls", "--area", "admin,exams"), [be, fe])
+        self.assertEqual(self.ls("ls", "--area", "admin,none"), [be, bare, design])
+        self.assertEqual(self.ls("ls", "--audience", "none", "--side", "be,fe"), [fe])
+        self.assertEqual(self.ls("ls", "--requested-by", "manager,none", "--side", "design"), [design])
+        self.assertEqual(self.ls("ls", "--status", "ready,backlog", "--side", "fe"), [fe])
+        self.assertEqual(self.ls("ready", "--area", "none"), [design, bare])
+        self.assertEqual(self.ls("ready", "--pri", "p2,P1", "--kind", "task", "--side", "be"), [be])
+        self.js("done", bare, "--evidence", "x")
+        self.assertEqual(self.ls("ls", "--side", "none", "--closed"), [bare])
+        facets = self.js("facets", "--project", self.project, "--area", "none", "--include-closed")
+        self.assertEqual(facets["total"], 2)
+        self.assertEqual(self.js("facets", "--project", self.project)["facets"]["lock"], {"free": 3})
+        next_task = self.js("next", "--project", self.project, "--area", "none")["next_task"]["id"]
+        self.assertEqual(next_task, design)
+        error = self.js("ls", "--project", self.project, "--side", "be,web", expect=2)["error"]
+        self.assertIn("none for unset", error["message"])
+        self.js("ls", "--project", self.project, "--kind", "none", expect=2)
+        self.js("area", "add", "none", "--project", self.project, expect=2)
+        self.js("ready", "--project", self.project, "--status", "ready", expect=2)
+
+    def test_area_hints(self):
+        no_areas = self.js("add", "Login page crash", "--project", self.project)
+        self.assertNotIn("area_hint", no_areas)
+        self.js("area", "add", "accounts", "--note", "signup, login, profiles", "--project", self.project)
+        self.js("area", "add", "exams", "--note", "the test screen", "--project", self.project)
+        self.add("Translate button on the test screen", "--area", "exams")
+        self.add("Timer on the test screen jumps", "--area", "exams")
+        made = self.js("add", "Test screen scroll jumps on small phones", "--project", self.project)
+        self.assertEqual(made["area_hint"][0]["area"], "exams")
+        text = self.run_qtask("add", "Signup form loses the email", "--project", self.project).stdout
+        self.assertIn("No area. Areas that fit: accounts", text)
+        self.assertIn("--area accounts", text)
+        self.assertIn("No area. See the areas", self.run_qtask("add", "Billing", "--project", self.project).stdout)
+        self.assertNotIn("No area", self.run_qtask("add", "x", "--area", "exams", "--project", self.project).stdout)
+        found = self.js("area", "suggest", made["task"]["id"])
+        self.assertEqual((found["task"], found["areas"][0]["area"]), (made["task"]["id"], "exams"))
+        self.assertEqual(self.js("area", "suggest", "profiles page", "--project", self.project)["areas"][0]["area"], "accounts")
+        self.assertEqual(self.js("area", "suggest", "zzz qqq", "--project", self.project)["areas"], [])
+        self.js("area", "suggest", "--project", self.project, expect=2)
+
+    def test_every_flag_has_help(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import qtask
+        finally:
+            sys.path.pop(0)
+        import argparse
+
+        missing = []
+
+        def walk(parser, name):
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for sub, child in action.choices.items():
+                        walk(child, sub)
+                elif not action.help and not isinstance(action, argparse._HelpAction):
+                    missing.append(f"{name} {action.option_strings or action.dest}")
+
+        walk(qtask.build_parser(), "qtask")
+        self.assertEqual(missing, [])
 
     def test_facets(self):
         self.add("a", "--side", "be", "--pri", "P1")

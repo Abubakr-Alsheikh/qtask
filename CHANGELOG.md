@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1 (unreleased)
+
+Organise tasks by side and area.
+
+- A new side, `design`, as on the team hub. Schema 10 widens the side check; it only adds.
+- `ls`, `ready` and `facets` filters take comma lists, as `next` does: `--side be,fe`, `--kind bug,feature`, `--pri P0,P1`, `--audience students,teachers`, `--requested-by manager,stakeholder`, `--area books,catalog`, `--status ready,backlog`. `none` matches an empty field: `--side none`, `--area none`, `--audience none`. An area cannot be named `none`. `--closed` is an alias of `--include-closed`. `ready` no longer lists `--status`, which it never used.
+- `add` without `--area`, in a project with areas, prints the areas that fit, from the area names and notes and the tasks in them, with the `set` command. JSON adds `area_hint`. `area suggest TITLE|ID` prints the same list for a title or an existing task.
+- `facets` counts `lock` too.
+- `publish --fields side` no longer stops with a Python error for a mobile, content or qa task: every side but docs goes to the hub as it is. Without `--kind`, a feature, chore, content or research task keeps its kind on the hub instead of becoming a task.
+- Every flag and argument in `--help` has a line of help.
+
 ## 0.6.0 (unreleased)
 
 Pick the right work in one call.

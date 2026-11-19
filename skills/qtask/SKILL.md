@@ -17,8 +17,8 @@ description: Local task tracker shared by agents and the developer. Load it when
 
 | Step | Command | Notes |
 |------|---------|-------|
-| Find work | `qtask next` | Comments to you, your idle or expired claims, then the top ready task with a `why first:` line. `--side be`, `--kind bug`, `--area X`, `--limit 3`; `--expand` adds whole comments and the brief, so you need no second call. `QTASK_SIDES=be,infra` sets your sides |
-| More choice | `qtask ready` | Claimable tasks by impact, 20 a page. `--side be`, `--kind bug`, `--area X` filter |
+| Find work | `qtask next` | Comments to you, your idle or expired claims, then the top ready task with a `why first:` line. `--side be,infra`, `--kind bug`, `--area X`, `--limit 3`; `--expand` adds whole comments and the brief, so you need no second call. `QTASK_SIDES=be,infra` sets your default sides for `next` only |
+| More choice | `qtask ready` | Claimable tasks by impact, 20 a page. Filters as on `ls` |
 | Read it | `qtask brief ID` | About 2 KB: claim, next step, plan, open checklist, questions, blockers, body |
 | Claim | `qtask claim ID` | Exit 3: another agent holds it, pick other work. Your activity on the task renews the 2 h lease (the team hub uses 48 h idle instead) |
 | Work | `qtask comment ID "text"`, `qtask todo ID add "step"`, `todo ID done N`, `qtask set ID --next "text"` | Keep findings on the task |
@@ -27,14 +27,28 @@ description: Local task tracker shared by agents and the developer. Load it when
 | Hand back | `qtask comment ID --kind handback --body-file FILE` | The file needs `Summary:`, `Checks run:` and `Left:` lines |
 | Close | `qtask done ID --evidence "what you ran and saw"` | Or `qtask set ID --status needs_review` for someone else to check, `qtask release ID` to stop early, `qtask drop ID --reason "text"` for work that will not happen |
 
-Before you add a task, run `qtask similar "title"`. `add` exits 4 with `duplicate_likely` when an open task scores 90 or more: read it, and pass `--duplicate-reason "how it differs"` only when yours is other work. Split work with `qtask add TITLE --parent ID` or `qtask split ID --part be --part fe`. To hand a task to a new session: `qtask prompt ID --agent NAME`.
+Before you add a task, run `qtask similar "title"`. `add` exits 4 with `duplicate_likely` when an open task scores 90 or more and your title has three words or more: read it, and pass `--duplicate-reason "how it differs"` only when yours is other work (`--no-similar` for a bulk import). To hand a task to a new session: `qtask prompt ID --agent NAME`.
 
 Park a task without a question by naming who it waits on: `qtask set ID --status blocked --waiting-on manager --waiting-note "approve the copy"`. Record the deploy state with `qtask set ID --deployed staging|production --deploy-note "text"`.
+
+## Organise a task
+
+Give each new task a side, an area and, for product work, an audience, so `next`, `ready` and `facets` can sort and filter it.
+
+| Field | Flag on `add` and `set` | Values and use |
+|-------|-------------------------|----------------|
+| Side | `--side` | fe, be, mobile, infra, docs, content, qa, design, other. Work on two sides: add the parent, then `qtask split ID --part be --part fe`, one subtask per side; keep the parent's side empty. `qtask add TITLE --parent ID` adds any other subtask |
+| Area | `--area` | The project's tree: `qtask area --tree`. `add` without `--area` prints the areas that fit; `qtask area suggest ID` does the same later. Pick the deepest fit; add one with `qtask area add NAME --parent P` only when none fits |
+| Audience | `--audience` | students, teachers, parents, managers, admins, team (internal work). Sorts `ready` |
+| Who asked | `--requested-by` | manager, stakeholder, developer, scan, agent; `--requester NAME`. Manager and stakeholder requests sort first |
+| Kind, priority | `--kind`, `--pri` | `qtask template KIND` prints the body for bug, feature, chore, content, research; a bug needs it. P0 to P3 |
+
+Filters on `ls`, `ready`, `facets` and `next` take comma lists (`--side be,fe`, `--pri P0,P1`) and `none` for an empty field: `qtask ls --area none` lists tasks to tag, `qtask facets` counts them.
 
 ## Reading output
 
 - Lists (`ls`, `ready`, `search`, `review`, `inbox`, `tree`, `plans`, `decisions`) print 20 rows. A cut list starts with `showing 21-40 of 133 (page 2 of 7)` and ends with `more: <the next command>`: run that line for the next page. `--limit N` (1 to 100), `--page N`, `--offset N`, `--all-pages`.
-- `qtask facets` (`--ready`, ls filters) counts tasks by lane, status, priority, kind, side, audience, requester and area.
+- `qtask facets` (`--ready`, ls filters) counts tasks by lane, status, priority, kind, side, audience, requester, area (direct counts; `area --tree` rolls them up) and lock. `none` is the count with the field empty.
 - `--json` list rows carry about 18 short fields, with `lock` (`free`, `claimed`, `blocked`, `needs_decision`, `in_review`, `has_subtasks`, `closed`), empty ones left out, plus a `page` object with `total` and `next`. `--fields id,title,status` picks fields (text too), `--full-json` gives every field, `--compact` prints one line. Every JSON answer has `"schema": 1`.
 - `show ID` prints the last 10 comments and an event count: `--events` adds the log, `--full` prints everything. `report` prints 5 rows a section with `+N more: <command>`; `--section NAME` or `--full` prints more.
 - `search` cuts comment hits to 160 characters (`--expand` for whole ones). `--max-chars N` cuts any long body, comment or summary and says so.
