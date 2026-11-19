@@ -114,11 +114,11 @@ REPORT_ROWS = 5
 # The fields of a task row in list output with --json. --full-json prints every field.
 LIST_FIELDS = (
     "id", "title", "status", "lane", "priority", "kind", "side", "area", "audience", "requested_by",
-    "claimed_by", "claim_valid", "blocked_by", "progress", "todo_progress", "parent_id", "deployed",
+    "claimed_by", "claim_valid", "blocked_by", "progress", "todo_progress", "parent_id", "deployed", "lock",
 )
 COMPUTED_FIELDS = (
     "blocked_by", "children_count", "children_done", "children_total", "todos_total", "todos_done",
-    "claim_valid", "progress", "todo_progress", "lane",
+    "claim_valid", "progress", "todo_progress", "lane", "lock", "lock_reason",
 )
 
 BUSY_MS = 15000
@@ -1005,7 +1005,29 @@ def task_dict(row):
         f"{data['children_done']}/{data['children_total']}" if data.get("children_count") else None
     )
     data["todo_progress"] = f"{data['todos_done']}/{data['todos_total']}" if data.get("todos_total") else None
+    data["lock"], data["lock_reason"] = lock_of(data)
     return data
+
+
+def lock_of(task):
+    """Why an agent cannot claim the task now, as (code, text). ("free", "free") when it can."""
+    waits = f", waits on {task['waiting_on']}" if task.get("waiting_on") else ""
+    open_children = (task.get("children_total") or 0) - (task.get("children_done") or 0)
+    if task["status"] in CLOSED:
+        return "closed", task["status"]
+    if task["claim_valid"]:
+        return "claimed", f"claimed by {task['claimed_by']}"
+    if task["blocked_by"]:
+        return "blocked", f"blocked by {', '.join(task['blocked_by'])}"
+    if task["status"] == "blocked":
+        return "blocked", f"blocked{waits}"
+    if task["status"] == "needs_confirm":
+        return "needs_decision", f"needs a decision{waits}"
+    if task["status"] == "needs_review":
+        return "in_review", "in review"
+    if open_children > 0:
+        return "has_subtasks", f"has {open_children} open subtask{'s' if open_children > 1 else ''}: take one"
+    return "free", "free"
 
 
 def fetch_task(conn, task_id):
@@ -1856,7 +1878,10 @@ def cmd_ready(ctx):
         "by_side": count_by(every, "side", SIDES),
         "by_priority": count_by(every, "priority", PRIORITIES),
     }
-    lines = [row_line(ctx, t, f"{t['lane']:<8} {task_line(t)}") for t in tasks]
+    lines = [
+        row_line(ctx, t, f"{t['lane']:<8} {task_line(t)}" + (f" [{t['lock_reason']}]" if t["lock"] != "free" else ""))
+        for t in tasks
+    ]
     if not every:
         lines = ["No ready tasks."]
     tail = []

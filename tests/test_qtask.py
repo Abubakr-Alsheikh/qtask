@@ -2691,7 +2691,8 @@ class Lists(Base):
         self.assertEqual(data["schema"], 1)
         self.assertEqual(
             data["tasks"][0],
-            {"id": "APP-1", "title": "full", "status": "ready", "priority": "P2", "kind": "task", "side": "be"},
+            {"id": "APP-1", "title": "full", "status": "ready", "priority": "P2", "kind": "task", "side": "be",
+             "lock": "free"},
         )
         for flag in ("--full-json", "--raw-json"):
             full = self.js("ls", "--project", self.project, flag)["tasks"][0]
@@ -2779,6 +2780,26 @@ class ShowAndReport(Base):
         self.assertIn(ids[6], self.run_qtask("report", "--project", self.project, "--full").stdout)
         error = self.js("report", "--project", self.project, "--section", "nope", expect=2)["error"]
         self.assertEqual(error["code"], "unknown_section")
+
+
+class PickWork(Base):
+    """next filters and reasons, lock codes, fences, facets and scored similar (0.6.0)."""
+
+    def test_lock_codes(self):
+        free, claimed, blocker, blocked = self.add("free"), self.add("claimed"), self.add("blocker"), self.add("blocked")
+        parent = self.add("parent")
+        self.add("child", "--parent", parent)
+        review = self.add("review", "--status", "needs_review")
+        self.js("claim", claimed, agent="bob")
+        self.js("link", blocker, "--blocks", blocked)
+        locks = {t["id"]: t["lock"] for t in self.js("ls", "--project", self.project)["tasks"]}
+        self.assertEqual(
+            (locks[free], locks[claimed], locks[blocked], locks[parent], locks[review]),
+            ("free", "claimed", "blocked", "has_subtasks", "in_review"),
+        )
+        reason = self.js("ls", "--project", self.project, "--fields", "id,lock_reason")["tasks"]
+        self.assertIn({"id": blocked, "lock_reason": f"blocked by {blocker}"}, reason)
+        self.assertIn("[has 1 open subtask: take one]", self.run_qtask("ready", "--project", self.project).stdout)
 
 
 class Version(Base):
