@@ -1932,6 +1932,7 @@ def cmd_show(ctx):
         lines.append(f"Hub: {hub['hub_id']} {hub['link']}")
     lines.append(f"Visibility: {task['visibility']}")
     lines.append(f"Created: {task['created_at']} by {task['created_by']}")
+    full = ctx.args.full
     task = {**task, "body": cut_text(ctx, task["body"]), "summary": cut_text(ctx, task["summary"])}
     if task["body"]:
         lines += ["", task["body"]]
@@ -1943,15 +1944,26 @@ def cmd_show(ctx):
         lines += ["", "Links:"] + [f"  {k}: {', '.join(v)}" for k, v in links.items() if v]
     if commits:
         lines += ["", "Commits:"] + [f"  {commit_line(c, task['project'])}" for c in commits]
-    shown = [cut_comment(ctx, c) for c in comments]
+    shown = comments if full else comments[-SHOW_COMMENTS:]
+    shown = [cut_comment(ctx, c) for c in shown]
     if comments:
-        lines += ["", "Comments:"] + [f"  {comment_line(c)}" for c in shown]
-    lines += ["", "Events:"]
-    lines += [f"  {e['at']} {e['actor']} {e['field']}: {e['old']} -> {e['new']}" for e in events]
+        head = "Comments:"
+        if len(shown) < len(comments):
+            head = f"Comments, the last {len(shown)} of {len(comments)} (all: qtask show {task_id} --full):"
+        lines += ["", head] + [f"  {comment_line(c)}" for c in shown]
+    with_events = full or ctx.args.events
+    if with_events:
+        lines += ["", "Events:"]
+        lines += [f"  {e['at']} {e['actor']} {e['field']}: {e['old']} -> {e['new']}" for e in events]
+    elif events:
+        lines += ["", f"Events: {len(events)} (qtask show {task_id} --events)"]
     data = {
-        "task": task, "children": children, "todos": todos, "comments": shown, "links": links,
-        "commits": commits, "events": events, "hub": hub,
+        "task": task, "children": children if full else shape_tasks(ctx, children), "todos": todos,
+        "comments": shown, "comment_count": len(comments), "links": links, "commits": commits,
+        "event_count": len(events), "hub": hub,
     }
+    if with_events:
+        data["events"] = events
     return data, "\n".join(lines)
 
 
@@ -4891,8 +4903,14 @@ def build_parser():
     lanes.add_argument("--planned", action="store_true", help="only status ready")
     lanes.add_argument("--backlog", action="store_true", help="only status backlog")
 
-    p = command("show", cmd_show, "Show a task with its checklist, children, links, commits, comments and events.")
+    p = command(
+        "show", cmd_show,
+        f"Show a task with its checklist, children, links, commits and the last {SHOW_COMMENTS} comments. "
+        "The event log stays out unless asked.",
+    )
     p.add_argument("id")
+    p.add_argument("--events", action="store_true", help="add the event log")
+    p.add_argument("--full", action="store_true", help="every comment, the event log and full child rows")
 
     p = command(
         "search", cmd_search,

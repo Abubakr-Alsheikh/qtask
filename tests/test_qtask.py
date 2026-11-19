@@ -213,7 +213,7 @@ class Claims(Base):
         self.sql("UPDATE tasks SET claim_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?", task)
         result = self.js("claim", task, agent="bob")["task"]
         self.assertEqual(result["claimed_by"], "bob")
-        events = self.js("show", task)["events"]
+        events = self.js("show", task, "--events")["events"]
         released = [(e["actor"], e["old"]) for e in events if e["field"] == "auto_released"]
         self.assertEqual(released, [("qtask", "alice")])
         claimed = [e for e in events if e["field"] == "claimed_by" and e["new"] == "bob"]
@@ -322,7 +322,7 @@ class Done(Base):
         self.assertEqual(len(error["open_questions"]), 1)
         done = self.js("done", task, "--evidence", "ran it", "--force", agent="a")["task"]
         self.assertEqual(done["status"], "done")
-        forced = [e for e in self.js("show", task)["events"] if e["field"] == "force"]
+        forced = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "force"]
         self.assertEqual(len(forced), 1)
         self.assertEqual(forced[0]["actor"], "a")
 
@@ -586,7 +586,7 @@ class Fields(Base):
         self.js("comment", parent, "note")
         data = self.js("show", parent.lower())
         self.assertEqual(
-            set(data), {"ok", "schema", "task", "children", "todos", "comments", "links", "commits", "events", "hub"}
+            set(data), {"ok", "schema", "task", "children", "todos", "comments", "comment_count", "links", "commits", "event_count", "hub"}
         )
         self.assertIsNone(data["hub"])
         self.assertEqual([c["id"] for c in data["children"]], [child])
@@ -651,7 +651,7 @@ class EventsAndSearch(Base):
         self.js("unlink", task, "--blocks", other, agent="alice")
         self.js("release", task, agent="alice")
         self.js("done", task, "--evidence", "ran", agent="alice")
-        events = self.js("show", task)["events"]
+        events = self.js("show", task, "--events")["events"]
         fields = [e["field"] for e in events]
         for expected in (
             "created", "priority", "tags", "claimed_by", "claim_expires_at", "status",
@@ -664,10 +664,10 @@ class EventsAndSearch(Base):
 
     def test_refused_write_logs_nothing(self):
         task = self.add()
-        count = len(self.js("show", task)["events"])
+        count = len(self.js("show", task, "--events")["events"])
         self.js("done", task, expect=4)
         self.js("set", task, "--pri", "PX", expect=2)
-        self.assertEqual(len(self.js("show", task)["events"]), count)
+        self.assertEqual(len(self.js("show", task, "--events")["events"]), count)
 
     @unittest.skipUnless(HAS_FTS5, "this Python's SQLite has no FTS5")
     def test_fts_finds_comment_text_and_stays_current(self):
@@ -895,7 +895,7 @@ class Plans(Base):
         self.assertIn(f"**Task:** {task}\n", text)
         self.assertTrue(data["plan_path_set"])
         self.assertEqual(self.js("show", task)["task"]["plan_path"], data["path"])
-        self.assertIn("plan_path", [e["field"] for e in self.js("show", task)["events"]])
+        self.assertIn("plan_path", [e["field"] for e in self.js("show", task, "--events")["events"]])
 
     def test_task_with_a_plan_path_keeps_it_and_existing_file_survives(self):
         task = self.add("t", "--plan", "D:/repo/plan.md")
@@ -1316,7 +1316,7 @@ class Commits(GitBase):
         )
         self.assertEqual(commits[2]["note"], "the follow-up")
         self.assertRegex(commits[0]["authored_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        events = [e for e in self.js("show", task)["events"] if e["field"] == "commit"]
+        events = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "commit"]
         self.assertEqual([e["new"] for e in events], [base, second, third])
         text = self.run_qtask("show", task).stdout
         self.assertIn(f"Commits:\n  {base[:7]} Add the base (main)", text)
@@ -1378,7 +1378,7 @@ class Commits(GitBase):
         self.assertEqual(
             sorted((m["old_sha"], m["sha"]) for m in moved), sorted([(feature, new_feature), (kept, new_kept)])
         )
-        show = self.js("show", task)
+        show = self.js("show", task, "--events")
         self.assertEqual({c["sha"] for c in show["commits"]}, {new_feature, new_kept})
         events = [(e["old"], e["new"], e["actor"]) for e in show["events"] if e["field"] == "commit" and e["old"]]
         self.assertIn((feature, new_feature, "fixer"), events)
@@ -1548,7 +1548,7 @@ class Deploys(Base):
         self.assertEqual(self.js("report", "--project", self.project)["on_staging"], [])
         self.js("set", task, "--deployed", "prod", expect=2)
         self.js("ls", "--project", self.project, "--deployed", "x", expect=2)
-        fields = [e["field"] for e in self.js("show", task)["events"]]
+        fields = [e["field"] for e in self.js("show", task, "--events")["events"]]
         self.assertIn("deployed", fields)
         self.assertIn("deploy_note", fields)
 
@@ -1580,7 +1580,7 @@ class Todos(Base):
         self.assertIn("[todo 1/3]", self.run_qtask("ls", "--project", self.project).stdout)
         listed = self.js("ls", "--project", self.project, "--full-json")["tasks"][0]
         self.assertEqual((listed["todo_progress"], listed["todos_done"], listed["todos_total"]), ("1/3", 1, 3))
-        events = [(e["field"], e["old"], e["new"], e["actor"]) for e in self.js("show", task)["events"]]
+        events = [(e["field"], e["old"], e["new"], e["actor"]) for e in self.js("show", task, "--events")["events"]]
         self.assertIn(("todo", None, "1 added: write the migration", "a"), events)
         self.assertIn(("todo", "3 done", "3 open", "unknown"), events)
         self.assertIn(("todo", "3 open: update the docs", "3 removed", "unknown"), events)
@@ -1600,7 +1600,7 @@ class Todos(Base):
         self.assertEqual((error["code"], error["open_todos"]), ("done_refused", [2]))
         done = self.js("done", task, "--evidence", "ran", "--force", agent="closer")["task"]
         self.assertEqual(done["status"], "done")
-        forced = [e for e in self.js("show", task)["events"] if e["field"] == "force"]
+        forced = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "force"]
         self.assertIn("open checklist items 2", forced[0]["new"])
         self.assertEqual(self.todo(task, "add", "late", expect=4)["error"]["code"], "task_closed")
         self.todo(task, "done", "2")
@@ -1640,7 +1640,7 @@ class AnswerAs(Base):
         )
         comments = self.js("show", task)["comments"]
         self.assertTrue(comments[0]["resolved"])
-        event = [e for e in self.js("show", task)["events"] if e["field"] == "comment"][-1]
+        event = [e for e in self.js("show", task, "--events")["events"] if e["field"] == "comment"][-1]
         self.assertEqual((event["actor"], event["new"]), ("alice", f"#{data['comment']['id']} answer as developer"))
         self.assertEqual(self.js("inbox", "--for", "developer", "--project", self.project)["comments"], [])
 
@@ -1651,7 +1651,7 @@ class AnswerAs(Base):
         self.assertEqual(self.js("comment", task, "x", "--as", " ", expect=2)["error"]["code"], "bad_usage")
         mine = self.js("comment", task, "mine", agent="bot")["comment"]
         self.assertEqual(mine["author"], "bot")
-        events = [e["new"] for e in self.js("show", task)["events"] if e["field"] == "comment"]
+        events = [e["new"] for e in self.js("show", task, "--events")["events"] if e["field"] == "comment"]
         self.assertEqual(events, [f"#{comment['id']} note as Product Owner", f"#{mine['id']} note"])
 
 
@@ -1974,7 +1974,7 @@ class Hub(Base):
         self.assertEqual(request["headers"]["X-Agent"], "agent-a")
         self.assertNotIn("BODY-SECRET-TEXT", json.dumps(request["body"]))
         self.assertNotIn(task, json.dumps(request["body"]))
-        shown = self.js("show", task)
+        shown = self.js("show", task, "--events")
         self.assertEqual((shown["hub"]["hub_task_id"], shown["hub"]["link"]), (7, board))
         self.assertEqual(shown["hub"]["external_ref"], request["body"]["fingerprint"].removeprefix("ext:"))
         self.assertEqual(shown["hub"]["published_by"], "agent-a")
@@ -2210,7 +2210,7 @@ class Leases(Base):
             self.sql("UPDATE tasks SET claim_expires_at = ? WHERE id = ?", PAST, task)
         self.ls()  # Any command releases expired claims first.
         for task, lane in ((planned, "ready"), (parked, "backlog")):
-            data = self.js("show", task)
+            data = self.js("show", task, "--events")
             self.assertEqual(data["task"]["status"], lane)
             self.assertIsNone(data["task"]["claimed_by"])
             released = [e for e in data["events"] if e["field"] == "auto_released"]
@@ -2546,7 +2546,7 @@ class AgentSchema(Base):
             "INSERT INTO comments(task_id, author, kind, body, created_at) VALUES ('APP-1', 'old', 'note', 'n', 'x')"
         )
         conn.close()
-        tagged = self.js("show", "APP-1")
+        tagged = self.js("show", "APP-1", "--events")
         self.assertEqual(self.sql("SELECT version FROM schema_version"), [(n,) for n in range(1, LATEST_SCHEMA + 1)])
         self.assertEqual(self.sql("PRAGMA integrity_check"), [("ok",)])
         task = tagged["task"]
@@ -2736,6 +2736,28 @@ class Lists(Base):
         self.assertNotIn("b" * 100, brief)
         self.assertIn("cut, see qtask show", brief)
         self.js("show", task, "--max-chars", "0", expect=2)
+
+
+class ShowAndReport(Base):
+    def test_show_leaves_out_events_and_old_comments(self):
+        task = self.add()
+        for n in range(12):
+            self.js("comment", task, f"comment {n}")
+        text = self.run_qtask("show", task).stdout
+        self.assertIn(f"Comments, the last 10 of 12 (all: qtask show {task} --full):", text)
+        self.assertNotIn("comment 1\n", text)
+        self.assertIn("comment 11", text)
+        self.assertRegex(text, rf"Events: \d+ \(qtask show {task} --events\)")
+        self.assertNotIn(" -> ", text)
+        data = self.js("show", task)
+        self.assertNotIn("events", data)
+        self.assertEqual((len(data["comments"]), data["comment_count"]), (10, 12))
+        self.assertGreater(data["event_count"], 0)
+        events = self.js("show", task, "--events")
+        self.assertEqual(len(events["events"]), events["event_count"])
+        self.assertIn(" -> ", self.run_qtask("show", task, "--events").stdout)
+        full = self.js("show", task, "--full")
+        self.assertEqual((len(full["comments"]), "events" in full), (12, True))
 
 
 class Version(Base):
