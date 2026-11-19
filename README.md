@@ -59,7 +59,10 @@ The skill in `skills/qtask/` tells Claude when to load qtask and how to use it: 
 ```bash
 mkdir -p ~/.claude/skills/qtask
 curl -fsSL https://raw.githubusercontent.com/Abubakr-Alsheikh/qtask/main/skills/qtask/SKILL.md -o ~/.claude/skills/qtask/SKILL.md
+curl -fsSL https://raw.githubusercontent.com/Abubakr-Alsheikh/qtask/main/skills/qtask/reference.md -o ~/.claude/skills/qtask/reference.md
 ```
+
+`SKILL.md` stays short (about 5 KB), because Claude loads it in each session. `reference.md` holds the full command table, and Claude reads it only when it needs a rare flag.
 
 ### Other agents
 
@@ -116,7 +119,17 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | `backup` | A database copy and a JSONL export, kept 7 deep |
 | `publish`, `hub-pull`, `hub` | Send a task to a team hub after you confirm, read back what changed there, list published tasks |
 
-`qtask COMMAND --help` lists the flags. The skill file has the full table and the exit codes.
+`qtask COMMAND --help` lists the flags. `skills/qtask/reference.md` has the full table and the exit codes.
+
+### Reading output
+
+Output stays small, so an agent can read it without filling its context.
+
+- `ls`, `ready`, `search`, `review`, `inbox`, `tree`, `plans` and `decisions` print 20 rows a page. A cut list starts with `showing 21-40 of 133 (page 2 of 7)` and ends with `more: qtask ls --status ready --page 3`, the command for the next page. Flags: `--limit N` (1 to 100), `--page N`, `--offset N`, `--all-pages`. `QTASK_LIMIT=0` prints every row, as qtask 0.4 did.
+- `--json` list rows carry 17 short fields (`id, title, status, lane, priority, kind, side, area, audience, requested_by, claimed_by, claim_valid, blocked_by, progress, todo_progress, parent_id, deployed`) and leave out empty ones. A `page` object gives `page`, `pages`, `limit`, `offset`, `total` and `next`. `--fields id,title` picks fields in text and JSON, `--full-json` (or `--raw-json`) prints every field, `--compact` prints one line.
+- Every JSON answer carries `"schema": 1`. Adding a key keeps the number; removing or renaming one raises it, and the changelog says so.
+- `show` prints the last 10 comments and an event count: `--events` adds the event log, `--full` prints everything. `report` prints 5 rows a section with `+N more: qtask report --section NAME`; `--full` prints all.
+- `search` cuts each comment hit to about 160 characters around the match; `--expand` prints it whole. `--max-chars N` cuts any long body, comment or summary and says how much it cut.
 
 ### Hand a task to another agent
 
@@ -284,6 +297,7 @@ qtask needs SQLite 3.24 or newer with JSON functions. The Python builds from pyt
 |----------|---------|
 | `QTASK_HOME` | Data folder, an absolute path |
 | `QTASK_AGENT` | Agent name when `--agent` is absent |
+| `QTASK_LIMIT` | Rows per page of a list when `--limit` is absent, 1 to 100, default 20. `0` prints every row |
 | `QTASK_NO_FTS` | Use plain `LIKE` search instead of SQLite FTS5 when the database is created |
 | `QTASK_HUB_URL` | Hub base URL when `--hub-url` is absent |
 | `QTASK_HUB_TOKEN` | Hub API token. Else qtask reads `~/.qhub/token` |
