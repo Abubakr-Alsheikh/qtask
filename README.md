@@ -99,14 +99,14 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | Command | Does |
 |---------|------|
 | `add`, `set`, `show`, `ls`, `search` | Create, change, read and find tasks |
-| `ready`, `next` | Tasks an agent may claim now, by lane and impact; what to do next, with the commands |
+| `ready`, `next`, `facets` | Tasks an agent may claim now, by lane and impact; what to do next, with the reason and the commands; counts by field |
 | `brief` | About 2 KB of what an agent needs to start a task |
 | `claim`, `release` | Take or give back a task. Activity renews a claim; an expired one goes back to its lane |
 | `review`, `approve`, `reject`, `decisions` | The review queue, and what waits on whom |
 | `prompt`, `context`, `export` | Hand a task to another agent session |
 | `area` | Areas of a project as a tree, with counts |
 | `split`, `take` | One subtask per side, and claim one part |
-| `similar`, `template` | Look for duplicates; body templates per kind |
+| `similar`, `template` | Look for duplicates, scored 0 to 100 (`add` refuses one at 90 or more); body templates per kind |
 | `comment`, `ask`, `answer`, `resolve`, `inbox` | Notes and questions between agents and people |
 | `todo` | A checklist inside a task |
 | `link`, `unlink` | Blockers and related tasks |
@@ -129,7 +129,9 @@ Output stays small, so an agent can read it without filling its context.
 - `--json` list rows carry 17 short fields (`id, title, status, lane, priority, kind, side, area, audience, requested_by, claimed_by, claim_valid, blocked_by, progress, todo_progress, parent_id, deployed`) and leave out empty ones. A `page` object gives `page`, `pages`, `limit`, `offset`, `total` and `next`. `--fields id,title` picks fields in text and JSON, `--full-json` (or `--raw-json`) prints every field, `--compact` prints one line.
 - Every JSON answer carries `"schema": 1`. Adding a key keeps the number; removing or renaming one raises it, and the changelog says so.
 - `show` prints the last 10 comments and an event count: `--events` adds the event log, `--full` prints everything. `report` prints 5 rows a section with `+N more: qtask report --section NAME`; `--full` prints all.
-- `search` cuts each comment hit to about 160 characters around the match; `--expand` prints it whole. `--max-chars N` cuts any long body, comment or summary and says how much it cut.
+- `search` cuts each comment hit to about 160 characters around the match; `--expand` prints it whole.
+- Text that another agent wrote prints between `<<<text by NAME>>>` and `<<<end>>>` in `show`, `brief`, `prompt`, `next --expand` and `search --expand`, so a reading agent treats it as data. Markers inside the text are defused.
+- List rows carry a `lock` code: `free`, `claimed`, `blocked`, `needs_decision`, `in_review`, `has_subtasks` or `closed`. `--max-chars N` cuts any long body, comment or summary and says how much it cut.
 
 ### Hand a task to another agent
 
@@ -297,6 +299,7 @@ qtask needs SQLite 3.24 or newer with JSON functions. The Python builds from pyt
 |----------|---------|
 | `QTASK_HOME` | Data folder, an absolute path |
 | `QTASK_AGENT` | Agent name when `--agent` is absent |
+| `QTASK_SIDES` | Comma list of sides `next` picks from when `--side` is absent |
 | `QTASK_LIMIT` | Rows per page of a list when `--limit` is absent, 1 to 100, default 20. `0` prints every row |
 | `QTASK_NO_FTS` | Use plain `LIKE` search instead of SQLite FTS5 when the database is created |
 | `QTASK_HUB_URL` | Hub base URL when `--hub-url` is absent |
