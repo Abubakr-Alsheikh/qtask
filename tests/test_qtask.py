@@ -2500,7 +2500,10 @@ class Extras(Base):
         first = self.add("Fix the login redirect for old links")
         data = self.js("add", "Login redirect for old links breaks", "--project", self.project)
         self.assertEqual([s["id"] for s in data["similar"]], [first])
-        self.assertIn("Similar open tasks", self.run_qtask("add", "login redirect old links", "--project", self.project).stdout)
+        self.assertIn("Likely the same work", self.run_qtask("add", "Login redirect for old links fails", "--project", self.project).stdout)
+        refused = self.run_qtask("add", "login redirect old links", "--project", self.project)
+        self.assertEqual(refused.returncode, 4)
+        self.assertIn("looks like the same work", refused.stderr)
         self.assertEqual(self.js("similar", "something else entirely", "--project", self.project)["count"], 0)
 
     def test_bug_template(self):
@@ -2785,6 +2788,39 @@ class ShowAndReport(Base):
 class PickWork(Base):
     """next filters and reasons, lock codes, fences, facets and scored similar (0.6.0)."""
 
+    def test_next_skips_parents_with_open_subtasks_and_says_why(self):
+        parent = self.add("grouped work", "--requested-by", "manager", "--pri", "P0")
+        child = self.add("one part", "--parent", parent, "--side", "be")
+        bug = self.add("crash on save", "--kind", "bug", "--body", BUG_BODY, "--audience", "students", "--side", "fe")
+        data = self.js("next", "--project", self.project, agent="a")
+        self.assertNotEqual(data["next_task"]["id"], parent)
+        self.assertEqual(data["next_task"]["id"], bug)
+        self.assertEqual(data["next_task"]["why"], "bug, for students, P2, planned")
+        text = self.run_qtask("next", "--project", self.project, agent="a").stdout
+        self.assertIn("   why first: bug, for students, P2, planned", text)
+        three = self.js("next", "--project", self.project, "--limit", "3", agent="a")
+        self.assertEqual([t["id"] for t in three["candidates"]], [bug, child])
+        self.assertEqual(self.js("next", "--project", self.project, "--side", "be", agent="a")["next_task"]["id"], child)
+        env = {**self.env, "QTASK_SIDES": "fe"}
+        self.assertEqual(self.js("next", "--project", self.project, agent="a", env=env)["next_task"]["id"], bug)
+        self.assertEqual(self.js("next", "--project", self.project, "--kind", "task", agent="a")["next_task"]["id"], child)
+        self.js("next", "--project", self.project, "--limit", "11", agent="a", expect=2)
+        self.js("next", "--project", self.project, "--side", "nope", agent="a", expect=2)
+
+    def test_next_expand_prints_whole_comments_and_the_brief(self):
+        task = self.add("the work", "--body", "line one\nline two")
+        long = "x" * 300
+        self.js("comment", task, long, "--to", "a", agent="b")
+        text = self.run_qtask("next", "--project", self.project, "--expand", agent="a").stdout
+        self.assertIn(long, text)
+        self.assertIn("<<<text by b>>>", text)
+        self.assertIn("Project: acme/app", text)
+        self.assertIn("line two", text)
+        short = self.run_qtask("next", "--project", self.project, agent="a").stdout
+        self.assertNotIn(long, short)
+        step = self.js("next", "--project", self.project, "--expand", agent="a")["steps"][-1]
+        self.assertIn("Claim: none", step["brief"])
+
     def test_lock_codes(self):
         free, claimed, blocker, blocked = self.add("free"), self.add("claimed"), self.add("blocker"), self.add("blocked")
         parent = self.add("parent")
@@ -2820,39 +2856,6 @@ class PickWork(Base):
         self.assertIn("<<<text by b>>>", found)
         self.assertEqual(self.js("show", task, agent="a")["comments"][1]["body"], "theirs")
 
-    def test_next_skips_parents_with_open_subtasks_and_says_why(self):
-        parent = self.add("grouped work", "--requested-by", "manager", "--pri", "P0")
-        child = self.add("one part", "--parent", parent, "--side", "be")
-        bug = self.add("crash on save", "--kind", "bug", "--body", BUG_BODY, "--audience", "students", "--side", "fe")
-        data = self.js("next", "--project", self.project, agent="a")
-        self.assertNotEqual(data["next_task"]["id"], parent)
-        self.assertEqual(data["next_task"]["id"], bug)
-        self.assertEqual(data["next_task"]["why"], "bug, for students, P2, planned")
-        text = self.run_qtask("next", "--project", self.project, agent="a").stdout
-        self.assertIn("   why first: bug, for students, P2, planned", text)
-        three = self.js("next", "--project", self.project, "--limit", "3", agent="a")
-        self.assertEqual([t["id"] for t in three["candidates"]], [bug, child])
-        self.assertEqual(self.js("next", "--project", self.project, "--side", "be", agent="a")["next_task"]["id"], child)
-        env = {**self.env, "QTASK_SIDES": "fe"}
-        self.assertEqual(self.js("next", "--project", self.project, agent="a", env=env)["next_task"]["id"], bug)
-        self.assertEqual(self.js("next", "--project", self.project, "--kind", "task", agent="a")["next_task"]["id"], child)
-        self.js("next", "--project", self.project, "--limit", "11", agent="a", expect=2)
-        self.js("next", "--project", self.project, "--side", "nope", agent="a", expect=2)
-
-    def test_next_expand_prints_whole_comments_and_the_brief(self):
-        task = self.add("the work", "--body", "line one\nline two")
-        long = "x" * 300
-        self.js("comment", task, long, "--to", "a", agent="b")
-        text = self.run_qtask("next", "--project", self.project, "--expand", agent="a").stdout
-        self.assertIn(long, text)
-        self.assertIn("<<<text by b>>>", text)
-        self.assertIn("Project: acme/app", text)
-        self.assertIn("line two", text)
-        short = self.run_qtask("next", "--project", self.project, agent="a").stdout
-        self.assertNotIn(long, short)
-        step = self.js("next", "--project", self.project, "--expand", agent="a")["steps"][-1]
-        self.assertIn("Claim: none", step["brief"])
-
     def test_facets(self):
         self.add("a", "--side", "be", "--pri", "P1")
         self.add("b", "--side", "be", "--status", "backlog")
@@ -2869,6 +2872,32 @@ class PickWork(Base):
         self.assertEqual(self.js("facets", "--project", self.project, "--side", "fe", "--include-closed")["total"], 2)
         self.assertIn("total 3  claimable 2", self.run_qtask("facets", "--project", self.project).stdout)
         self.js("facets", "--project", self.project, "--ready", "--status", "done", expect=2)
+
+    def test_similar_scores_title_and_body(self):
+        crash = self.add("Translate crashes the whole test page when the stem translation arrives")
+        self.add("Speaking transcription moves off the old model")
+        found = self.js("similar", "Translate crash", "--project", self.project)["similar"]
+        self.assertEqual([s["id"] for s in found], [crash])
+        self.assertGreaterEqual(found[0]["score"], 75)
+        self.assertEqual(self.js("similar", "Billing export", "--project", self.project)["similar"], [])
+        text = self.run_qtask("similar", "Translate crash", "--project", self.project).stdout
+        self.assertRegex(text, rf"^\d+ {crash} ready: Translate crashes")
+
+    def test_add_refuses_a_likely_duplicate(self):
+        first = self.add("Translate crashes the test page")
+        error = self.js("add", "Translate crash on the test page", "--project", self.project, expect=4)["error"]
+        self.assertEqual(error["code"], "duplicate_likely")
+        self.assertEqual(error["similar"][0]["id"], first)
+        self.assertIn("--duplicate-reason", error["message"])
+        made = self.js(
+            "add", "Translate crash on the test page", "--project", self.project, "--duplicate-reason", "the mobile app",
+        )
+        events = self.js("show", made["task"]["id"], "--events")["events"]
+        self.assertIn(("duplicate_reason", first, "the mobile app"), [(e["field"], e["old"], e["new"]) for e in events])
+        self.js("add", "Translate crash on the test page", "--project", self.project, "--no-similar")
+        self.add("task")
+        self.add("task")
+
 
 
 class Version(Base):

@@ -1721,33 +1721,62 @@ def check_template(kind, body):
         )
 
 
-def similar_tasks(conn, project, title, skip=None, limit=5):
-    """Open tasks of the project whose titles share most of their words with `title`."""
+DUPLICATE_SCORE = 90
+WARN_SCORE = 75
+SHOW_SCORE = 50
+GATE_WORDS = 3
+STEM_SUFFIXES = ("ations", "ation", "ions", "ion", "ings", "ing", "ies", "es", "ed", "s", "e")
+STOP_WORDS = {
+    "the", "and", "for", "with", "from", "into", "add", "fix", "use", "make", "new", "a", "an", "of", "to", "in",
+    "on", "is", "it", "be", "when", "that", "this", "or", "at", "by",
+}
+
+
+def stem(word):
+    """A crude English stem: crashes, crash -> crash; translate, translation -> translat."""
+    for suffix in STEM_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def title_words(text):
+    return {stem(w) for w in re.findall(r"\w+", (text or "").casefold()) if len(w) > 1 and w not in STOP_WORDS}
+
+
+def similar_score(words, body_words, area, row):
+    """0 to 100: how much of the new title the task's title holds, its title overlap, and its body."""
+    title = title_words(row["title"])
+    text = title | title_words(row["body"])
+    shared = words & title
+    cover, overlap, in_text = len(shared) / len(words), len(shared) / len(words | title), len(words & text) / len(words)
+    if body_words:
+        body = len(body_words & text) / len(body_words | text)
+        score = 45 * cover + 25 * overlap + 15 * in_text + 15 * body
+    else:
+        score = 50 * cover + 30 * overlap + 20 * in_text
+    if area and row["area"] == area:
+        score += 5
+    return min(100, round(score))
+
+
+def similar_tasks(conn, project, title, skip=None, limit=5, body=None, area=None):
+    """Open tasks of the project that look like the same work, best first, scored 0 to 100."""
     words = title_words(title)
     if not words:
         return []
+    body_words = title_words(body)
     found = []
     for row in conn.execute(
-        f"SELECT id, title, status FROM tasks WHERE project = ? AND status NOT IN {SQL_CLOSED}", (project,)
+        f"SELECT id, title, body, status, area FROM tasks WHERE project = ? AND status NOT IN {SQL_CLOSED}", (project,)
     ):
         if row["id"] == skip:
             continue
-        other = title_words(row["title"])
-        shared = words & other
-        if not shared:
-            continue
-        score = len(shared) / len(words | other)
-        if score >= 0.5 or (len(shared) >= 3 and score >= 0.34):
-            found.append({"id": row["id"], "title": row["title"], "status": row["status"], "score": round(score, 2)})
+        score = similar_score(words, body_words, area, row)
+        if score >= SHOW_SCORE:
+            found.append({"id": row["id"], "title": row["title"], "status": row["status"], "score": score})
     found.sort(key=lambda f: (-f["score"], f["id"]))
     return found[:limit]
-
-
-STOP_WORDS = {"the", "and", "for", "with", "from", "into", "add", "fix", "use", "make", "new", "a", "an", "of", "to", "in", "on"}
-
-
-def title_words(title):
-    return {w for w in re.findall(r"\w+", title.casefold()) if len(w) > 1 and w not in STOP_WORDS}
 
 
 def cmd_add(ctx):
@@ -1783,7 +1812,17 @@ def cmd_add(ctx):
         if area:
             require_area(conn, row["name"], area)
         task_id = f"{row['prefix']}-{row['next_n']}"
-        similar = similar_tasks(conn, row["name"], title)
+        similar = [] if a.no_similar else similar_tasks(conn, row["name"], title, body=a.body, area=area)
+        duplicate = next((t for t in similar if t["score"] >= DUPLICATE_SCORE), None)
+        reason = (a.duplicate_reason or "").strip()
+        if duplicate and len(title_words(title)) >= GATE_WORDS and not reason:
+            raise refused(
+                "duplicate_likely",
+                f"{duplicate['id']} ({duplicate['score']}/100) looks like the same work: {duplicate['title']}. "
+                f"Read it with qtask brief {duplicate['id']}. If yours is different, run add again with "
+                "--duplicate-reason \"how it differs\".",
+                similar=similar,
+            )
         conn.execute("UPDATE projects SET next_n = next_n + 1 WHERE name = ?", (project,))
         at = now()
         conn.execute(
@@ -1800,12 +1839,14 @@ def cmd_add(ctx):
             columns = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE tasks SET {columns} WHERE id = ?", (*fields.values(), task_id))
         log_event(ctx, task_id, "created", None, title, at)
+        if duplicate and reason:
+            log_event(ctx, task_id, "duplicate_reason", duplicate["id"], reason, at)
     task = fetch_task(ctx.conn, task_id)
     text = f"Created {task_id}: {title}"
+    warn = [t for t in similar if t["score"] >= WARN_SCORE]
     if similar:
-        text += "\nSimilar open tasks, check you did not add it twice:\n" + "\n".join(
-            f"  {s['id']} {s['status']}: {s['title']}" for s in similar
-        )
+        head = "Likely the same work, check you did not add it twice:" if warn else "Similar open tasks:"
+        text += f"\n{head}\n" + "\n".join(f"  {s['score']} {s['id']} {s['status']}: {s['title']}" for s in similar)
     return {"task": task, "similar": similar}, text
 
 
@@ -1814,8 +1855,9 @@ def cmd_similar(ctx):
     if not title:
         raise usage_error("similar needs a title.")
     project = ctx.project()
-    found = similar_tasks(ctx.conn, project, title)
-    lines = [f"{s['id']} {s['status']} ({s['score']}): {s['title']}" for s in found]
+    body = ctx.args.body
+    found = similar_tasks(ctx.conn, project, title, body=body, area=ctx.args.area)
+    lines = [f"{s['score']} {s['id']} {s['status']}: {s['title']}" for s in found]
     return {"title": title, "similar": found, "count": len(found)}, "\n".join(lines) if lines else "No similar open tasks."
 
 
@@ -5067,6 +5109,11 @@ def build_parser():
     p.add_argument("--owner")
     p.add_argument("--branch")
     p.add_argument("--pr")
+    p.add_argument(
+        "--duplicate-reason", metavar="TEXT",
+        help=f"add despite an open task scoring {DUPLICATE_SCORE} or more; say how this one differs",
+    )
+    p.add_argument("--no-similar", action="store_true", help="skip the similar check, such as for a bulk import")
     add_field_flags(p)
 
     p = command("ls", cmd_ls, "List tasks. Hides done and dropped unless asked.")
@@ -5403,8 +5450,15 @@ def build_parser():
     p.add_argument("--part", required=True, help="a side such as be, or the part's number")
     p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
 
-    p = command("similar", cmd_similar, "Open tasks of the project with a similar title. add runs it too.")
+    p = command(
+        "similar", cmd_similar,
+        "Open tasks of the project that look like the same work, scored 0 to 100 on title and body. add runs it "
+        f"too, and refuses a title of {GATE_WORDS} or more words that scores {DUPLICATE_SCORE} or more.",
+    )
     p.add_argument("title")
+    p.add_argument("--body-file", help="compare this body too: a UTF-8 file, or stdin with -")
+    p.set_defaults(body=None)
+    p.add_argument("--area", help="an area; a task in it scores a little higher")
 
     p = command(
         "facets", cmd_facets,
