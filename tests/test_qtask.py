@@ -2820,6 +2820,39 @@ class PickWork(Base):
         self.assertIn("<<<text by b>>>", found)
         self.assertEqual(self.js("show", task, agent="a")["comments"][1]["body"], "theirs")
 
+    def test_next_skips_parents_with_open_subtasks_and_says_why(self):
+        parent = self.add("grouped work", "--requested-by", "manager", "--pri", "P0")
+        child = self.add("one part", "--parent", parent, "--side", "be")
+        bug = self.add("crash on save", "--kind", "bug", "--body", BUG_BODY, "--audience", "students", "--side", "fe")
+        data = self.js("next", "--project", self.project, agent="a")
+        self.assertNotEqual(data["next_task"]["id"], parent)
+        self.assertEqual(data["next_task"]["id"], bug)
+        self.assertEqual(data["next_task"]["why"], "bug, for students, P2, planned")
+        text = self.run_qtask("next", "--project", self.project, agent="a").stdout
+        self.assertIn("   why first: bug, for students, P2, planned", text)
+        three = self.js("next", "--project", self.project, "--limit", "3", agent="a")
+        self.assertEqual([t["id"] for t in three["candidates"]], [bug, child])
+        self.assertEqual(self.js("next", "--project", self.project, "--side", "be", agent="a")["next_task"]["id"], child)
+        env = {**self.env, "QTASK_SIDES": "fe"}
+        self.assertEqual(self.js("next", "--project", self.project, agent="a", env=env)["next_task"]["id"], bug)
+        self.assertEqual(self.js("next", "--project", self.project, "--kind", "task", agent="a")["next_task"]["id"], child)
+        self.js("next", "--project", self.project, "--limit", "11", agent="a", expect=2)
+        self.js("next", "--project", self.project, "--side", "nope", agent="a", expect=2)
+
+    def test_next_expand_prints_whole_comments_and_the_brief(self):
+        task = self.add("the work", "--body", "line one\nline two")
+        long = "x" * 300
+        self.js("comment", task, long, "--to", "a", agent="b")
+        text = self.run_qtask("next", "--project", self.project, "--expand", agent="a").stdout
+        self.assertIn(long, text)
+        self.assertIn("<<<text by b>>>", text)
+        self.assertIn("Project: acme/app", text)
+        self.assertIn("line two", text)
+        short = self.run_qtask("next", "--project", self.project, agent="a").stdout
+        self.assertNotIn(long, short)
+        step = self.js("next", "--project", self.project, "--expand", agent="a")["steps"][-1]
+        self.assertIn("Claim: none", step["brief"])
+
 
 class Version(Base):
     def test_version_matches_the_package(self):

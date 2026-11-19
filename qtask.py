@@ -3997,11 +3997,15 @@ def cmd_next(ctx):
             params,
         ):
             command = f'qtask answer {c["id"]} "your answer"' if c["kind"] == "question" else f"qtask resolve {c['id']}"
-            steps.append({
+            step = {
                 "what": "inbox", "task_id": c["task_id"], "comment_id": c["id"],
                 "text": f"#{c['id']} on {c['task_id']} [{c['kind']}] from {c['author']}: {one_line(c['body'])}",
                 "commands": [f"qtask brief {c['task_id']}", command],
-            })
+            }
+            if ctx.args.expand:
+                step["text"] = f"#{c['id']} on {c['task_id']} [{c['kind']}] from {c['author']}:"
+                step["body"] = fence(me, cut_text(ctx, c["body"]), c["author"])
+            steps.append(step)
         cutoff = iso(utc_now() - timedelta(hours=IDLE_HOURS))
         for task in held_claims(ctx, me, project):
             idle = (task["claim_active_at"] or task["updated_at"]) < cutoff
@@ -4027,28 +4031,86 @@ def cmd_next(ctx):
                 "text": f"Your claim expired and qtask released it: {task_line(task)}",
                 "commands": [f"qtask brief {task['id']}", f"qtask claim {task['id']}"],
             })
-    where = [
-        "t.status IN ('ready', 'backlog')", f"NOT {SQL_HAS_BLOCKER}",
-        "(t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?)",
-    ]
-    params = [now()]
-    add_scope(where, params, project)
-    row = conn.execute(
-        f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order('impact', lanes=True)} LIMIT 1", params
-    ).fetchone()
-    top = task_dict(row) if row else None
-    if top:
-        steps.append({
-            "what": "ready", "task_id": top["id"], "text": f"Top ready task by impact: {task_line(top)}",
-            "commands": [f"qtask brief {top['id']}", f"qtask claim {top['id']}"],
-        })
+    where, params = next_where(ctx, project)
+    limit = ctx.args.limit or 1
+    if not 1 <= limit <= 10:
+        raise usage_error("next --limit takes 1 to 10. For a longer list use qtask ready.")
+    rows = conn.execute(
+        f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order('impact', lanes=True)} LIMIT ?",
+        [*params, limit],
+    ).fetchall()
+    picks = [task_dict(r) for r in rows]
+    for n, task in enumerate(picks):
+        task["why"] = why_first(task)
+        label = "Top ready task by impact" if n == 0 else f"Next candidate {n + 1}"
+        step = {
+            "what": "ready", "task_id": task["id"], "text": f"{label}: {task_line(task)}", "why": task["why"],
+            "commands": [f"qtask brief {task['id']}", f"qtask claim {task['id']}"],
+        }
+        if ctx.args.expand and n == 0:
+            data = brief_data(conn, task["id"])
+            step["brief"] = brief_text(data, max_chars=ctx.args.max_chars, reader=me)
+            step["commands"] = [f"qtask claim {task['id']}"]
+        steps.append(step)
+    top = picks[0] if picks else None
     lines = []
     for n, step in enumerate(steps, 1):
         lines.append(f"{n}. {step['text']}")
+        if step.get("why"):
+            lines.append(f"   {'why first' if step['text'].startswith('Top') else 'why'}: {step['why']}")
+        for key in ("body", "brief"):
+            if step.get(key):
+                lines += [f"   {line}" for line in step[key].split("\n")]
         lines += [f"   {command}" for command in step["commands"]]
     if not top:
         lines.append("No ready task. See qtask decisions for what waits on people.")
-    return {"for": me, "steps": steps, "next_task": shape_task(ctx, top) if top else None}, "\n".join(lines)
+    data = {
+        "for": me, "steps": steps, "next_task": shape_task(ctx, top, ("why",)) if top else None,
+        "candidates": shape_tasks(ctx, picks, ("why",)),
+    }
+    return data, "\n".join(lines)
+
+
+def next_where(ctx, project):
+    """Claimable tasks for next: ready or backlog, no open blocker or claim, no open subtasks, the filters."""
+    a = ctx.args
+    where = [
+        "t.status IN ('ready', 'backlog')", f"NOT {SQL_HAS_BLOCKER}",
+        "(t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?)",
+        f"NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_id = t.id AND c.status NOT IN {SQL_CLOSED})",
+    ]
+    params = [now()]
+    add_scope(where, params, project)
+    sides = a.side if a.side is not None else os.environ.get("QTASK_SIDES", "")
+    for flag, column, raw, allowed, upper in (
+        ("--side", "t.side", sides, SIDES, False), ("--kind", "t.kind", a.kind, KINDS, False),
+        ("--pri", "t.priority", a.pri, PRIORITIES, True),
+    ):
+        values = [choice(v.strip(), allowed, flag, upper=upper) for v in (raw or "").split(",") if v.strip()]
+        if values:
+            where.append(f"{column} IN ({','.join('?' * len(values))})")
+            params.extend(values)
+    if a.area:
+        if project is None:
+            raise usage_error("--area needs one project. Pass --project, not --all.")
+        names = area_subtree(ctx.conn, project, clean_area(a.area))
+        where.append(f"t.area IN ({','.join('?' * len(names))})")
+        params.extend(names)
+    return where, params
+
+
+def why_first(task):
+    """The impact sort's reasons for this task, in its order."""
+    reasons = []
+    if task.get("requested_by") in ("manager", "stakeholder"):
+        reasons.append(f"{task['requested_by']} request")
+    if task["kind"] == "bug":
+        reasons.append("bug")
+    if task.get("audience"):
+        reasons.append(f"for {task['audience']}")
+    reasons.append(task["priority"])
+    reasons.append("planned" if task["status"] == "ready" else "backlog")
+    return ", ".join(reasons)
 
 
 # ------------------------------------------------------------ hand-off pack
@@ -5239,6 +5301,12 @@ def build_parser():
         "What to do now: comments addressed to you, your claims (idle or expired), then the top ready task.",
     )
     p.add_argument("--for", dest="for_agent", help="agent name, default the current agent")
+    p.add_argument("--expand", action="store_true", help="whole inbox comments and the brief of the top task")
+    p.add_argument("--side", help="comma list of sides; default QTASK_SIDES")
+    p.add_argument("--kind", help="comma list of kinds")
+    p.add_argument("--pri", "--priority", dest="pri", help="comma list of priorities")
+    p.add_argument("--area", help="an area; includes the areas below it")
+    p.add_argument("--limit", type=int, metavar="N", help="how many ready candidates to list, 1 to 10, default 1")
 
     p = command(
         "prompt", cmd_prompt,
