@@ -10,6 +10,7 @@ Lists page: `ls`, `ready`, `search`, `review`, `inbox`, `tree` (with no ID), `pl
 - `QTASK_LIMIT=N` sets your own default; `QTASK_LIMIT=0` prints every row, as qtask 0.4 did.
 - When a page leaves rows out, the text starts with `showing 21-40 of 133 (page 2 of 7)` and ends with `more: qtask ... --page 3`, the same command with the next page. `ready` keeps its footer counts over every claimable task, not the page.
 - `--json` adds `"page": {"page", "pages", "limit", "offset", "total", "next"}`; `count` is the rows on this page and `total` all of them.
+- `ls --json --all-pages --fields id,title` reads a whole list in one call, at about 70 characters a row.
 - List rows in `--json` carry these fields and leave out empty ones: `id, title, status, lane, priority, kind, side, area, audience, requested_by, claimed_by, claim_valid, blocked_by, progress, todo_progress, parent_id, deployed, lock`. `lock` says why you cannot claim the task now: `free`, `claimed`, `blocked`, `needs_decision`, `in_review`, `has_subtasks` (take a subtask instead) or `closed`; `--fields lock_reason` gives the words. `review` adds `in_review_since` and `submitted_by`. `--full-json` (or `--raw-json`) prints every field. `--fields id,title,status` prints those fields only, as columns in text and as keys in JSON; an unknown field exits 2 with `unknown_field`.
 - `--compact` prints the JSON on one line. Every JSON answer, errors too, carries `"schema": 1`. A new key keeps the schema number; a removed or renamed key raises it.
 - `show ID` prints the last 10 comments and `Events: N (qtask show ID --events)`. `--events` adds the event log; `--full` prints every comment, the log and full child rows. JSON has `comment_count` and `event_count`, and `events` only with one of the flags.
@@ -84,7 +85,18 @@ When the developer copies a task to an issue tracker, record the link with `qtas
 
 - `--requested-by manager|stakeholder|developer|scan|agent` on `add` or `set` records who asked. `--requester NAME` and `--requested-on YYYY-MM-DD` add the person and the day (default: today on add). `--audience students|teachers|parents|managers|admins|team` records who the work is for.
 - `ready` sorts by impact: manager and stakeholder requests first, then bugs, then audience in the order above, then priority, then oldest. `ls` and `ready` take `--sort impact|oldest|priority`, `--requested-by`, `--audience` and `--area`.
-- Areas form a tree per project: `qtask area add content --parent admin --note "question bank"`, then `add` or `set --area content`. `--area admin` on `ls` and `ready` includes the areas below it. `qtask area --tree` shows open/total counts rolled up to the parents. An unknown area exits 2 with `unknown_area`.
+- Areas form a tree per project: `qtask area add content --parent admin --note "question bank"`, then `add` or `set --area content`. `--area admin` on `ls`, `ready`, `facets` and `next` includes the areas below it. `qtask area --tree` shows open/total counts rolled up to the parents. An unknown area exits 2 with `unknown_area`. Write a note with the words people use for the area: `area suggest` matches them.
+- `add` without `--area`, in a project that has areas, prints `No area. Areas that fit: ...` with the `set` command (JSON `area_hint`). `qtask area suggest ID` or `qtask area suggest "title"` prints the same list later. Each title word in an area's name or note adds 1 and each body word a quarter; each task in the area whose title holds a third of the words or more adds that share. It is a hint: check it before you set it.
+
+## Filters
+
+`ls`, `ready`, `facets` and `next` share their filters.
+
+- `--side`, `--kind`, `--pri`, `--audience`, `--requested-by` and `--area` take one value or a comma list: `--side be,fe`, `--pri P0,P1`, `--area books,catalog`.
+- `none` matches tasks with the field empty: `--side none`, `--area none`, `--audience students,none`. Kind and priority always have a value, so they do not take it. An area cannot be named `none`.
+- `--status` (on `ls` and `facets`) repeats or takes a comma list: `--status ready,backlog`. `--include-closed` (alias `--closed`) adds done and dropped. `ready` picks its own statuses and takes neither.
+- `--tag` repeats, and a task needs every tag given.
+- To tag the untagged: `qtask facets` counts `none` per field, `qtask ls --area none --fields id,title,side` lists them, `qtask area suggest ID` names an area, and `qtask set ID --area NAME --side be` sets it.
 - A bug needs `Steps:`, `Expected:` and `Actual:` lines in its body: `add --kind bug` without them exits 2 with `bug_template`. `qtask template KIND` prints the template for bug, feature, chore, content and research.
 
 ## Checklists and subtasks
@@ -119,11 +131,11 @@ Commands that take text (`comment`, `ask`, `answer`, `todo add`) read it from th
 
 | Command | Does |
 |---------|------|
-| `add TITLE [--kind --pri --side --tag --body --body-file --plan --parent --status --owner --branch --pr --requested-by --requester --requested-on --audience --area --waiting-on --waiting-note --next]` | Create a task. Defaults: `ready`, `task`, `P2`. Prints similar open tasks |
-| `ls [--status --kind --pri --side --tag --owner --claimed-by --parent --search --include-closed --deployed --requested-by --audience --area --sort --limit --page --offset --all-pages --fields]` | List tasks, without done and dropped unless asked. `--deployed STATE` lists closed tasks too. Default sort: priority |
-| `ready [the filters of ls] [--planned \| --backlog] [--sort]` | Claimable tasks with a lane column: planned (status ready), then backlog, by impact. Ends with counts by lane, side and priority |
-| `next [--for AGENT --side LIST --kind LIST --pri LIST --area A --limit N --expand]` | Comments to you, your idle or expired claims, then the top ready task with `why first:`, with commands. Skips parents with open subtasks. `QTASK_SIDES` is the default `--side`. `--expand` prints whole comments and the top task's brief |
-| `facets [--ready] [the filters of ls]` | Counts by lane, status, priority, kind, side, audience, requester and area |
+| `add TITLE [--kind --pri --side --tag --body --body-file --plan --parent --status --owner --branch --pr --requested-by --requester --requested-on --audience --area --waiting-on --waiting-note --next --duplicate-reason TEXT --no-similar]` | Create a task. Defaults: `ready`, `task`, `P2`. Prints similar open tasks, and the areas that fit when you pass no `--area`. Exit 4 with `duplicate_likely` when an open task scores 90 or more and the title has three words or more |
+| `ls [--status --kind --pri --side --tag --owner --claimed-by --parent --search --include-closed --deployed --requested-by --audience --area --sort --limit --page --offset --all-pages --fields]` | List tasks, without done and dropped unless asked. `--deployed STATE` lists closed tasks too. Default sort: priority. See Filters |
+| `ready [the filters of ls, without --status and --include-closed] [--planned \| --backlog] [--sort]` | Claimable tasks with a lane column: planned (status ready), then backlog, by impact. Ends with counts by lane, side and priority |
+| `next [--for AGENT --side LIST --kind LIST --pri LIST --area LIST --limit N --expand]` | Comments to you, your idle or expired claims, then the top ready task with `why first:`, with commands. Skips parents with open subtasks. `QTASK_SIDES` is the default `--side`, for `next` only. `--limit` takes 1 to 10. `--expand` prints whole comments and the top task's brief |
+| `facets [--ready] [the filters of ls]` | Counts by lane, status, priority, kind, side, audience, requester, area (direct, not rolled up) and lock; `none` counts empty fields |
 | `brief ID` | About 2 KB: status, claim, next step, summary, plan, branch, worktree, open checklist items, open questions, blockers, context files, body |
 | `show ID [--events --full]` | Task, checklist, children, links, commits, the last 10 comments, the event count, hub link |
 | `search TEXT [--expand]`, `similar TITLE [--body-file F --area A]` | Tasks and comment snippets, paged; open tasks that look like the same work, scored 0 to 100 on title and body |
@@ -136,7 +148,7 @@ Commands that take text (`comment`, `ask`, `answer`, `todo add`) read it from th
 | `prompt ID --agent NAME [--setup CMD --base BRANCH]` | A session prompt for another agent |
 | `context ID`, `context ID add PATH [--note TEXT]`, `context ID rm N...` | Files to read for the task |
 | `export ID --pack [DIR]` | Write `pack.md`: brief, context links, plan, prompt |
-| `area [ls] [--tree]`, `area add NAME [--parent P --note TEXT]` | Areas as a tree with rolled-up counts; add or move one |
+| `area [ls] [--tree]`, `area add NAME [--parent P --note TEXT]`, `area suggest TITLE\|ID` | Areas as a tree with rolled-up counts; add or move one; the areas that fit a title or a task |
 | `split ID --part SIDE...`, `take ID --part SIDE\|N [--ttl-hours]` | One subtask per side, and claim one of them |
 | `template KIND` | Body template for bug, feature, chore, content, research |
 | `resolve COMMENT_ID` | Mark a comment resolved |
@@ -157,11 +169,26 @@ Commands that take text (`comment`, `ask`, `answer`, `todo add`) read it from th
 | `plan-path TOPIC [--task ID]` | Create the dated plan file and print its path. With `--task`, link it to the task |
 | `plans [--day YYYY-MM-DD --search TEXT]` | Plan files, newest first: date, task and status if linked, title, path |
 | `backup` | Write a database copy and a JSONL export, keeping 7 of each. Also runs on the first write of each day |
-| `publish ID --scope TEXT \| --scope-file FILE [--fields LIST --kind --status --dry-run --hub-url URL]` | Send the task to the team hub after the developer confirms in a terminal. Fields: title and scope (default), checklist, priority, side, tags. Status: backlog (default), to_do, proposed |
+| `publish ID --scope TEXT \| --scope-file FILE [--fields LIST --kind --status --dry-run --hub-url URL]` | Send the task to the team hub after the developer confirms in a terminal. Fields: title and scope (default), checklist, priority, side, tags. Kind: the task's own when the hub has it (task, bug, feature, chore, content, research), else task. Status: backlog (default), to_do, proposed |
 | `hub-pull ID [--dry-run]` | Show the hub task's status, deploy state, git links and new events and comments. In a terminal, ask to save them as one comment |
 | `hub`, `hub set-url URL` | List the project's published tasks and hub URL, or store the URL |
 
-Statuses: backlog, ready, in_progress, blocked, needs_review, needs_confirm, done, dropped. `ready` lists two lanes: planned (status ready) and backlog. Priorities: P0 to P3. Sides: fe, be, mobile, infra, docs, content, qa, other. Kinds: task, bug, feature, chore, content, research, decision, question, improvement, review.
+Statuses: backlog, ready, in_progress, blocked, needs_review, needs_confirm, done, dropped. `ready` lists two lanes: planned (status ready) and backlog. Priorities: P0 to P3. Sides: fe, be, mobile, infra, docs, content, qa, design, other. Kinds: task, bug, feature, chore, content, research, decision, question, improvement, review.
+
+## qtask and the team hub
+
+The two CLIs share exit codes and most verbs (`next`, `ready`, `ls`, `facets`, `similar`, `claim`, `release`, `split`, `take`, `ask`, `answer`, `inbox`). Where they differ:
+
+| Concept | qtask | qhub |
+|---------|-------|------|
+| Statuses | `ready`, `needs_review` | `to_do`, `in_review` (`publish` maps them) |
+| Priority | `P0` to `P3` | urgent, high, medium, low |
+| Done and dropped in a list | `--include-closed` or `--closed` | `--all` |
+| Every project | global `--all` | none |
+| Who asked | `manager`, `stakeholder` | `managers`, `stakeholders` |
+| Lease | 2 h, renewed by your activity on the task | 48 h idle |
+| Sides | the hub's eight plus `docs` | fe, be, mobile, content, infra, qa, design, other (`docs` publishes as other) |
+| Areas | the project's own tree | the hub's tree; `publish` sends no area |
 
 ## Shell notes
 

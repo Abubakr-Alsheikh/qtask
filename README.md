@@ -3,7 +3,8 @@
 A local task tracker for AI coding agents and the people they work with. One Python file, standard library only, one SQLite database on your machine.
 
 ```text
-$ qtask add "Fix the login redirect" --kind bug --pri P1
+$ qtask template bug > bug.md      # fill in Steps:, Expected: and Actual:
+$ qtask add "Fix the login redirect" --kind bug --pri P1 --side fe --body-file bug.md
 Created APP-14: Fix the login redirect
 $ qtask claim APP-14 --agent fe-fix-1
 Claimed APP-14 as fe-fix-1 until 2026-11-02T17:56:49Z. Status: in_progress.
@@ -21,7 +22,7 @@ $ qtask done APP-14 --evidence "npm test: 412 passed" --agent fe-fix-1
 Done APP-14.
 ```
 
-Status: **0.4, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
+Status: **0.6, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
 
 ## Why another tracker
 
@@ -74,7 +75,8 @@ Codex, Cursor, Aider, Gemini CLI and others read a project instructions file (`A
 Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 
 - Pass `--agent NAME` on each command, or set `QTASK_AGENT`.
-- Before you start: `qtask ready`, `qtask search TEXT`, then `qtask claim ID`. Exit 3 means another agent holds it.
+- Before you start: `qtask next` (or `qtask ready` for more choice), `qtask brief ID`, then `qtask claim ID`. Exit 3 means another agent holds it.
+- Before you add a task: `qtask similar "title"`. Give it `--side`, `--area` and `--audience`.
 - Record findings with `qtask comment ID "text"`.
 - Ask the human with `qtask ask ID "question" --to developer`, then check `qtask inbox`.
 - After each commit, run `qtask commit ID`. Before each commit, run `qtask scan --staged --message "the message"`.
@@ -104,7 +106,7 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | `claim`, `release` | Take or give back a task. Activity renews a claim; an expired one goes back to its lane |
 | `review`, `approve`, `reject`, `decisions` | The review queue, and what waits on whom |
 | `prompt`, `context`, `export` | Hand a task to another agent session |
-| `area` | Areas of a project as a tree, with counts |
+| `area` | Areas of a project as a tree, with counts; `area suggest` names the areas that fit a task |
 | `split`, `take` | One subtask per side, and claim one part |
 | `similar`, `template` | Look for duplicates, scored 0 to 100 (`add` refuses one at 90 or more); body templates per kind |
 | `comment`, `ask`, `answer`, `resolve`, `inbox` | Notes and questions between agents and people |
@@ -126,7 +128,7 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 Output stays small, so an agent can read it without filling its context.
 
 - `ls`, `ready`, `search`, `review`, `inbox`, `tree`, `plans` and `decisions` print 20 rows a page. A cut list starts with `showing 21-40 of 133 (page 2 of 7)` and ends with `more: qtask ls --status ready --page 3`, the command for the next page. Flags: `--limit N` (1 to 100), `--page N`, `--offset N`, `--all-pages`. `QTASK_LIMIT=0` prints every row, as qtask 0.4 did.
-- `--json` list rows carry 17 short fields (`id, title, status, lane, priority, kind, side, area, audience, requested_by, claimed_by, claim_valid, blocked_by, progress, todo_progress, parent_id, deployed`) and leave out empty ones. A `page` object gives `page`, `pages`, `limit`, `offset`, `total` and `next`. `--fields id,title` picks fields in text and JSON, `--full-json` (or `--raw-json`) prints every field, `--compact` prints one line.
+- `--json` list rows carry 18 short fields (`id, title, status, lane, priority, kind, side, area, audience, requested_by, claimed_by, claim_valid, blocked_by, progress, todo_progress, parent_id, deployed, lock`) and leave out empty ones. A `page` object gives `page`, `pages`, `limit`, `offset`, `total` and `next`. `--fields id,title` picks fields in text and JSON, `--full-json` (or `--raw-json`) prints every field, `--compact` prints one line.
 - Every JSON answer carries `"schema": 1`. Adding a key keeps the number; removing or renaming one raises it, and the changelog says so.
 - `show` prints the last 10 comments and an event count: `--events` adds the event log, `--full` prints everything. `report` prints 5 rows a section with `+N more: qtask report --section NAME`; `--full` prints all.
 - `search` cuts each comment hit to about 160 characters around the match; `--expand` prints it whole.
@@ -163,15 +165,20 @@ Checks run: npm test -- auth, 14 passed
 Left: nothing
 ```
 
-### Who asked, and for whom
+### Side, area, and who asked
 
 ```text
-$ qtask add "Show weekly progress on the dashboard" --requested-by manager --requester Sam --audience students --area dashboard
-$ qtask ready --requested-by manager
+$ qtask area add app --note "the web app"
+$ qtask area add dashboard --parent app --note "home screen, progress, streaks"
+$ qtask add "Show weekly progress on the dashboard" --side fe --area dashboard --requested-by manager --requester Sam --audience students
+$ qtask ready --requested-by manager --side fe,be
 $ qtask report --by requester
 ```
 
-`--audience` takes students, teachers, parents, managers, admins or team. Areas form a tree (`qtask area add dashboard --parent app`), and `--area app` includes the areas below it.
+- **Side:** fe, be, mobile, infra, docs, content, qa, design or other. For work on two sides, add one task, then `qtask split APP-15 --part be --part fe` makes a subtask per side, and each agent runs `qtask take APP-15 --part be`.
+- **Area:** a tree per project. `--area app` includes the areas below it. `add` without `--area` prints the areas that fit, from the area names, notes and the tasks already in them; `qtask area suggest APP-15` does the same later.
+- **Audience:** students, teachers, parents, managers, admins or team. **Who asked:** manager, stakeholder, developer, scan or agent. Both feed the impact sort of `ready` and `next`.
+- **Filters** take comma lists, and `none` matches an empty field: `qtask ls --area none` lists the tasks with no area, and `qtask facets` counts them per field.
 
 ### Checklists
 
@@ -251,7 +258,7 @@ Publish to https://hub.example.com/api? [y/N] y
 Published APP-14 as HUB-31: https://hub.example.com/board?task=31
 ```
 
-- **What it sends:** the title and the scope text you pass with `--scope` or `--scope-file`. `--fields` adds `checklist` (open items become acceptance criteria), `priority` (P0 urgent, P1 high, P2 medium, P3 low), `side` (docs maps to other) and `tags`. The task body, comments, evidence and plan never leave, and no field sends them. `--kind` sets the hub kind; a qtask bug is a `bug`, anything else a `task`. `--status` is `backlog` (default), `to_do` or `proposed`.
+- **What it sends:** the title and the scope text you pass with `--scope` or `--scope-file`. `--fields` adds `checklist` (open items become acceptance criteria), `priority` (P0 urgent, P1 high, P2 medium, P3 low), `side` (docs maps to other) and `tags`. The task body, comments, evidence and plan never leave, and no field sends them. `--kind` sets the hub kind; without it, a task whose kind the hub has (task, bug, feature, chore, content, research) keeps it, and any other kind goes as `task`. `--status` is `backlog` (default), `to_do` or `proposed`.
 - **What it refuses:** before it shows anything, it checks every line for task IDs of any prefix in your database, qtask paths, private keys, API tokens, `KEY=value` secret lines, IPv4 addresses (except 127.0.0.1 and 0.0.0.0) and email addresses. A hit exits 4 with the code `publish_blocked` and the field and line.
 - **When it sends:** only after you answer `y` in a terminal. Without a terminal, such as from an agent, it exits 4 with `confirm_required`. No flag or variable skips the question. `--dry-run` checks and shows the JSON, then stops.
 - **The fingerprint:** each task gets a random reference, sent as `ext:<uuid>`. The hub never sees the task ID. If the hub already has an open task with that fingerprint, qtask links to it.

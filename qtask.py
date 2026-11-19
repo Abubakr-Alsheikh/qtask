@@ -57,7 +57,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -79,7 +79,10 @@ PARKED = ("needs_confirm", "blocked")
 LANES = {"ready": "planned", "backlog": "backlog"}
 PRIORITIES = ("P0", "P1", "P2", "P3")
 SIDES_V1 = ("fe", "be", "infra", "docs", "other")
-SIDES = SIDES_V1 + ("mobile", "content", "qa")
+SIDES_V8 = SIDES_V1 + ("mobile", "content", "qa")
+SIDES = SIDES_V8 + ("design",)
+# A filter value that matches tasks with the field unset, as on the team hub.
+UNSET = "none"
 VISIBILITIES = ("local", "public")
 COMMENT_KINDS_V1 = ("note", "question", "answer", "decision", "review")
 COMMENT_KINDS = COMMENT_KINDS_V1 + ("handback",)
@@ -656,7 +659,7 @@ def migrate_8(conn):
         conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
     widen_checks(conn, [
         ("tasks", KINDS_V1, KINDS),
-        ("tasks", SIDES_V1, SIDES),
+        ("tasks", SIDES_V1, SIDES_V8),
         ("comments", COMMENT_KINDS_V1, COMMENT_KINDS),
     ])
     at = now()
@@ -714,9 +717,14 @@ def migrate_9(conn):
     )
 
 
+def migrate_10(conn):
+    """The design side, which the team hub has too."""
+    widen_checks(conn, [("tasks", SIDES_V8, SIDES)])
+
+
 MIGRATIONS = {
     1: migrate_1, 2: migrate_2, 3: migrate_3, 4: migrate_4, 5: migrate_5, 6: migrate_6, 7: migrate_7,
-    8: migrate_8, 9: migrate_9,
+    8: migrate_8, 9: migrate_9, 10: migrate_10,
 }
 
 
@@ -1193,18 +1201,66 @@ def add_scope(where, params, project, column="t.project"):
         params.append(project)
 
 
+def value_filter(where, params, column, raw, allowed, flag, upper=False, unset=True):
+    """
+    One filter flag as a comma list, such as --side be,fe. With unset, the value none matches
+    tasks where the field is empty, such as --side none or --audience students,none.
+    """
+    picked, empty = [], False
+    for value in (raw or "").split(","):
+        value = value.strip()
+        if not value:
+            continue
+        if unset and value.lower() == UNSET:
+            empty = True
+            continue
+        name = value.upper() if upper else value.lower()
+        if name not in allowed:
+            extra = f", or {UNSET} for unset" if unset else ""
+            raise usage_error(f"{flag} takes a comma list of {', '.join(allowed)}{extra}. Got {value!r}.")
+        if name not in picked:
+            picked.append(name)
+    parts = []
+    if picked:
+        parts.append(f"{column} IN ({','.join('?' * len(picked))})")
+        params.extend(picked)
+    if empty:
+        parts.append(f"{column} IS NULL")
+    if parts:
+        where.append(f"({' OR '.join(parts)})")
+
+
+def area_filter(conn, where, params, raw, project):
+    """--area as a comma list. Each area includes the areas below it; none matches tasks with no area."""
+    names, empty = set(), False
+    for value in (raw or "").split(","):
+        if not value.strip():
+            continue
+        if value.strip().lower() == UNSET:
+            empty = True
+        else:
+            names.update(area_subtree(conn, project, clean_area(value)))
+    parts = []
+    if names:
+        parts.append(f"t.area IN ({','.join('?' * len(names))})")
+        params.extend(sorted(names))
+    if empty:
+        parts.append("t.area IS NULL")
+    if parts:
+        where.append(f"({' OR '.join(parts)})")
+
+
+def status_values(raw_list):
+    """--status is repeatable and takes comma lists: --status ready,backlog."""
+    return [choice(x, STATUSES, "--status") for raw in raw_list or [] for x in raw.split(",") if x.strip()]
+
+
 def build_filters(ctx, where, params):
     a = ctx.args
     add_scope(where, params, ctx.scope())
-    if a.kind:
-        where.append("t.kind = ?")
-        params.append(choice(a.kind, KINDS, "--kind"))
-    if a.pri:
-        where.append("t.priority = ?")
-        params.append(choice(a.pri, PRIORITIES, "--pri", upper=True))
-    if a.side:
-        where.append("t.side = ?")
-        params.append(choice(a.side, SIDES, "--side"))
+    value_filter(where, params, "t.kind", a.kind, KINDS, "--kind", unset=False)
+    value_filter(where, params, "t.priority", a.pri, PRIORITIES, "--pri", upper=True, unset=False)
+    value_filter(where, params, "t.side", a.side, SIDES, "--side")
     for tag in clean_tags(a.tag):
         where.append("EXISTS (SELECT 1 FROM json_each(t.tags) WHERE value = ?)")
         params.append(tag)
@@ -1217,16 +1273,9 @@ def build_filters(ctx, where, params):
     if a.parent:
         where.append("t.parent_id = ?")
         params.append(normalize_id(a.parent))
-    if getattr(a, "requested_by", None):
-        where.append("t.requested_by = ?")
-        params.append(choice(a.requested_by, REQUESTERS, "--requested-by"))
-    if getattr(a, "audience", None):
-        where.append("t.audience = ?")
-        params.append(choice(a.audience, AUDIENCES, "--audience"))
-    if getattr(a, "area", None):
-        names = area_subtree(ctx.conn, ctx.scope(), clean_area(a.area))
-        where.append(f"t.area IN ({','.join('?' * len(names))})")
-        params.extend(names)
+    value_filter(where, params, "t.requested_by", getattr(a, "requested_by", None), REQUESTERS, "--requested-by")
+    value_filter(where, params, "t.audience", getattr(a, "audience", None), AUDIENCES, "--audience")
+    area_filter(ctx.conn, where, params, getattr(a, "area", None), ctx.scope())
     if a.search:
         task_ids, comment_ids = search_hits(ctx.conn, a.search)
         tasks = hit_table(ctx.conn, "hit_tasks", task_ids)
@@ -1760,6 +1809,52 @@ def similar_score(words, body_words, area, row):
     return min(100, round(score))
 
 
+AREA_HINT_TASK = 0.34
+AREA_HINT_MIN = 0.5
+AREA_HINTS = 3
+
+
+AREA_BODY_WEIGHT = 0.25
+
+
+def suggest_areas(conn, project, title, body=None, skip=None):
+    """
+    Areas whose name, note or tasks share words with the title, best first. Each title word in
+    the area's name or note adds 1, each body word there adds a quarter. A task in the area adds
+    the share of the title's words its own title holds, when that is a third or more.
+    """
+    words = title_words(title)
+    body_words = title_words(body) - words
+    if not words:
+        return []
+    scores, likes = {}, {}
+    for row in conn.execute("SELECT name, note FROM areas WHERE project = ?", (project,)):
+        label = title_words(f"{row['name'].replace('-', ' ')} {row['note'] or ''}")
+        score = len(words & label) + AREA_BODY_WEIGHT * len(body_words & label)
+        if score:
+            scores[row["name"]] = score
+    for row in conn.execute(
+        "SELECT id, title, area FROM tasks WHERE project = ? AND area IS NOT NULL AND status != 'dropped'", (project,)
+    ):
+        if row["id"] == skip:
+            continue
+        share = len(words & title_words(row["title"])) / len(words)
+        if share >= AREA_HINT_TASK:
+            scores[row["area"]] = scores.get(row["area"], 0.0) + share
+            likes[row["area"]] = likes.get(row["area"], 0) + 1
+    found = [
+        {"area": name, "score": round(score, 2), "like_tasks": likes.get(name, 0)}
+        for name, score in scores.items() if score >= AREA_HINT_MIN
+    ]
+    found.sort(key=lambda f: (-f["score"], f["area"]))
+    return found[:AREA_HINTS]
+
+
+def area_hint_text(hints, task_id):
+    names = ", ".join(h["area"] + (f" ({h['like_tasks']} like tasks)" if h["like_tasks"] else "") for h in hints)
+    return f"Areas that fit: {names}. Set one: qtask set {task_id} --area {hints[0]['area']}"
+
+
 def similar_tasks(conn, project, title, skip=None, limit=5, body=None, area=None):
     """Open tasks of the project that look like the same work, best first, scored 0 to 100."""
     words = title_words(title)
@@ -1847,7 +1942,12 @@ def cmd_add(ctx):
     if similar:
         head = "Likely the same work, check you did not add it twice:" if warn else "Similar open tasks:"
         text += f"\n{head}\n" + "\n".join(f"  {s['score']} {s['id']} {s['status']}: {s['title']}" for s in similar)
-    return {"task": task, "similar": similar}, text
+    data = {"task": task, "similar": similar}
+    if not area and ctx.conn.execute("SELECT 1 FROM areas WHERE project = ?", (task["project"],)).fetchone():
+        hints = suggest_areas(ctx.conn, task["project"], title, a.body, skip=task_id)
+        data["area_hint"] = hints
+        text += "\nNo area. " + (area_hint_text(hints, task_id) if hints else "See the areas with qtask area --tree.")
+    return data, text
 
 
 def cmd_similar(ctx):
@@ -1869,6 +1969,7 @@ def cmd_template(ctx):
 FACETS = (
     ("lane", None), ("status", STATUSES), ("priority", PRIORITIES), ("kind", KINDS), ("side", SIDES),
     ("audience", AUDIENCES), ("requested_by", REQUESTERS), ("area", None),
+    ("lock", ("free", "claimed", "blocked", "needs_decision", "in_review", "has_subtasks", "closed")),
 )
 
 
@@ -1884,7 +1985,7 @@ def cmd_facets(ctx):
         where, params = [], []
         build_filters(ctx, where, params)
         if a.status:
-            statuses = [choice(x, STATUSES, "--status") for x in a.status]
+            statuses = status_values(a.status)
             where.append(f"t.status IN ({','.join('?' * len(statuses))})")
             params.extend(statuses)
         elif not a.include_closed:
@@ -1915,7 +2016,7 @@ def cmd_ls(ctx):
         where.append("t.deployed = ?")
         params.append(choice(a.deployed, DEPLOY_STATES, "--deployed"))
     if a.status:
-        statuses = [choice(s, STATUSES, "--status") for s in a.status]
+        statuses = status_values(a.status)
         where.append(f"t.status IN ({','.join('?' * len(statuses))})")
         params.extend(statuses)
     elif not a.include_closed and not a.deployed:
@@ -3738,12 +3839,16 @@ def flat_areas(nodes, depth=0):
 
 def cmd_area(ctx):
     a = ctx.args
+    if a.action == "suggest":
+        return area_suggest(ctx)
     if a.action == "add":
         if not a.name:
             raise usage_error("area add needs a name, such as: qtask area add admin-content --parent admin")
         if a.all:
             raise usage_error("area add needs one project. Pass --project, not --all.")
         name = clean_area(a.name)
+        if name == UNSET:
+            raise usage_error(f"{UNSET} is the filter value for tasks with no area. Pick another name.", "bad_area")
         parent = clean_area(a.parent) if a.parent and a.parent.strip() else None
         project = ctx.project()
         with write_tx(ctx) as conn:
@@ -3796,6 +3901,33 @@ def cmd_area(ctx):
         lines.append(f"{indent}(no area)  open {none['open']}/{none['total']}")
     if project is not None:
         data = {"project": project, "areas": data["projects"][0]["areas"], "no_area": data["projects"][0]["no_area"]}
+    return data, "\n".join(lines)
+
+
+def area_suggest(ctx):
+    """area suggest TITLE or ID: the areas that fit, from the area names, notes and the tasks in them."""
+    a = ctx.args
+    if not a.name or not a.name.strip():
+        raise usage_error('area suggest needs a title or a task ID, such as: qtask area suggest "Fix the login page"')
+    if a.all:
+        raise usage_error("area suggest needs one project. Pass --project, not --all.")
+    text, body, skip = a.name.strip(), None, None
+    row = None
+    if re.fullmatch(r"[A-Za-z]{1,6}-\d+", text):
+        row = ctx.conn.execute("SELECT * FROM tasks WHERE id = ?", (normalize_id(text),)).fetchone()
+    if row is not None:
+        project, text, body, skip = row["project"], row["title"], row["body"], row["id"]
+    else:
+        project = ctx.project()
+    hints = suggest_areas(ctx.conn, project, text, body, skip=skip)
+    data = {"project": project, "title": text, "task": skip, "areas": hints}
+    if not hints:
+        return data, "No area fits. See the areas with qtask area --tree, or add one with qtask area add NAME."
+    lines = [
+        f"{h['score']:>5}  {h['area']}" + (f"  ({h['like_tasks']} like tasks)" if h["like_tasks"] else "")
+        for h in hints
+    ]
+    lines.append(f"Set it: qtask set {skip or 'ID'} --area {hints[0]['area']}")
     return data, "\n".join(lines)
 
 
@@ -4165,20 +4297,13 @@ def next_where(ctx, project):
     params = [now()]
     add_scope(where, params, project)
     sides = a.side if a.side is not None else os.environ.get("QTASK_SIDES", "")
-    for flag, column, raw, allowed, upper in (
-        ("--side", "t.side", sides, SIDES, False), ("--kind", "t.kind", a.kind, KINDS, False),
-        ("--pri", "t.priority", a.pri, PRIORITIES, True),
-    ):
-        values = [choice(v.strip(), allowed, flag, upper=upper) for v in (raw or "").split(",") if v.strip()]
-        if values:
-            where.append(f"{column} IN ({','.join('?' * len(values))})")
-            params.extend(values)
+    value_filter(where, params, "t.side", sides, SIDES, "--side")
+    value_filter(where, params, "t.kind", a.kind, KINDS, "--kind", unset=False)
+    value_filter(where, params, "t.priority", a.pri, PRIORITIES, "--pri", upper=True, unset=False)
     if a.area:
-        if project is None:
+        if project is None and any(v.strip().lower() != UNSET for v in a.area.split(",") if v.strip()):
             raise usage_error("--area needs one project. Pass --project, not --all.")
-        names = area_subtree(ctx.conn, project, clean_area(a.area))
-        where.append(f"t.area IN ({','.join('?' * len(names))})")
-        params.extend(names)
+        area_filter(ctx.conn, where, params, a.area, project)
     return where, params
 
 
@@ -4456,7 +4581,8 @@ HUB_STATUSES = ("backlog", "to_do", "proposed")
 HUB_FIELDS = ("title", "scope", "checklist", "priority", "side", "tags")
 HUB_DEFAULT_FIELDS = ("title", "scope")
 HUB_PRIORITY = {"P0": "urgent", "P1": "high", "P2": "medium", "P3": "low"}
-HUB_SIDE = {"fe": "fe", "be": "be", "infra": "infra", "docs": "other", "other": "other"}
+# The hub has every qtask side but docs.
+HUB_SIDE = {side: side for side in SIDES} | {"docs": "other"}
 HUB_MAX_CRITERIA = 30
 HUB_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 HUB_SAFE_IPS = ("127.0.0.1", "0.0.0.0")
@@ -4693,7 +4819,7 @@ def publish_payload(ctx, row, fields, scope, ref):
     if a.kind:
         payload["kind"] = choice(a.kind, HUB_KINDS, "--kind")
     else:
-        payload["kind"] = "bug" if row["kind"] == "bug" else "task"
+        payload["kind"] = row["kind"] if row["kind"] in HUB_KINDS else "task"
     payload["status"] = a.status
     if "checklist" in fields:
         criteria = [t["body"] for t in fetch_todos(ctx.conn, row["id"]) if not t["done"]]
@@ -5040,19 +5166,34 @@ def add_paging(parser, fields=True):
         )
 
 
-def add_filters(parser, default_sort):
-    parser.add_argument("--kind")
-    parser.add_argument("--pri", "--priority", dest="pri")
-    parser.add_argument("--side")
-    parser.add_argument("--tag", action="append")
-    parser.add_argument("--owner")
-    parser.add_argument("--claimed-by")
-    parser.add_argument("--parent")
-    parser.add_argument("--search")
+def add_filter_flags(parser, statuses=True):
+    """The task filters that ls, ready and facets share. ready picks its own statuses."""
+    parser.add_argument("--kind", help=f"comma list of {', '.join(KINDS)}")
+    parser.add_argument("--pri", "--priority", dest="pri", help="comma list of P0 to P3, such as P0,P1")
+    parser.add_argument("--side", help=f"comma list of {', '.join(SIDES)}; none = no side")
+    parser.add_argument("--tag", action="append", help="repeatable; a task needs every tag given")
+    parser.add_argument("--owner", metavar="NAME", help="tasks with this owner")
+    parser.add_argument("--claimed-by", metavar="AGENT", help="tasks this agent holds, such as your own")
+    parser.add_argument("--parent", metavar="ID", help="subtasks of this task")
+    parser.add_argument("--search", metavar="TEXT", help="tasks whose title, body or comments hold TEXT")
+    parser.add_argument("--requested-by", help=f"comma list of {', '.join(REQUESTERS)}; none = not recorded")
+    parser.add_argument("--audience", help=f"comma list of {', '.join(AUDIENCES)}; none = not set")
+    parser.add_argument(
+        "--area", help="comma list of areas, each with the areas below it; none = no area, such as --area none"
+    )
+    if not statuses:
+        return
+    parser.add_argument(
+        "--status", action="append", help=f"repeatable or a comma list of {', '.join(STATUSES)}",
+    )
+    parser.add_argument(
+        "--include-closed", "--closed", dest="include_closed", action="store_true", help="list done and dropped too",
+    )
+
+
+def add_filters(parser, default_sort, statuses=True):
+    add_filter_flags(parser, statuses)
     add_paging(parser)
-    parser.add_argument("--requested-by", help=", ".join(REQUESTERS))
-    parser.add_argument("--audience", help=", ".join(AUDIENCES))
-    parser.add_argument("--area", help="an area; includes the areas below it")
     parser.add_argument("--sort", help=f"{', '.join(SORTS)}; default {default_sort}")
 
 
@@ -5095,20 +5236,24 @@ def build_parser():
         sub.set_defaults(func=func)
         return sub
 
-    p = command("add", cmd_add, "Create a task.")
-    p.add_argument("title")
-    p.add_argument("--kind", default="task", help=", ".join(KINDS))
-    p.add_argument("--pri", "--priority", dest="pri", default="P2", help=", ".join(PRIORITIES))
-    p.add_argument("--side", help=", ".join(SIDES))
+    p = command(
+        "add", cmd_add,
+        "Create a task. Run qtask similar TITLE first. Prints similar open tasks, and the areas that fit when "
+        "you pass no --area.",
+    )
+    p.add_argument("title", help="a short title in quotes, such as \"Fix the login redirect\"")
+    p.add_argument("--kind", default="task", help=f"{', '.join(KINDS)}; default task. A bug needs qtask template bug")
+    p.add_argument("--pri", "--priority", dest="pri", default="P2", help=f"{', '.join(PRIORITIES)}; default P2")
+    p.add_argument("--side", help=f"{', '.join(SIDES)}; for work on two sides, add it, then qtask split ID")
     p.add_argument("--tag", action="append", help="repeatable")
-    p.add_argument("--body")
+    p.add_argument("--body", metavar="TEXT", help="the task body; use --body-file for quotes or line breaks")
     p.add_argument("--body-file", help="read the body from a UTF-8 file, or stdin with -")
     p.add_argument("--plan", help="plan file path, stored as written")
-    p.add_argument("--parent")
-    p.add_argument("--status", default="ready", help="any open status, default ready")
-    p.add_argument("--owner")
-    p.add_argument("--branch")
-    p.add_argument("--pr")
+    p.add_argument("--parent", metavar="ID", help="make it a subtask of ID (two levels at most)")
+    p.add_argument("--status", default="ready", help="any open status, default ready; backlog for later work")
+    p.add_argument("--owner", metavar="NAME", help="who answers for the task, such as developer")
+    p.add_argument("--branch", help="git branch of the work")
+    p.add_argument("--pr", metavar="URL", help="pull request link")
     p.add_argument(
         "--duplicate-reason", metavar="TEXT",
         help=f"add despite an open task scoring {DUPLICATE_SCORE} or more; say how this one differs",
@@ -5118,8 +5263,6 @@ def build_parser():
 
     p = command("ls", cmd_ls, "List tasks. Hides done and dropped unless asked.")
     add_filters(p, "priority")
-    p.add_argument("--status", action="append", help="repeatable")
-    p.add_argument("--include-closed", action="store_true")
     p.add_argument(
         "--deployed", help=f"{', '.join(DEPLOY_STATES)}; lists closed tasks too unless --status is given"
     )
@@ -5128,7 +5271,7 @@ def build_parser():
         "ready", cmd_ready,
         "List tasks an agent can claim now: the planned lane (status ready), then the backlog, by impact.",
     )
-    add_filters(p, "impact")
+    add_filters(p, "impact", statuses=False)
     lanes = p.add_mutually_exclusive_group()
     lanes.add_argument("--planned", action="store_true", help="only status ready")
     lanes.add_argument("--backlog", action="store_true", help="only status backlog")
@@ -5138,7 +5281,7 @@ def build_parser():
         f"Show a task with its checklist, children, links, commits and the last {SHOW_COMMENTS} comments. "
         "The event log stays out unless asked.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("--events", action="store_true", help="add the event log")
     p.add_argument("--full", action="store_true", help="every comment, the event log and full child rows")
 
@@ -5146,7 +5289,7 @@ def build_parser():
         "search", cmd_search,
         f"Search tasks and comments. A comment hit prints about {SNIPPET_CHARS} characters around the match.",
     )
-    p.add_argument("text")
+    p.add_argument("text", help="words to find in titles, bodies and comments")
     p.add_argument("--expand", action="store_true", help="print each matching comment whole")
     add_paging(p)
 
@@ -5155,40 +5298,45 @@ def build_parser():
         "Claim a task. Exit 3 when another agent holds it. Each later event of yours on the task renews the "
         "lease; an expired lease goes back to the lane it came from.",
     )
-    p.add_argument("id")
-    p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
+    p.add_argument("id", help="task ID, such as APP-12")
+    p.add_argument(
+        "--ttl-hours", type=float, default=DEFAULT_TTL_HOURS, help=f"lease length, default {DEFAULT_TTL_HOURS:g} h",
+    )
 
     p = command("release", cmd_release, "Clear the claim and return the task to the lane it was claimed from.")
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("--force", action="store_true", help="release another agent's valid claim")
 
-    p = command("set", cmd_set, "Change task fields. An empty value clears an optional field.")
-    p.add_argument("id")
-    p.add_argument("--title")
-    p.add_argument("--body")
+    p = command(
+        "set", cmd_set,
+        "Change task fields, such as qtask set ID --area books --side be. An empty value (\"\") clears an optional field.",
+    )
+    p.add_argument("id", help="task ID, such as APP-12")
+    p.add_argument("--title", help="a new title")
+    p.add_argument("--body", metavar="TEXT", help="replace the body; use --body-file for quotes or line breaks")
     p.add_argument("--body-file", help="read the body from a UTF-8 file, or stdin with -")
-    p.add_argument("--kind")
+    p.add_argument("--kind", help=", ".join(KINDS))
     p.add_argument("--status", help="any open status; use done or drop to close")
-    p.add_argument("--pri", "--priority", dest="pri")
-    p.add_argument("--side")
-    p.add_argument("--owner")
-    p.add_argument("--plan")
-    p.add_argument("--branch")
-    p.add_argument("--worktree")
-    p.add_argument("--pr")
-    p.add_argument("--gh-issue")
-    p.add_argument("--release-tag")
-    p.add_argument("--visibility", help=", ".join(VISIBILITIES))
-    p.add_argument("--evidence")
+    p.add_argument("--pri", "--priority", dest="pri", help=", ".join(PRIORITIES))
+    p.add_argument("--side", help=f"{', '.join(SIDES)}; \"\" clears it")
+    p.add_argument("--owner", metavar="NAME", help="who answers for the task")
+    p.add_argument("--plan", metavar="PATH", help="plan file path; qtask plan-path TOPIC --task ID makes one")
+    p.add_argument("--branch", help="git branch of the work")
+    p.add_argument("--worktree", metavar="PATH", help="worktree folder of the work; prompt prints cd PATH")
+    p.add_argument("--pr", metavar="URL", help="pull request link")
+    p.add_argument("--gh-issue", metavar="URL", help="GitHub issue link, when the developer copied the task there")
+    p.add_argument("--release-tag", metavar="TAG", help="the release that shipped it, such as v1.4.0")
+    p.add_argument("--visibility", help=f"{', '.join(VISIBILITIES)}; public once the task is copied to a tracker")
+    p.add_argument("--evidence", metavar="TEXT", help="what proves the work, as on done")
     p.add_argument("--deployed", help=f"where the work runs: {', '.join(DEPLOY_STATES)}")
     p.add_argument("--deploy-note", help="what to know about the deploy, such as a flag to keep off")
-    p.add_argument("--parent")
+    p.add_argument("--parent", metavar="ID", help="make it a subtask of ID; \"\" makes it a top task")
     p.add_argument("--add-tag", action="append", help="repeatable")
     p.add_argument("--remove-tag", action="append", help="repeatable")
     add_field_flags(p, on_set=True)
 
     p = command("comment", cmd_comment, "Add a comment to a task.")
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     add_text(p, "comment text")
     p.add_argument("--to", help="address the comment to an agent")
     p.add_argument(
@@ -5197,16 +5345,16 @@ def build_parser():
     )
     p.add_argument("--as", dest="as_name", metavar="NAME", help="write down what NAME said; NAME is the author")
 
-    p = command("resolve", cmd_resolve, "Mark a comment resolved.")
-    p.add_argument("comment_id")
+    p = command("resolve", cmd_resolve, "Mark a comment resolved, such as after you read an answer in inbox.")
+    p.add_argument("comment_id", help="the comment number, such as 31 from #31")
 
     p = command("ask", cmd_ask, "Ask a question. The task moves to needs_confirm.")
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     add_text(p, "question text")
     p.add_argument("--to", required=True, help="agent or developer who should answer")
 
     p = command("answer", cmd_answer, "Answer a question and resolve it.")
-    p.add_argument("comment_id")
+    p.add_argument("comment_id", help="the question's number, such as 31 from #31")
     add_text(p, "answer text")
     p.add_argument(
         "--as", dest="as_name", metavar="NAME",
@@ -5222,21 +5370,21 @@ def build_parser():
         ("unlink", cmd_unlink, "Remove a link between two tasks."),
     ):
         p = command(name, func, text)
-        p.add_argument("id")
+        p.add_argument("id", help="task ID")
         group = p.add_mutually_exclusive_group(required=True)
-        group.add_argument("--blocks", metavar="ID2")
-        group.add_argument("--relates", metavar="ID2")
+        group.add_argument("--blocks", metavar="ID2", help="ID must close before ID2 is ready")
+        group.add_argument("--relates", metavar="ID2", help="the tasks touch the same work")
 
     p = command("done", cmd_done, "Close a task with evidence.")
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("--evidence", help="commands you ran and their results; required")
     p.add_argument(
         "--force", action="store_true", help="close despite open questions, children or checklist items"
     )
 
     p = command("drop", cmd_drop, "Close a task without doing it.")
-    p.add_argument("id")
-    p.add_argument("--reason", help="required")
+    p.add_argument("id", help="task ID")
+    p.add_argument("--reason", help="why it will not happen; required")
 
     p = command(
         "report", cmd_report,
@@ -5250,16 +5398,16 @@ def build_parser():
     p.add_argument("--full", action="store_true", help="print every row of every section")
 
     p = command("plan-path", cmd_plan_path, "Create the dated plan file and print its path.")
-    p.add_argument("topic")
+    p.add_argument("topic", help="a short topic for the file name, such as login-redirect")
     p.add_argument("--task", metavar="ID", help="name the file after this task and link it")
 
     p = command("plans", cmd_plans, "List plan files, newest first.")
-    p.add_argument("--day", metavar="YYYY-MM-DD")
-    p.add_argument("--search", metavar="TEXT")
+    p.add_argument("--day", metavar="YYYY-MM-DD", help="plans of one day")
+    p.add_argument("--search", metavar="TEXT", help="plans whose name or title holds TEXT")
     add_paging(p, fields=False)
 
     p = command("tree", cmd_tree, "Show a parent and its subtasks, or all open parents in the project.")
-    p.add_argument("id", nargs="?")
+    p.add_argument("id", nargs="?", help="a parent task; leave out for every open parent")
     add_paging(p)
 
     command("backup", cmd_backup, "Write a database backup and a JSONL export.")
@@ -5283,7 +5431,7 @@ def build_parser():
         "Link commits to a task: HEAD when you pass no REV. Run it in the repo of the commits. "
         "--rebased moves the links after a rebase or amend.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("revs", nargs="*", metavar="REV", help="commits to link, default HEAD")
     p.add_argument("--range", metavar="A..B", help="link every commit in the range, oldest first")
     p.add_argument("--note", help="a short note for these links")
@@ -5294,7 +5442,7 @@ def build_parser():
     )
 
     p = command("which", cmd_which, "List the tasks a commit is linked to. Takes a full or short hash, or HEAD.")
-    p.add_argument("rev", metavar="REV")
+    p.add_argument("rev", metavar="REV", help="a full or short hash, or a name such as HEAD")
 
     p = command(
         "scan", cmd_scan,
@@ -5316,7 +5464,7 @@ def build_parser():
         "Checklist inside a task. 'todo ID' lists it; 'todo ID add TEXT', 'done N', 'undo N' and 'rm N' "
         "change it. Numbers stay the same after rm. done refuses while items are open.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("action", nargs="?", choices=TODO_ACTIONS, help="leave out to list the checklist")
     p.add_argument("values", nargs="*", metavar="TEXT_OR_N", help="item text for add, item numbers otherwise")
     p.add_argument("--body-file", help="for add: read the item text from a UTF-8 file, or stdin with -")
@@ -5327,7 +5475,7 @@ def build_parser():
         "comments, evidence or plan. It checks the text, shows the exact JSON and asks before it sends. "
         "Run it in a terminal; without one it exits 4 with confirm_required.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--scope", metavar="TEXT", help="the description the hub shows, written for the team")
     group.add_argument("--scope-file", metavar="FILE", help="read the scope from a UTF-8 file, or stdin with -")
@@ -5335,7 +5483,7 @@ def build_parser():
         "--fields", metavar="LIST",
         help=f"what to send, from {','.join(HUB_FIELDS)}; default {','.join(HUB_DEFAULT_FIELDS)}",
     )
-    p.add_argument("--kind", help=f"hub kind: {', '.join(HUB_KINDS)}; default bug for a bug, else task")
+    p.add_argument("--kind", help=f"hub kind: {', '.join(HUB_KINDS)}; default the task's kind when the hub has it, else task")
     p.add_argument("--status", choices=HUB_STATUSES, default="backlog", help="default backlog")
     p.add_argument("--dry-run", action="store_true", help="check and show the JSON, send nothing")
     p.add_argument("--hub-url", metavar="URL", help="hub base URL, else QTASK_HUB_URL, else hub set-url")
@@ -5345,7 +5493,7 @@ def build_parser():
         "Show what changed on the hub task of a published task, then ask to save it as one comment. "
         "Saves nothing with --dry-run or without a terminal.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="a published task's ID")
     p.add_argument("--dry-run", action="store_true", help="show only, save nothing")
 
     p = command(
@@ -5359,7 +5507,7 @@ def build_parser():
     add_paging(p)
 
     p = command("approve", cmd_approve, "Close a task in needs_review as done. The submitter gets a review comment.")
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("--evidence", help="what you checked and the results; required")
     p.add_argument("--force", action="store_true", help="close despite open questions, children or checklist items")
 
@@ -5367,7 +5515,7 @@ def build_parser():
         "reject", cmd_reject,
         "Send a task in needs_review back to in_progress. The submitter gets the reason in their inbox.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("--reason", help="what to fix; required")
 
     p = command(
@@ -5382,7 +5530,7 @@ def build_parser():
         "About 2 KB to start work: status, claim, next step, plan, branch, worktree, open checklist items, "
         "open questions, blockers, summary, context files, then the body.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
 
     p = command(
         "next", cmd_next,
@@ -5390,10 +5538,10 @@ def build_parser():
     )
     p.add_argument("--for", dest="for_agent", help="agent name, default the current agent")
     p.add_argument("--expand", action="store_true", help="whole inbox comments and the brief of the top task")
-    p.add_argument("--side", help="comma list of sides; default QTASK_SIDES")
-    p.add_argument("--kind", help="comma list of kinds")
-    p.add_argument("--pri", "--priority", dest="pri", help="comma list of priorities")
-    p.add_argument("--area", help="an area; includes the areas below it")
+    p.add_argument("--side", help=f"comma list of {', '.join(SIDES)}, or none; default QTASK_SIDES")
+    p.add_argument("--kind", help="comma list of kinds, such as bug,feature")
+    p.add_argument("--pri", "--priority", dest="pri", help="comma list of priorities, such as P0,P1")
+    p.add_argument("--area", help="comma list of areas, each with the areas below it; none = no area")
     p.add_argument("--limit", type=int, metavar="N", help="how many ready candidates to list, 1 to 10, default 1")
 
     p = command(
@@ -5401,7 +5549,7 @@ def build_parser():
         "Print a session prompt for another agent: brief, rules, plan, worktree and setup. "
         "--agent names the agent that will run it.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("--setup", metavar="CMD", help="setup command for the worktree, else the project's set-setup")
     p.add_argument("--base", default="main", help="base branch for the scan before a push, default main")
 
@@ -5410,9 +5558,9 @@ def build_parser():
         "Files to read for a task. 'context ID' lists them; 'context ID add PATH --note TEXT' and "
         "'context ID rm N' change them.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument("action", nargs="?", choices=("add", "rm"), help="leave out to list")
-    p.add_argument("values", nargs="*", metavar="PATH_OR_N")
+    p.add_argument("values", nargs="*", metavar="PATH_OR_N", help="file paths for add, item numbers for rm")
     p.add_argument("--note", help="for add: why the file matters")
 
     p = command(
@@ -5420,7 +5568,7 @@ def build_parser():
         "Write a hand-off pack (brief, context file links, plan, session prompt) as pack.md. "
         "Refuses a folder inside a git repo.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="task ID")
     p.add_argument(
         "--pack", nargs="?", const="", metavar="DIR",
         help="folder for pack.md; default QTASK_HOME/packs/<project>/<ID>",
@@ -5429,12 +5577,13 @@ def build_parser():
     p = command(
         "area", cmd_area,
         "Areas of the project as a tree. 'area' or 'area ls' lists them with open/total counts rolled up to "
-        "parents; 'area add NAME [--parent P] [--note TEXT]' adds or moves one.",
+        "parents; 'area add NAME [--parent P] [--note TEXT]' adds or moves one; 'area suggest TITLE|ID' "
+        "names the areas that fit.",
     )
-    p.add_argument("action", nargs="?", choices=("ls", "add"), default="ls")
-    p.add_argument("name", nargs="?")
+    p.add_argument("action", nargs="?", choices=("ls", "add", "suggest"), default="ls", help="ls (default), add or suggest")
+    p.add_argument("name", nargs="?", help="for add: the area name; for suggest: a title in quotes or a task ID")
     p.add_argument("--parent", help="for add: the parent area; empty moves it to the top")
-    p.add_argument("--note")
+    p.add_argument("--note", metavar="TEXT", help="for add: what the area holds; suggest matches its words")
     p.add_argument("--tree", action="store_true", help="indent children under their parent")
 
     p = command(
@@ -5442,37 +5591,33 @@ def build_parser():
         "Make one subtask per part, such as --part be --part fe. Each child copies the parent's fields "
         "and gets that side.",
     )
-    p.add_argument("id")
+    p.add_argument("id", help="the parent task's ID")
     p.add_argument("--part", action="append", required=True, help=f"repeatable: {', '.join(SIDES)}")
 
     p = command("take", cmd_take, "Claim one part of a split task, by side or by number.")
-    p.add_argument("id")
+    p.add_argument("id", help="the parent task's ID")
     p.add_argument("--part", required=True, help="a side such as be, or the part's number")
-    p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
+    p.add_argument(
+        "--ttl-hours", type=float, default=DEFAULT_TTL_HOURS, help=f"lease length, default {DEFAULT_TTL_HOURS:g} h",
+    )
 
     p = command(
         "similar", cmd_similar,
         "Open tasks of the project that look like the same work, scored 0 to 100 on title and body. add runs it "
         f"too, and refuses a title of {GATE_WORDS} or more words that scores {DUPLICATE_SCORE} or more.",
     )
-    p.add_argument("title")
+    p.add_argument("title", help="the title you plan to add, in quotes")
     p.add_argument("--body-file", help="compare this body too: a UTF-8 file, or stdin with -")
     p.set_defaults(body=None)
     p.add_argument("--area", help="an area; a task in it scores a little higher")
 
     p = command(
         "facets", cmd_facets,
-        "Counts of open tasks by lane, status, priority, kind, side, audience, requester and area. "
+        "Counts of open tasks by lane, status, priority, kind, side, audience, requester, area (direct, not "
+        "rolled up: see qtask area --tree) and lock. none counts tasks with the field unset. "
         "--ready counts claimable tasks only. Takes the filters of ls.",
     )
-    for flag in ("--kind", "--side", "--owner", "--claimed-by", "--parent", "--search", "--area"):
-        p.add_argument(flag)
-    p.add_argument("--pri", "--priority", dest="pri")
-    p.add_argument("--tag", action="append")
-    p.add_argument("--requested-by", help=", ".join(REQUESTERS))
-    p.add_argument("--audience", help=", ".join(AUDIENCES))
-    p.add_argument("--status", action="append", help="repeatable")
-    p.add_argument("--include-closed", action="store_true")
+    add_filter_flags(p)
     p.add_argument("--ready", action="store_true", help="only tasks an agent can claim now")
 
     p = command("template", cmd_template, "Print the body template of a kind.")
