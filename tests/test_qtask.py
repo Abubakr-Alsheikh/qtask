@@ -73,7 +73,7 @@ HAS_FTS5 = sqlite_has_fts5()
 ARABIC ="إصلاح زر الإرسال «ذاكر» في الاختبار"
 RACE_ROUNDS = 5
 RACE_PROCESSES = 20
-LATEST_SCHEMA = 10
+LATEST_SCHEMA = 11
 BUG_BODY = "Steps: save a file\nExpected: it saves\nActual: it crashes"
 SCISSORS = "# ------------------------ >8 ------------------------"
 
@@ -98,7 +98,8 @@ class Base(unittest.TestCase):
         self.home = tempfile.mkdtemp(prefix="qtask-test-")
         self.addCleanup(force_rmtree, self.home)
         self.env = {**os.environ, "QTASK_HOME": self.home}
-        self.env.pop("QTASK_AGENT", None)
+        for name in ("QTASK_AGENT", "QTASK_SIDES", "QTASK_AREAS", "QTASK_LIMIT"):
+            self.env.pop(name, None)
         self.assertNotEqual(Path(self.home).resolve(), REAL_DB.parent.resolve())
 
     def run_qtask(self, *args, agent=None, cwd=None, env=None, stdin=None):
@@ -559,7 +560,7 @@ class Fields(Base):
         self.assertEqual(self.ls("ls", "--tag", "x"), [a])
         self.assertEqual(self.ls("ls", "--owner", "o"), [a])
         self.assertEqual(self.ls("ls", "--parent", a), [b])
-        self.assertEqual(self.ls("ls", "--limit", "1"), [a])
+        self.assertEqual(self.ls("ls", "--limit", "1", "--sort", "priority"), [a])
         self.js("claim", b, agent="zed")
         self.assertEqual(self.ls("ls", "--claimed-by", "zed"), [b])
         self.assertEqual(self.ls("ls", "--status", "in_progress", "--status", "ready"), [a, b])
@@ -2301,11 +2302,14 @@ class Requests(Base):
         students = self.add("students", "--audience", "students")
         bug = self.add("bug", "--kind", "bug", "--body", BUG_BODY)
         asked = self.add("asked", "--requested-by", "manager", "--pri", "P3")
-        self.assertEqual(self.ls("ready"), [asked, bug, students, team, plain])
+        self.assertEqual(self.ls("ready"), [plain, asked, bug, students, team])
+        self.assertEqual(self.ls("ready", "--sort", "impact"), [asked, bug, students, team, plain])
         self.assertEqual(self.ls("ready", "--sort", "priority"), [plain, team, students, bug, asked])
         self.assertEqual(self.ls("ready", "--sort", "oldest"), [plain, team, students, bug, asked])
         self.assertEqual(self.ls("ls", "--sort", "impact"), [asked, bug, students, team, plain])
-        self.assertEqual(self.ls("ls"), [plain, team, students, bug, asked])
+        # 0.7: ls sorts by the important score by default: P0 60, manager 50, bug P2 35, students P2 22, team P2 7.
+        self.assertEqual(self.ls("ls"), [plain, asked, bug, students, team])
+        self.assertEqual(self.ls("ls", "--sort", "priority"), [plain, team, students, bug, asked])
         self.assertEqual(self.run_qtask("ls", "--sort", "random", "--project", self.project).returncode, 2)
 
 
@@ -2407,7 +2411,7 @@ class Areas(Base):
         closed = self.add("closed", "--area", "content")
         self.js("done", closed, "--evidence", "e")
         loose = self.add("loose")
-        self.assertEqual(self.ls("ls", "--area", "admin"), [top, video])
+        self.assertEqual(self.ls("ls", "--area", "admin"), [video, top])  # 0.7: the manager request first
         self.assertEqual(self.ls("ls", "--area", "videos"), [video])
         self.assertEqual(self.ls("ready", "--area", "content"), [video])
         data = self.js("area", "ls", "--tree", "--project", self.project)
@@ -2800,9 +2804,9 @@ class PickWork(Base):
         data = self.js("next", "--project", self.project, agent="a")
         self.assertNotEqual(data["next_task"]["id"], parent)
         self.assertEqual(data["next_task"]["id"], bug)
-        self.assertEqual(data["next_task"]["why"], "bug, for students, P2, planned")
+        self.assertEqual(data["next_task"]["why"], "bug +25, for students +12, P2 +10, planned; score 47")
         text = self.run_qtask("next", "--project", self.project, agent="a").stdout
-        self.assertIn("   why first: bug, for students, P2, planned", text)
+        self.assertIn("   why first: bug +25, for students +12, P2 +10, planned; score 47", text)
         three = self.js("next", "--project", self.project, "--limit", "3", agent="a")
         self.assertEqual([t["id"] for t in three["candidates"]], [bug, child])
         self.assertEqual(self.js("next", "--project", self.project, "--side", "be", agent="a")["next_task"]["id"], child)
@@ -2875,20 +2879,21 @@ class PickWork(Base):
         be = self.add("a", "--side", "be", "--area", "content", "--audience", "students")
         fe = self.add("b", "--side", "fe", "--area", "exams", "--status", "backlog")
         bare = self.add("c")
+        # The filters are under test, so the lists use the 0.6 order: priority, then oldest.
         design = self.add("d", "--side", "design", "--requested-by", "manager")
-        self.assertEqual(self.ls("ls", "--side", "be,fe"), [be, fe])
-        self.assertEqual(self.ls("ls", "--side", "none"), [bare])
-        self.assertEqual(self.ls("ls", "--side", "design,none"), [bare, design])
-        self.assertEqual(self.ls("ls", "--area", "none"), [bare, design])
-        self.assertEqual(self.ls("ls", "--area", "admin,exams"), [be, fe])
-        self.assertEqual(self.ls("ls", "--area", "admin,none"), [be, bare, design])
-        self.assertEqual(self.ls("ls", "--audience", "none", "--side", "be,fe"), [fe])
-        self.assertEqual(self.ls("ls", "--requested-by", "manager,none", "--side", "design"), [design])
-        self.assertEqual(self.ls("ls", "--status", "ready,backlog", "--side", "fe"), [fe])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--side", "be,fe"), [be, fe])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--side", "none"), [bare])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--side", "design,none"), [bare, design])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--area", "none"), [bare, design])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--area", "admin,exams"), [be, fe])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--area", "admin,none"), [be, bare, design])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--audience", "none", "--side", "be,fe"), [fe])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--requested-by", "manager,none", "--side", "design"), [design])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--status", "ready,backlog", "--side", "fe"), [fe])
         self.assertEqual(self.ls("ready", "--area", "none"), [design, bare])
         self.assertEqual(self.ls("ready", "--pri", "p2,P1", "--kind", "task", "--side", "be"), [be])
         self.js("done", bare, "--evidence", "x")
-        self.assertEqual(self.ls("ls", "--side", "none", "--closed"), [bare])
+        self.assertEqual(self.ls("ls", "--sort", "priority", "--side", "none", "--closed"), [bare])
         facets = self.js("facets", "--project", self.project, "--area", "none", "--include-closed")
         self.assertEqual(facets["total"], 2)
         self.assertEqual(self.js("facets", "--project", self.project)["facets"]["lock"], {"free": 3})
@@ -2983,6 +2988,219 @@ class PickWork(Base):
         self.add("task")
         self.add("task")
 
+
+
+class SmartOrder(Base):
+    """The important order, sorts, time and number filters, views, due dates, --mine and parent sides (0.7.0)."""
+
+    def make_fixture(self):
+        ids = {}
+        ids["team"] = self.add("team work", "--audience", "team")
+        ids["plain"] = self.add("urgent fix", "--pri", "P0")
+        ids["asked"] = self.add("manager ask", "--requested-by", "manager", "--pri", "P3")
+        ids["bug"] = self.add("save crash", "--kind", "bug", "--body", BUG_BODY, "--audience", "students")
+        ids["later"] = self.add("later work", "--status", "backlog", "--pri", "P0")
+        ids["target"] = self.add("blocked target", "--pri", "P1", "--audience", "students")
+        ids["blocker"] = self.add("the blocker", "--pri", "P3")
+        self.js("link", ids["blocker"], "--blocks", ids["target"])
+        ids["parent"] = self.add("grouped work", "--pri", "P0", "--requested-by", "manager")
+        ids["part"] = self.add("one part", "--parent", ids["parent"], "--side", "be")
+        ids["held"] = self.add("held work", "--pri", "P0")
+        self.js("claim", ids["held"], agent="bob")
+        return ids
+
+    def test_important_order_is_deterministic_and_shared(self):
+        ids = self.make_fixture()
+        order = ["plain", "asked", "bug", "blocker", "part", "team", "later", "parent", "held", "target"]
+        self.assertEqual(self.ls("ls"), [ids[k] for k in order])
+        ready = ["plain", "asked", "bug", "blocker", "part", "team", "later", "parent"]
+        self.assertEqual(self.ls("ready"), [ids[k] for k in ready])
+        rows = {t["id"]: t for t in self.js("ls", "--project", self.project, "--explain")["tasks"]}
+        self.assertEqual(rows[ids["plain"]]["score"], 60)
+        self.assertEqual(rows[ids["asked"]]["why"], "manager request +50, P3 +0, planned; score 50")
+        # The blocker: 5 per blocked task plus a quarter of the target's own 42 points, rounded.
+        self.assertEqual(rows[ids["blocker"]]["why"], f"blocks {ids['target']} +16, P3 +0, planned; score 16")
+        self.assertEqual(rows[ids["team"]]["why"], "P2 +10, for team -3, planned; score 7")
+        self.assertIn("has 1 open subtask: take one", rows[ids["parent"]]["why"])
+        self.assertIn("claimed by bob", rows[ids["held"]]["why"])
+        self.assertEqual(rows[ids["bug"]]["reasons"][0], {"reason": "bug", "points": 25})
+        nxt = self.js("next", "--project", self.project, "--limit", "3", agent="a")
+        self.assertEqual([t["id"] for t in nxt["candidates"]], [ids["plain"], ids["asked"], ids["bug"]])
+        self.assertEqual(nxt["next_task"]["score"], 60)
+        text = self.run_qtask("next", "--project", self.project, agent="a").stdout
+        self.assertIn("why first: P0 +60, planned; score 60", text)
+        explain = self.run_qtask("ls", "--project", self.project, "--explain").stdout.splitlines()
+        self.assertTrue(explain[0].startswith(ids["plain"]))
+        self.assertEqual(explain[1], "    why: P0 +60, planned; score 60")
+        self.assertNotIn("score", self.js("ls", "--project", self.project)["tasks"][0])
+
+    def test_age_and_due_raise_the_score(self):
+        old, new = self.add("old"), self.add("new")
+        self.sql("UPDATE tasks SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?", old)
+        due = self.add("soon", "--due", "+1d")
+        late = self.add("late", "--due", "2001-01-01")
+        rows = {t["id"]: t for t in self.js("ls", "--project", self.project, "--explain")["tasks"]}
+        self.assertIn("overdue", rows[late]["why"])
+        self.assertEqual(rows[late]["score"], 50)
+        self.assertIn("due tomorrow +25", rows[due]["why"])
+        self.assertIn("waiting", rows[old]["why"])
+        self.assertEqual(rows[old]["score"], 20)
+        self.assertEqual(self.ls("ls"), [late, due, old, new])
+
+    def test_each_sort_and_reverse(self):
+        a = self.add("a", "--pri", "P3")
+        b = self.add("b", "--pri", "P1", "--due", "+5d")
+        c = self.add("c", "--pri", "P2", "--due", "+2d")
+        self.sql("UPDATE tasks SET created_at = '2001-01-01T00:00:00Z', updated_at = '2001-01-01T00:00:00Z' WHERE id = ?", a)
+        self.sql("UPDATE tasks SET updated_at = '2000-01-01T00:00:00Z' WHERE id = ?", c)
+        self.assertEqual(self.ls("ls", "--sort", "oldest"), [a, b, c])
+        self.assertEqual(self.ls("ls", "--sort", "newest"), [c, b, a])
+        self.assertEqual(self.ls("ls", "--sort", "priority"), [b, c, a])
+        self.assertEqual(self.ls("ls", "--sort", "id"), [a, b, c])
+        self.assertEqual(self.ls("ls", "--sort", "updated"), [b, a, c])
+        self.assertEqual(self.ls("ls", "--sort", "due"), [c, b, a])
+        self.assertEqual(self.ls("ls", "--sort", "id", "--reverse"), [c, b, a])
+        self.assertEqual(self.ls("ready", "--sort", "newest"), [c, b, a])
+        # b: P1 30 + due within a week 10 = 40; c: P2 10 + due soon 25 = 35; a: P3 0 + age 10.
+        self.assertEqual(self.ls("ls"), [b, c, a])
+        self.assertEqual(self.js("ls", "--project", self.project)["sort"], "important")
+        self.assertEqual(self.js("ls", "--project", self.project, "--sort", "impact")["sort"], "impact")
+        found = self.js("search", "--project", self.project, "a", "--sort", "id")
+        self.assertEqual(found["sort"], "id")
+        self.js("ls", "--project", self.project, "--sort", "nope", expect=2)
+
+    def test_time_and_number_filters(self):
+        old, mid, new = self.add("old"), self.add("mid"), self.add("new")
+        self.sql("UPDATE tasks SET created_at = '2001-01-01T00:00:00Z', updated_at = '2001-01-01T00:00:00Z' WHERE id = ?", old)
+        self.sql("UPDATE tasks SET created_at = '2026-01-01T00:00:00Z', updated_at = '2026-01-02T00:00:00Z' WHERE id = ?", mid)
+        self.assertEqual(sorted(self.ls("ls", "--created-since", "2025-12-31")), sorted([mid, new]))
+        self.assertEqual(self.ls("ls", "--created-before", "2026-01-01"), [old])
+        self.assertEqual(self.ls("ls", "--created-since", "7d"), [new])
+        self.assertEqual(self.ls("ls", "--updated-since", "24h"), [new])
+        self.assertEqual(self.ls("ls", "--stale", "14", "--sort", "id"), [old, mid])
+        self.assertEqual(self.ls("ls", "--stale", "2w", "--sort", "id"), [old, mid])
+        self.assertEqual(self.ls("ready", "--stale", "36h", "--created-since", "2025-01-01"), [mid])
+        for flag, value in (("--created-since", "yesterday"), ("--stale", "x"), ("--due-before", "5h")):
+            self.assertEqual(self.js("ls", "--project", self.project, flag, value, expect=2)["error"]["code"], "bad_usage")
+        self.assertEqual(self.js("ls", "--project", self.project, "--top", "2")["count"], 2)
+        self.assertEqual(self.js("ready", "--project", self.project, "--top", "1")["count"], 1)
+        self.assertEqual(len(self.js("next", "--project", self.project, "--top", "2", agent="a")["candidates"]), 2)
+        self.assertEqual(self.js("facets", "--project", self.project, "--stale", "14")["total"], 2)
+
+    def test_paging_more_line_keeps_the_flags(self):
+        for n in range(3):
+            self.add(f"t{n}", "--side", "be")
+        text = self.run_qtask("ls", "--project", self.project, "--side", "be", "--sort", "newest", "--reverse",
+                              "--limit", "1").stdout
+        self.assertIn("more: qtask ls --project acme/app --side be --sort newest --reverse --limit 1 --page 2", text)
+        data = self.js("ready", "--project", self.project, "--sort", "oldest", "--top", "2")
+        self.assertEqual(data["page"]["next"], "qtask ready --project acme/app --sort oldest --top 2 --json --page 2")
+
+    def test_due_dates(self):
+        task = self.add("ship", "--due", "+3d")
+        due = self.js("show", task)["task"]["due"]
+        self.assertRegex(due, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertIn(f"Due: {due} (in 3 days)", self.run_qtask("show", task).stdout)
+        self.assertIn(f"[due {due}]", self.run_qtask("ls", "--project", self.project).stdout)
+        self.assertIn(f"Due: {due} (in 3 days)", self.js("brief", task)["text"])
+        late = self.add("late")
+        self.js("set", late, "--due", "2001-02-03")
+        far = self.add("far", "--due", "2w")
+        self.assertEqual(self.ls("ls", "--overdue"), [late])
+        self.assertEqual(self.ls("ls", "--due-before", "7d", "--sort", "due"), [late, task])
+        self.assertEqual(self.ls("ls", "--due-before", "2001-02-03"), [late])
+        report = self.js("report", "--project", self.project)
+        self.assertEqual([t["id"] for t in report["due_soon"]], [late, task])
+        self.assertEqual(report["sections"]["due"]["total"], 2)
+        text = self.run_qtask("report", "--project", self.project).stdout
+        self.assertIn("Overdue or due within 7 days (2):", text)
+        self.assertIn("overdue by", text)
+        self.js("set", far, "--due", "")
+        self.assertIsNone(self.js("show", far)["task"]["due"])
+        self.js("set", far, "--due", "next week", expect=2)
+        self.js("add", "x", "--project", self.project, "--due", "2026-02-30", expect=2)
+
+    def test_views(self):
+        bug = self.add("crash", "--kind", "bug", "--body", BUG_BODY, "--side", "be")
+        self.add("other", "--side", "fe")
+        saved = self.js("view", "save", "be-bugs", "ready", "--side", "be", "--kind", "bug", "--project", self.project)
+        self.assertEqual(saved["view"]["line"], "qtask ready --side be --kind bug")
+        self.assertFalse(saved["replaced"])
+        run = self.js("view", "be-bugs", "--project", self.project)
+        self.assertEqual((run["view"], [t["id"] for t in run["tasks"]]), ("be-bugs", [bug]))
+        self.assertIn("counts", run)
+        text = self.run_qtask("view", "be-bugs", "--project", self.project, "--explain").stdout
+        self.assertIn("why: bug +25", text)
+        listed = self.js("view", "ls", "--project", self.project)["views"]
+        self.assertEqual([(v["name"], v["command"], v["args"]) for v in listed],
+                         [("be-bugs", "ready", ["--side", "be", "--kind", "bug"])])
+        self.assertIn("be-bugs: qtask ready --side be --kind bug", self.run_qtask("view", "--project", self.project).stdout)
+        again = self.js("view", "save", "be-bugs", "--side", "fe", "--project", self.project)
+        self.assertTrue(again["replaced"])
+        self.assertEqual(again["view"]["line"], "qtask ls --side fe")
+        for n in range(3):
+            self.add(f"fe {n}", "--side", "fe")
+        page = self.js("view", "be-bugs", "--limit", "2", "--project", self.project)
+        self.assertEqual(page["page"]["next"], "qtask view be-bugs --limit 2 --project acme/app --json --page 2")
+        self.assertEqual(self.js("view", "save", "x", "--page", "2", "--project", self.project, expect=2)["error"]["code"], "bad_usage")
+        self.assertEqual(self.run_qtask("view", "save", "x", "--nope", "--project", self.project).returncode, 2)
+        self.assertEqual(self.js("view", "save", "save", "--project", self.project, expect=2)["error"]["code"], "bad_view_name")
+        self.assertEqual(self.js("view", "missing", "--project", self.project, expect=5)["error"]["code"], "view_not_found")
+        self.js("view", "rm", "be-bugs", "--project", self.project)
+        self.assertEqual(self.js("view", "rm", "be-bugs", "--project", self.project, expect=5)["error"]["code"], "view_not_found")
+        self.assertEqual(self.js("view", "--project", self.project)["views"], [])
+
+    def test_ready_mine_and_parent_sides(self):
+        parent = self.add("full stack")
+        self.js("split", parent, "--part", "be", "--part", "fe")
+        alone = self.add("infra job", "--side", "infra")
+        untagged = self.add("untagged")
+        be = [t["id"] for t in self.js("ls", "--project", self.project, "--side", "be")["tasks"]]
+        self.assertIn(parent, be)
+        self.assertEqual(len(be), 2)
+        self.assertEqual(self.ls("ls", "--side", "none"), [untagged])
+        facets = self.js("facets", "--project", self.project)["facets"]["side"]
+        self.assertEqual(facets, {"be": 1, "fe": 1, "infra": 1, "fe+be": 1, "none": 1})
+        env = {**self.env, "QTASK_SIDES": "infra"}
+        mine = self.js("ready", "--project", self.project, "--mine", env=env)
+        self.assertEqual([t["id"] for t in mine["tasks"]], [alone])
+        self.assertEqual(self.js("ready", "--project", self.project, "--mine", "--side", "be", env=env)["count"], 2)
+        error = self.js("ready", "--project", self.project, "--mine", expect=2)["error"]
+        self.assertEqual(error["code"], "mine_unset")
+        self.js("area", "add", "books", "--project", self.project)
+        self.js("set", untagged, "--area", "books")
+        env = {**self.env, "QTASK_AREAS": "books"}
+        self.assertEqual([t["id"] for t in self.js("ls", "--project", self.project, "--mine", env=env)["tasks"]], [untagged])
+        self.assertEqual(self.js("next", "--project", self.project, agent="a", env=env)["next_task"]["id"], untagged)
+
+    def test_config_weights(self):
+        bug = self.add("crash", "--kind", "bug", "--body", BUG_BODY)
+        urgent = self.add("urgent", "--pri", "P0")
+        self.assertEqual(self.ls("ls"), [urgent, bug])
+        data = self.js("config", "set", "bug", "80", "--project", self.project)
+        row = next(w for w in data["weights"] if w["name"] == "bug")
+        self.assertEqual((row["value"], row["default"], row["changed"]), (80, 25, True))
+        self.assertEqual(self.ls("ls"), [bug, urgent])
+        self.assertIn("(default 25)", self.run_qtask("config", "--project", self.project).stdout)
+        self.js("config", "unset", "bug", "--project", self.project)
+        self.assertEqual(self.ls("ls"), [urgent, bug])
+        self.js("config", "set", "blocks_share", "0.5", "--project", self.project)
+        self.js("config", "reset", "--project", self.project)
+        self.assertFalse(any(w["changed"] for w in self.js("config", "--project", self.project)["weights"]))
+        error = self.js("config", "set", "nope", "1", "--project", self.project, expect=2)["error"]
+        self.assertEqual(error["code"], "unknown_weight")
+        self.js("config", "set", "bug", "lots", "--project", self.project, expect=2)
+        self.js("config", "set", "due_soon_days", "2.5", "--project", self.project, expect=2)
+        self.js("add", "other bug", "--project", "two/other", "--kind", "bug", "--body", BUG_BODY)
+        self.js("config", "set", "bug", "0", "--project", "two/other")
+        self.assertEqual(self.js("ls", "--project", "two/other", "--explain")["tasks"][0]["score"], 10)
+        self.assertEqual(self.js("ls", "--project", self.project, "--explain")["tasks"][0]["score"], 60)
+
+    def test_schema_11_adds_due_and_views_only(self):
+        self.add("x")
+        self.assertEqual([r[1] for r in self.sql("PRAGMA table_info(tasks)")][-1], "due")
+        self.assertEqual([r[1] for r in self.sql("PRAGMA table_info(views)")],
+                         ["project", "name", "command", "args", "created_by", "created_at", "updated_at"])
 
 
 class Version(Base):

@@ -17,8 +17,8 @@ description: Local task tracker shared by agents and the developer. Load it when
 
 | Step | Command | Notes |
 |------|---------|-------|
-| Find work | `qtask next` | Comments to you, your idle or expired claims, then the top ready task with a `why first:` line. `--side be,infra`, `--kind bug`, `--area X`, `--limit 3`; `--expand` adds whole comments and the brief, so you need no second call. `QTASK_SIDES=be,infra` sets your default sides for `next` only |
-| More choice | `qtask ready` | Claimable tasks by impact, 20 a page. Filters as on `ls` |
+| Find work | `qtask next` | Comments to you, your idle or expired claims, then the top ready task with a `why first:` line. `--side be,infra`, `--kind bug`, `--area X`, `--limit 3`; `--expand` adds whole comments and the brief, so you need no second call. `QTASK_SIDES=be,infra` and `QTASK_AREAS=books` set your defaults for `next` |
+| More choice | `qtask ready` | Claimable tasks, most important first, 20 a page. Filters as on `ls`; `--mine` uses `QTASK_SIDES` and `QTASK_AREAS` |
 | Read it | `qtask brief ID` | About 2 KB: claim, next step, plan, open checklist, questions, blockers, body |
 | Claim | `qtask claim ID` | Exit 3: another agent holds it, pick other work. Your activity on the task renews the 2 h lease (the team hub uses 48 h idle instead) |
 | Work | `qtask comment ID "text"`, `qtask todo ID add "step"`, `todo ID done N`, `qtask set ID --next "text"` | Keep findings on the task |
@@ -42,8 +42,19 @@ Give each new task a side, an area and, for product work, an audience, so `next`
 | Audience | `--audience` | students, teachers, parents, managers, admins, team (internal work). Sorts `ready` |
 | Who asked | `--requested-by` | manager, stakeholder, developer, scan, agent; `--requester NAME`. Manager and stakeholder requests sort first |
 | Kind, priority | `--kind`, `--pri` | `qtask template KIND` prints the body for bug, feature, chore, content, research; a bug needs it. P0 to P3 |
+| Due date | `--due` | `2026-11-25`, `+3d` or `2w`; `set --due ""` clears it. `report` lists overdue and due-this-week tasks |
 
-Filters on `ls`, `ready`, `facets` and `next` take comma lists (`--side be,fe`, `--pri P0,P1`) and `none` for an empty field: `qtask ls --area none` lists tasks to tag, `qtask facets` counts them.
+Filters on `ls`, `ready`, `facets` and `next` take comma lists (`--side be,fe`, `--pri P0,P1`) and `none` for an empty field: `qtask ls --area none` lists tasks to tag, `qtask facets` counts them. `--side be` also matches a parent with no side of its own whose open parts include be.
+
+## Choosing what to work on
+
+`next`, `ready`, `ls` and `search` share one order, `important`. Free work comes first: the planned lane, then the backlog, then parents with open parts, then held tasks (claimed, blocked, in progress, parked). Inside each group the highest score wins, then the oldest task. The score adds points: P0 60, manager request 50, stakeholder 40, overdue 40, P1 30, bug 25, due within 2 days 25, students 12, P2 10, due this week 10, up to 40 for the tasks it blocks, up to 10 for age. reference.md has the full table.
+
+- Read the reasons: `next` prints `why first: P0 +60, bug +25, for students +12, planned; score 97`. `ls --explain` and `ready --explain` print the same line under each row, and `--json` adds `score`, `why` and `reasons`.
+- Other orders: `--sort impact` (the team hub's order), `priority`, `oldest`, `newest`, `updated`, `due`, `id`; `--reverse` flips any of them.
+- Time filters: `--created-since 7d`, `--created-before 2026-11-01`, `--updated-since 24h`, `--stale 14` (no activity for 14 days), `--due-before 7d`, `--overdue`. `--top 5` prints the first five.
+- Saved views: `qtask view save be-bugs ready --side be --kind bug`, then `qtask view be-bugs`; `qtask view ls`, `qtask view rm NAME`.
+- The developer tunes the weights for a project with `qtask config set bug 40`; `qtask config` lists them. Do not change them on your own.
 
 ## Reading output
 

@@ -22,7 +22,7 @@ $ qtask done APP-14 --evidence "npm test: 412 passed" --agent fe-fix-1
 Done APP-14.
 ```
 
-Status: **0.6, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
+Status: **0.7, early.** It runs daily on one Windows laptop with several agents at once. Commands and output may still change before 1.0.
 
 ## Why another tracker
 
@@ -87,7 +87,8 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 ## How it works
 
 - **Statuses:** `backlog`, `ready`, `in_progress`, `blocked`, `needs_review`, `needs_confirm`, `done`, `dropped`. A new task starts `ready`.
-- **Lanes:** `ready` lists two lanes: planned work (status `ready`), then the backlog. It sorts each by impact: manager and stakeholder requests, then bugs, then the audience (students first), then priority, then age.
+- **Lanes:** `ready` lists two lanes: planned work (status `ready`), then the backlog, then parents that wait on their parts.
+- **What to do first:** `next`, `ready`, `ls` and `search` share one order, `important`. Free work comes before held work, and inside each group a score decides: P0 60, manager request 50, overdue 40, P1 30, bug 25, due soon 25, students 12, P2 10, plus points for the tasks it blocks and for age. `next` prints the reasons (`why first: P0 +60, bug +25, planned; score 85`), and `ls --explain` prints them per row. `qtask config set bug 40` tunes a weight per project. `--sort impact` keeps the team hub's order.
 - **Claims:** `claim` sets `in_progress` and a lease, 2 hours by default. Each later qtask command of the holder on the task renews it. Another agent's claim fails with exit 3. When a lease runs out, the next qtask command releases the task back to the lane it came from and logs `auto_released`. `report` lists claims idle for more than 24 hours.
 - **Questions:** `ask` moves the task to `needs_confirm`. Once every question has an answer, the task goes back to `in_progress`, or to `ready` when nobody holds it.
 - **Parked work:** `needs_confirm` and `blocked` need a reason: an open question, an open blocker, or `--waiting-on developer|manager|person|external` with a note. `decisions` groups what waits on whom.
@@ -101,7 +102,8 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 | Command | Does |
 |---------|------|
 | `add`, `set`, `show`, `ls`, `search` | Create, change, read and find tasks |
-| `ready`, `next`, `facets` | Tasks an agent may claim now, by lane and impact; what to do next, with the reason and the commands; counts by field |
+| `ready`, `next`, `facets` | Tasks an agent may claim now, most important first; what to do next, with the reasons and the commands; counts by field |
+| `view`, `config` | Saved lists with their filters and sort; the weights of the important order |
 | `brief` | About 2 KB of what an agent needs to start a task |
 | `claim`, `release` | Take or give back a task. Activity renews a claim; an expired one goes back to its lane |
 | `review`, `approve`, `reject`, `decisions` | The review queue, and what waits on whom |
@@ -177,8 +179,24 @@ $ qtask report --by requester
 
 - **Side:** fe, be, mobile, infra, docs, content, qa, design or other. For work on two sides, add one task, then `qtask split APP-15 --part be --part fe` makes a subtask per side, and each agent runs `qtask take APP-15 --part be`.
 - **Area:** a tree per project. `--area app` includes the areas below it. `add` without `--area` prints the areas that fit, from the area names, notes and the tasks already in them; `qtask area suggest APP-15` does the same later.
-- **Audience:** students, teachers, parents, managers, admins or team. **Who asked:** manager, stakeholder, developer, scan or agent. Both feed the impact sort of `ready` and `next`.
-- **Filters** take comma lists, and `none` matches an empty field: `qtask ls --area none` lists the tasks with no area, and `qtask facets` counts them per field.
+- **Audience:** students, teachers, parents, managers, admins or team. **Who asked:** manager, stakeholder, developer, scan or agent. Both feed the score of the important order.
+- **Due date:** `--due 2026-11-25` or `--due +3d` on `add` and `set`. `report` lists overdue tasks and tasks due within a week.
+- **Filters** take comma lists, and `none` matches an empty field: `qtask ls --area none` lists the tasks with no area, and `qtask facets` counts them per field. `--side be` also finds a parent with no side of its own and an open be part.
+
+### Pick, filter and keep a list
+
+```text
+$ qtask next                                   # the top task, with why first: and the commands
+$ qtask ready --mine --top 5                   # QTASK_SIDES=be,infra and QTASK_AREAS=books pick your work
+$ qtask ls --explain --kind bug                # each row with its score and reasons
+$ qtask ls --sort updated --updated-since 7d   # what moved this week
+$ qtask ls --stale 14                          # no activity for two weeks
+$ qtask ls --overdue                           # past the due date
+$ qtask view save be-bugs-week ready --side be --kind bug --created-since 7d
+$ qtask view be-bugs-week                      # run it again any day; qtask view ls lists views
+```
+
+Sorts: `important` (default), `impact`, `priority`, `oldest`, `newest`, `updated`, `due`, `id`, and `--reverse`. Time filters take a date (`2026-11-01`) or a time ago (`7d`, `24h`, `2w`).
 
 ### Checklists
 

@@ -57,7 +57,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -89,7 +89,41 @@ COMMENT_KINDS = COMMENT_KINDS_V1 + ("handback",)
 REQUESTERS = ("manager", "stakeholder", "developer", "scan", "agent")
 AUDIENCES = ("students", "teachers", "parents", "managers", "admins", "team")
 WAITING_ON = ("developer", "manager", "person", "external")
-SORTS = ("impact", "oldest", "priority")
+SORTS = ("important", "impact", "priority", "oldest", "newest", "updated", "due", "id")
+DEFAULT_SORT = "important"
+# The important order: points per input, summed into a score. qtask config set NAME VALUE changes one
+# for a project. (name, default, what earns it). See the scoring table in reference.md.
+WEIGHTS = (
+    ("manager", 50, "a manager asked for it (requested_by manager)"),
+    ("stakeholder", 40, "a stakeholder asked for it"),
+    ("bug", 25, "kind bug"),
+    ("P0", 60, "priority P0"),
+    ("P1", 30, "priority P1"),
+    ("P2", 10, "priority P2"),
+    ("P3", 0, "priority P3"),
+    ("students", 12, "audience students"),
+    ("teachers", 9, "audience teachers"),
+    ("parents", 7, "audience parents"),
+    ("managers", 5, "audience managers"),
+    ("admins", 3, "audience admins"),
+    ("team", -3, "audience team: internal work"),
+    ("audience_none", 0, "no audience set"),
+    ("blocks_each", 5, "each open task it blocks"),
+    ("blocks_share", 0.25, "plus this share of each blocked task's own score"),
+    ("blocks_max", 40, "most points blocking can add"),
+    ("overdue", 40, "the due date has passed"),
+    ("due_soon", 25, "due within due_soon_days"),
+    ("due_soon_days", 2, "days ahead that count as due soon (0 = today only)"),
+    ("due_week", 10, "due within 7 days, past due_soon_days"),
+    ("age_per_week", 1, "each full week since the task was made"),
+    ("age_max", 10, "most points age can add"),
+)
+DEFAULT_WEIGHTS = {name: value for name, value, _ in WEIGHTS}
+# Groups of the important order, before the score: work you can take now first.
+RANK_GROUPS = ("planned", "backlog", "parent", "held", "closed")
+VIEW_COMMANDS = ("ls", "ready", "search", "facets", "next")
+VIEW_ACTIONS = ("ls", "save", "rm")
+VIEW_RE = re.compile(r"[a-z0-9][a-z0-9._\-]{0,39}")
 HANDBACK_LABELS = ("Summary", "Checks run", "Left")
 TEMPLATES = {
     "bug": "Steps:\n1. \n\nExpected:\n\nActual:\n",
@@ -118,10 +152,12 @@ REPORT_ROWS = 5
 LIST_FIELDS = (
     "id", "title", "status", "lane", "priority", "kind", "side", "area", "audience", "requested_by",
     "claimed_by", "claim_valid", "blocked_by", "progress", "todo_progress", "parent_id", "deployed", "lock",
+    "due",
 )
 COMPUTED_FIELDS = (
     "blocked_by", "children_count", "children_done", "children_total", "todos_total", "todos_done",
-    "claim_valid", "progress", "todo_progress", "lane", "lock", "lock_reason",
+    "claim_valid", "progress", "todo_progress", "lane", "lock", "lock_reason", "part_sides", "score", "why",
+    "reasons",
 )
 
 BUSY_MS = 15000
@@ -132,7 +168,7 @@ MIN_SQLITE = (3, 24, 0)
 BACKUPS_KEPT = 7
 BACKUP_TABLES = (
     "schema_version", "meta", "projects", "tasks", "comments", "links", "events", "commits", "todos",
-    "hub_links", "areas", "context_files",
+    "hub_links", "areas", "context_files", "views",
 )
 GIT_TIMEOUT = 15
 SCAN_TIMEOUT = 120
@@ -156,7 +192,9 @@ TASK_SELECT = (
     "(SELECT count(*) FROM tasks c WHERE c.parent_id = t.id AND c.status <> 'dropped') AS children_total, "
     "(SELECT count(*) FROM todos d WHERE d.task_id = t.id AND d.removed_at IS NULL) AS todos_total, "
     "(SELECT count(*) FROM todos d WHERE d.task_id = t.id AND d.removed_at IS NULL AND d.done = 1) "
-    "AS todos_done "
+    "AS todos_done, "
+    "(SELECT group_concat(DISTINCT c.side) FROM tasks c WHERE c.parent_id = t.id AND c.side IS NOT NULL "
+    f"AND c.status NOT IN {SQL_CLOSED}) AS part_sides "
     "FROM tasks t"
 )
 SQL_OPEN_TODOS = "t.id IN (SELECT task_id FROM todos WHERE removed_at IS NULL AND done = 0)"
@@ -722,9 +760,26 @@ def migrate_10(conn):
     widen_checks(conn, [("tasks", SIDES_V8, SIDES)])
 
 
+def migrate_11(conn):
+    """A due date per task (YYYY-MM-DD) and saved views: a named list command with its flags."""
+    conn.execute("ALTER TABLE tasks ADD COLUMN due TEXT")
+    conn.execute(
+        """CREATE TABLE views (
+            project TEXT NOT NULL REFERENCES projects(name),
+            name TEXT NOT NULL,
+            command TEXT NOT NULL,
+            args TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (project, name)
+        )"""
+    )
+
+
 MIGRATIONS = {
     1: migrate_1, 2: migrate_2, 3: migrate_3, 4: migrate_4, 5: migrate_5, 6: migrate_6, 7: migrate_7,
-    8: migrate_8, 9: migrate_9, 10: migrate_10,
+    8: migrate_8, 9: migrate_9, 10: migrate_10, 11: migrate_11,
 }
 
 
@@ -1013,6 +1068,9 @@ def task_dict(row):
         f"{data['children_done']}/{data['children_total']}" if data.get("children_count") else None
     )
     data["todo_progress"] = f"{data['todos_done']}/{data['todos_total']}" if data.get("todos_total") else None
+    if "part_sides" in data:
+        found = set((data["part_sides"] or "").split(",")) - {""}
+        data["part_sides"] = [s for s in SIDES if s in found]
     data["lock"], data["lock_reason"] = lock_of(data)
     return data
 
@@ -1250,6 +1308,124 @@ def area_filter(conn, where, params, raw, project):
         where.append(f"({' OR '.join(parts)})")
 
 
+def side_filter(where, params, raw):
+    """
+    --side as a comma list. A parent with no side of its own matches a side when one of its open
+    parts has it, so a full-stack parent with a be part shows under --side be. none: no side here and none on an open part.
+    """
+    picked, empty = [], False
+    for value in (raw or "").split(","):
+        value = value.strip().lower()
+        if not value:
+            continue
+        if value == UNSET:
+            empty = True
+            continue
+        if value not in SIDES:
+            raise usage_error(f"--side takes a comma list of {', '.join(SIDES)}, or {UNSET} for unset. Got {value!r}.")
+        if value not in picked:
+            picked.append(value)
+    open_part = f"SELECT 1 FROM tasks c WHERE c.parent_id = t.id AND c.status NOT IN {SQL_CLOSED}"
+    parts = []
+    if picked:
+        marks = ",".join("?" * len(picked))
+        parts.append(f"t.side IN ({marks}) OR (t.side IS NULL AND EXISTS ({open_part} AND c.side IN ({marks})))")
+        params.extend(picked * 2)
+    if empty:
+        parts.append(f"(t.side IS NULL AND NOT EXISTS ({open_part} AND c.side IS NOT NULL))")
+    if parts:
+        where.append(f"({' OR '.join(parts)})")
+
+
+DURATION_RE = re.compile(r"\+?(\d+)([hdw])", re.IGNORECASE)
+
+
+def parse_since(raw, flag):
+    """A moment in the past as a UTC timestamp: YYYY-MM-DD (UTC midnight), or 7d, 24h, 2w ago."""
+    raw = (raw or "").strip()
+    match = DURATION_RE.fullmatch(raw)
+    if match:
+        n, unit = int(match.group(1)), match.group(2).lower()
+        delta = {"h": timedelta(hours=n), "d": timedelta(days=n), "w": timedelta(weeks=n)}[unit]
+        return iso(utc_now() - delta)
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00Z")
+    except ValueError:
+        raise usage_error(f"{flag} takes a date such as 2026-11-01, or a time ago such as 7d, 24h or 2w. Got {raw!r}.") from None
+
+
+def today():
+    return datetime.now().date()
+
+
+def parse_day_ahead(raw, flag):
+    """A day as YYYY-MM-DD: the date itself, or today plus +3d, 3d, 2w. today is 0d."""
+    raw = (raw or "").strip()
+    if raw.lower() == "today":
+        return today().isoformat()
+    match = DURATION_RE.fullmatch(raw)
+    if match:
+        n, unit = int(match.group(1)), match.group(2).lower()
+        if unit == "h":
+            raise usage_error(f"{flag} counts days: use +3d or 2w, not hours.")
+        return (today() + timedelta(days=n * (7 if unit == "w" else 1))).isoformat()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise usage_error(f"{flag} takes a date such as 2026-11-25, or days from today such as +3d or 2w. Got {raw!r}.") from None
+
+
+def parse_stale(raw):
+    """--stale takes days (14) or a duration (14d, 36h, 2w). Returns the cutoff timestamp."""
+    raw = (raw or "").strip()
+    return parse_since(f"{raw}d" if raw.isdigit() else raw, "--stale")
+
+
+def due_text(due):
+    """How far a due date is from today: due today, in 3 days, overdue by 2 days."""
+    try:
+        days = (datetime.strptime(due, "%Y-%m-%d").date() - today()).days
+    except ValueError:
+        return "not a date"
+    if days < 0:
+        return f"overdue by {plural(-days, 'day')}"
+    return "due today" if days == 0 else "due tomorrow" if days == 1 else f"in {days} days"
+
+
+def mine_filters(a):
+    """--mine: your sides from QTASK_SIDES and your areas from QTASK_AREAS, unless --side or --area is given."""
+    sides = os.environ.get("QTASK_SIDES", "").strip()
+    areas = os.environ.get("QTASK_AREAS", "").strip()
+    if not sides and not areas:
+        raise usage_error(
+            "--mine reads QTASK_SIDES (such as be,infra) and QTASK_AREAS (such as books,exams). Set one of them.",
+            "mine_unset",
+        )
+    return (a.side if a.side is not None else sides or None), (a.area if a.area is not None else areas or None)
+
+
+def time_filters(a, where, params):
+    """--created-since, --created-before, --updated-since, --stale, --due-before and --overdue."""
+    if getattr(a, "created_since", None):
+        where.append("t.created_at >= ?")
+        params.append(parse_since(a.created_since, "--created-since"))
+    if getattr(a, "created_before", None):
+        where.append("t.created_at < ?")
+        params.append(parse_since(a.created_before, "--created-before"))
+    if getattr(a, "updated_since", None):
+        where.append("t.updated_at >= ?")
+        params.append(parse_since(a.updated_since, "--updated-since"))
+    if getattr(a, "stale", None):
+        where.append("t.updated_at < ?")
+        params.append(parse_stale(a.stale))
+    if getattr(a, "due_before", None):
+        where.append("t.due IS NOT NULL AND t.due <= ?")
+        params.append(parse_day_ahead(a.due_before, "--due-before"))
+    if getattr(a, "overdue", False):
+        where.append(f"t.due IS NOT NULL AND t.due < ? AND t.status NOT IN {SQL_CLOSED}")
+        params.append(today().isoformat())
+
+
 def status_values(raw_list):
     """--status is repeatable and takes comma lists: --status ready,backlog."""
     return [choice(x, STATUSES, "--status") for raw in raw_list or [] for x in raw.split(",") if x.strip()]
@@ -1258,9 +1434,11 @@ def status_values(raw_list):
 def build_filters(ctx, where, params):
     a = ctx.args
     add_scope(where, params, ctx.scope())
+    sides, areas = mine_filters(a) if getattr(a, "mine", False) else (a.side, getattr(a, "area", None))
     value_filter(where, params, "t.kind", a.kind, KINDS, "--kind", unset=False)
     value_filter(where, params, "t.priority", a.pri, PRIORITIES, "--pri", upper=True, unset=False)
-    value_filter(where, params, "t.side", a.side, SIDES, "--side")
+    side_filter(where, params, sides)
+    time_filters(a, where, params)
     for tag in clean_tags(a.tag):
         where.append("EXISTS (SELECT 1 FROM json_each(t.tags) WHERE value = ?)")
         params.append(tag)
@@ -1275,7 +1453,7 @@ def build_filters(ctx, where, params):
         params.append(normalize_id(a.parent))
     value_filter(where, params, "t.requested_by", getattr(a, "requested_by", None), REQUESTERS, "--requested-by")
     value_filter(where, params, "t.audience", getattr(a, "audience", None), AUDIENCES, "--audience")
-    area_filter(ctx.conn, where, params, getattr(a, "area", None), ctx.scope())
+    area_filter(ctx.conn, where, params, areas, ctx.scope())
     if a.search:
         task_ids, comment_ids = search_hits(ctx.conn, a.search)
         tasks = hit_table(ctx.conn, "hit_tasks", task_ids)
@@ -1294,25 +1472,162 @@ def hit_table(conn, name, ids):
     return f"(SELECT id FROM temp.{name})"
 
 
-SQL_AUDIENCE_RANK = (
-    "CASE t.audience " + " ".join(f"WHEN '{name}' THEN {n}" for n, name in enumerate(AUDIENCES))
-    + f" ELSE {len(AUDIENCES)} END"
-)
-SQL_IMPACT = (
-    "CASE WHEN t.requested_by IN ('manager', 'stakeholder') THEN 0 ELSE 1 END, "
-    f"CASE WHEN t.kind = 'bug' THEN 0 ELSE 1 END, {SQL_AUDIENCE_RANK}, {SQL_ORDER}"
-)
-SQL_OLDEST = "t.created_at, CAST(substr(t.id, instr(t.id, '-') + 1) AS INTEGER)"
-SQL_LANE = "CASE t.status WHEN 'ready' THEN 0 WHEN 'backlog' THEN 1 ELSE 2 END"
+# ------------------------------------------------------------------ ranking
 
 
-def sort_order(name, lanes=False):
+def weights_key(project):
+    return f"weights:{project}"
+
+
+def saved_weights(conn, project):
+    """The weights a project changed with qtask config set, as {name: value}."""
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (weights_key(project),)).fetchone()
+    if not row:
+        return {}
+    with contextlib.suppress(ValueError, TypeError):
+        data = json.loads(row["value"])
+        return {k: v for k, v in data.items() if k in DEFAULT_WEIGHTS and isinstance(v, (int, float))}
+    return {}
+
+
+def project_weights(conn, project):
+    return {**DEFAULT_WEIGHTS, **saved_weights(conn, project)}
+
+
+def plural(n, word):
+    return f"{n:g} {word}{'' if n == 1 else 's'}"
+
+
+def own_points(task, w, day, at):
+    """The task's own inputs as (reason, points), in the order of the scoring table."""
+    out = []
+    asked = task.get("requested_by")
+    if asked in ("manager", "stakeholder"):
+        out.append((f"{asked} request", w[asked]))
+    if task["kind"] == "bug":
+        out.append(("bug", w["bug"]))
+    out.append((task["priority"], w[task["priority"]]))
+    audience = task.get("audience")
+    out.append((f"for {audience}", w[audience]) if audience else ("no audience", w["audience_none"]))
+    due = task.get("due")
+    if due and task["status"] not in CLOSED:
+        with contextlib.suppress(ValueError):
+            days = (datetime.strptime(due, "%Y-%m-%d").date() - day).days
+            if days < 0:
+                out.append((f"overdue {plural(-days, 'day')}", w["overdue"]))
+            elif days <= int(w["due_soon_days"]):
+                out.append(("due today" if days == 0 else "due tomorrow" if days == 1 else f"due in {days} days",
+                            w["due_soon"]))
+            elif days <= 7:
+                out.append((f"due in {days} days", w["due_week"]))
+    with contextlib.suppress(ValueError, TypeError):
+        weeks = (at - parse_iso(task["created_at"])).days // 7
+        if weeks > 0 and w["age_per_week"]:
+            out.append((f"waiting {plural(weeks, 'week')}", min(w["age_max"], weeks * w["age_per_week"])))
+    return out
+
+
+def rank_group(task):
+    """0 planned, 1 backlog: free to claim. 2 a parent with open parts. 3 held (claimed, blocked, in progress, parked). 4 closed."""
+    if task["status"] in CLOSED:
+        return 4
+    if task["status"] in LANES and task["lock"] == "free":
+        return 0 if task["status"] == "ready" else 1
+    if task["status"] in LANES and task["lock"] == "has_subtasks":
+        return 2
+    return 3
+
+
+def show_points(points):
+    return f"{points:+g}" if points else "+0"
+
+
+def rank_tasks(conn, tasks):
     """
-    ORDER BY text. impact: manager and stakeholder requests, then bugs, then audience (students
-    first), then priority, then oldest. oldest: creation time. priority: priority, then oldest.
+    Give each task score, reasons, rank_group and why: the important order's inputs. The score
+    sums the points of the task's own inputs, plus points for each open task it blocks (each, plus
+    a share of that task's own score, capped). Weights come from the task's project.
     """
-    order = {"impact": SQL_IMPACT, "oldest": SQL_OLDEST, "priority": SQL_ORDER}[choice(name, SORTS, "--sort")]
-    return f"{SQL_LANE}, {order}" if lanes else order
+    if not tasks:
+        return tasks
+    cache = {}
+    day, at = today(), utc_now()
+    blocks = {}
+    for row in conn.execute(
+        "SELECT l.from_id, b.id, b.kind, b.priority, b.audience, b.requested_by, b.due, b.status, b.created_at "
+        f"FROM links l JOIN tasks b ON b.id = l.to_id WHERE l.type = 'blocks' AND b.status NOT IN {SQL_CLOSED}"
+    ):
+        blocks.setdefault(row["from_id"], []).append({k: row[k] for k in row.keys()})
+    for task in tasks:
+        if task["project"] not in cache:
+            cache[task["project"]] = project_weights(conn, task["project"])
+        w = cache[task["project"]]
+        points = own_points(task, w, day, at)
+        targets = blocks.get(task["id"]) if task["status"] not in CLOSED else None
+        if targets:
+            extra = sum(w["blocks_each"] + w["blocks_share"] * sum(p for _, p in own_points(b, w, day, at))
+                        for b in targets)
+            ids = sorted((b["id"] for b in targets), key=id_key)
+            points.append((f"blocks {', '.join(ids)}", round(min(w["blocks_max"], extra))))
+        score = round(sum(p for _, p in points), 1)
+        task["score"] = int(score) if score == int(score) else score
+        task["rank_group"] = rank_group(task)
+        shown = [(r, p) for r, p in points if p or r == task["priority"]]
+        shown.sort(key=lambda rp: -rp[1])
+        task["reasons"] = [{"reason": r, "points": p} for r, p in shown]
+        group = RANK_GROUPS[task["rank_group"]]
+        state = {"parent": task["lock_reason"], "held": task["lock_reason"] if task["lock"] != "free" else task["status"],
+                 "closed": task["status"]}.get(group, group)
+        task["why"] = ", ".join([*(f"{r} {show_points(p)}" for r, p in shown), state]) + f"; score {task['score']}"
+    return tasks
+
+
+def id_key(task_id):
+    prefix, _, number = task_id.partition("-")
+    return (prefix, int(number) if number.isdigit() else 0)
+
+
+REQUESTER_RANK = {"manager": 0, "stakeholder": 0}
+AUDIENCE_RANK = {name: n for n, name in enumerate(AUDIENCES)}
+PRIORITY_RANK = {name: n for n, name in enumerate(PRIORITIES)}
+LANE_RANK = {"ready": 0, "backlog": 1}
+
+
+def order_tasks(conn, tasks, name=None, lanes=False, reverse=False):
+    """
+    Sort tasks in place and return them. important (default): free planned work, free backlog,
+    parents, held, closed; inside each, the highest score, then the oldest. impact: the team hub's
+    order (manager and stakeholder requests, bugs, audience, priority, oldest). lanes: planned
+    before backlog under every sort, as ready does.
+    """
+    name = choice(name or DEFAULT_SORT, SORTS, "--sort")
+    rank_tasks(conn, tasks)
+
+    def tie(t):
+        return (t["created_at"], id_key(t["id"]))
+
+    keys = {
+        "important": lambda t: (t["rank_group"], -t["score"], *tie(t)),
+        "impact": lambda t: (
+            REQUESTER_RANK.get(t.get("requested_by"), 1), 0 if t["kind"] == "bug" else 1,
+            AUDIENCE_RANK.get(t.get("audience"), len(AUDIENCES)), PRIORITY_RANK[t["priority"]], *tie(t),
+        ),
+        "priority": lambda t: (PRIORITY_RANK[t["priority"]], *tie(t)),
+        "oldest": tie,
+        "due": lambda t: (t.get("due") is None, t.get("due") or "", t["rank_group"], -t["score"], *tie(t)),
+        "id": lambda t: id_key(t["id"]),
+    }
+    if name == "newest":
+        tasks.sort(key=tie, reverse=True)
+    elif name == "updated":
+        tasks.sort(key=lambda t: (t["updated_at"], id_key(t["id"])), reverse=True)
+    else:
+        tasks.sort(key=keys[name])
+    if lanes and name != "important":
+        tasks.sort(key=lambda t: LANE_RANK.get(t["status"], 2))
+    if reverse:
+        tasks.reverse()
+    return tasks
 
 
 def select_tasks(ctx, where, params, order=SQL_ORDER):
@@ -1335,6 +1650,8 @@ def task_line(task):
         parts.append(f"[for {task['audience']}]")
     if task.get("area"):
         parts.append(f"[area {task['area']}]")
+    if task.get("due") and task["status"] not in CLOSED:
+        parts.append(f"[{'overdue' if task['due'] < today().isoformat() else 'due'} {task['due']}]")
     if task["claim_valid"]:
         parts.append(f"[claimed by {task['claimed_by']}]")
     elif task["claimed_by"]:
@@ -1731,6 +2048,8 @@ def field_flags(a):
         out["next_step"] = text_or_null(a.next)
     if getattr(a, "summary", None) is not None:
         out["summary"] = text_or_null(a.summary)
+    if getattr(a, "due", None) is not None:
+        out["due"] = parse_day_ahead(a.due, "--due") if a.due.strip() else None
     return out
 
 
@@ -1994,6 +2313,9 @@ def cmd_facets(ctx):
     claimable = {t["id"] for t in select_tasks(ctx, claim_where, claim_params)}
     for task in tasks:
         task["lane"] = lane_of(task)
+        if not task["side"] and task.get("part_sides"):
+            # A parent with no side of its own counts under the sides of its open parts, such as fe+be.
+            task["side"] = "+".join(task["part_sides"])
     facets = {}
     for key, order in FACETS:
         counts = count_by(tasks, key, order or ())
@@ -2022,12 +2344,31 @@ def cmd_ls(ctx):
     elif not a.include_closed and not a.deployed:
         # A deployed task is often done already, so --deployed lists closed tasks too.
         where.append(f"t.status NOT IN {SQL_CLOSED}")
-    every = select_tasks(ctx, where, params, sort_order(a.sort or "priority"))
+    every = order_tasks(ctx.conn, select_tasks(ctx, where, params), a.sort, reverse=a.reverse)
     page = Page(ctx, len(every))
     tasks = page.rows(every)
-    data = {"tasks": shape_tasks(ctx, tasks), "count": len(tasks), "total": len(every), "page": page.info()}
-    lines = [row_line(ctx, t) for t in tasks] or (["No tasks."] if not every else [])
+    extra = explain_fields(ctx)
+    data = {"tasks": shape_tasks(ctx, tasks, extra), "count": len(tasks), "total": len(every), "page": page.info(),
+            "sort": sort_name(a.sort)}
+    lines = [line for t in tasks for line in explained(ctx, t, row_line(ctx, t, extra=extra))]
+    lines = lines or (["No tasks."] if not every else [])
     return data, page.wrap(lines)
+
+
+def sort_name(raw):
+    return choice(raw or DEFAULT_SORT, SORTS, "--sort")
+
+
+def explain_fields(ctx):
+    """With --explain, list rows carry score, why and reasons."""
+    return ("score", "why", "reasons") if getattr(ctx.args, "explain", False) else ()
+
+
+def explained(ctx, task, line):
+    """The row line, plus an indented line of the reasons with --explain."""
+    if not getattr(ctx.args, "explain", False):
+        return [line]
+    return [line, f"    why: {task['why']}"]
 
 
 def stale_claims(ctx, project):
@@ -2080,9 +2421,7 @@ def cmd_ready(ctx):
         raise usage_error("Pass --planned or --backlog, not both. Without either, ready lists both.")
     lanes = ("ready",) if a.planned else ("backlog",) if a.backlog else ("ready", "backlog")
     where, params = ready_where(ctx, lanes)
-    every = [task_dict(r) for r in ctx.conn.execute(
-        f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order(a.sort or 'impact', lanes=True)}", params
-    ).fetchall()]
+    every = order_tasks(ctx.conn, select_tasks(ctx, where, params), a.sort, lanes=True, reverse=a.reverse)
     for task in every:
         task["lane"] = lane_of(task)
     page = Page(ctx, len(every))
@@ -2093,9 +2432,11 @@ def cmd_ready(ctx):
         "by_side": count_by(every, "side", SIDES),
         "by_priority": count_by(every, "priority", PRIORITIES),
     }
+    extra = explain_fields(ctx)
     lines = [
-        row_line(ctx, t, f"{t['lane']:<8} {task_line(t)}" + (f" [{t['lock_reason']}]" if t["lock"] != "free" else ""))
-        for t in tasks
+        line for t in tasks for line in explained(ctx, t, row_line(
+            ctx, t, f"{t['lane']:<8} {task_line(t)}" + (f" [{t['lock_reason']}]" if t["lock"] != "free" else ""), extra,
+        ))
     ]
     if not every:
         lines = ["No ready tasks."]
@@ -2110,8 +2451,8 @@ def cmd_ready(ctx):
     if stale:
         tail.append(f"Expired claims you can take over with claim: {', '.join(stale)}")
     data = {
-        "tasks": shape_tasks(ctx, tasks), "count": len(tasks), "total": len(every), "page": page.info(),
-        "counts": footer, "stale_claims": stale, "auto_released": ctx.auto_released,
+        "tasks": shape_tasks(ctx, tasks, extra), "count": len(tasks), "total": len(every), "page": page.info(),
+        "counts": footer, "stale_claims": stale, "auto_released": ctx.auto_released, "sort": sort_name(a.sort),
     }
     return data, page.wrap(lines, tail)
 
@@ -2164,6 +2505,8 @@ def cmd_show(ctx):
         if task[key]:
             value = ", ".join(task[key]) if key == "tags" else task[key]
             lines.append(f"{label}: {value}")
+    if task["due"]:
+        lines.append(f"Due: {task['due']} ({due_text(task['due'])})")
     if task["deployed"] != "none":
         lines.append(f"Deployed: {task['deployed']}")
     if task["deploy_note"]:
@@ -2219,10 +2562,7 @@ def cmd_search(ctx):
         where = [f"t.id IN {hit_table(conn, 'hit_tasks', task_ids)}"]
         params = []
         add_scope(where, params, project)
-        rows = conn.execute(
-            f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params
-        ).fetchall()
-        tasks = [task_dict(r) for r in rows]
+        tasks = order_tasks(conn, select_tasks(ctx, where, params), ctx.args.sort, reverse=ctx.args.reverse)
     if comment_ids:
         where = [f"c.id IN {hit_table(conn, 'hit_comments', comment_ids)}"]
         params = []
@@ -2246,14 +2586,15 @@ def cmd_search(ctx):
             body, cut = snippet(comment["body"], text)
             comment = {**comment, "body": body, **({"body_cut": True} if cut else {})}
         comments.append(comment)
-    lines = [row_line(ctx, t) for t in tasks]
+    extra = explain_fields(ctx)
+    lines = [line for t in tasks for line in explained(ctx, t, row_line(ctx, t, extra=extra))]
     for comment in comments:
         lines += fenced_comment_lines(comment, ctx.agent, "") if ctx.args.expand else [comment_line(comment)]
     if not page.total:
         lines = ["No matches."]
     data = {
-        "query": text, "tasks": shape_tasks(ctx, tasks), "comments": comments, "count": len(hits),
-        "total": page.total, "page": page.info(),
+        "query": text, "tasks": shape_tasks(ctx, tasks, extra), "comments": comments, "count": len(hits),
+        "total": page.total, "page": page.info(), "sort": sort_name(ctx.args.sort),
     }
     return data, page.wrap(lines)
 
@@ -2863,11 +3204,19 @@ def cmd_report(ctx):
         )
     ]
     parked = parked_without_reason(ctx, project)
+    week = (today() + timedelta(days=7)).isoformat()
+    due_soon = [
+        task_dict(r) for r in conn.execute(
+            f"{TASK_SELECT} {open_clause} AND t.due IS NOT NULL AND t.due <= ? ORDER BY t.due, {SQL_ORDER}",
+            [*params, week],
+        )
+    ]
     breakdown = report_breakdown(ctx, project, ctx.args.by) if ctx.args.by else None
     # Sections in the order the developer acts on them: (name, JSON key, heading, rows).
     sections = [
         ("waiting", "waiting_on_developer", "Waiting on the developer",
          [("comment", c) for c in questions] + [("task", t) for t in waiting]),
+        ("due", "due_soon", "Overdue or due within 7 days", [("due", t) for t in due_soon]),
         ("blocked", "blocked", "Blocked", [("task", t) for t in blocked]),
         ("parked", "parked_no_reason", "Parked with no recorded reason (set one with --waiting-on)",
          [("parked", p) for p in parked]),
@@ -2909,6 +3258,7 @@ def cmd_report(ctx):
         "task": task_line,
         "idle": lambda t: f"{task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]",
         "parked": lambda p: f"{p['task_id']}: {one_line(p['title'], 100)}",
+        "due": lambda t: f"{due_text(t['due'])}: {task_line(t)}",
     }
     for name, key, heading, rows in sections:
         shown = rows if cap is None else rows[:cap]
@@ -2917,7 +3267,7 @@ def cmd_report(ctx):
             more = rerun_command(ctx, drop=("--full",), drop_values=("--section", "--by"), add=["--section", name])
         data["sections"][name] = {"key": key, "total": len(rows), "shown": len(shown), "more": more}
         tasks = [shape_task(ctx, item, ("claim_active_at",) if kind == "idle" else ()) for kind, item in shown
-                 if kind in ("task", "idle")]
+                 if kind in ("task", "idle", "due")]
         if name == "waiting":
             data[key] = {"questions": [cut_comment(ctx, c) for kind, c in shown if kind == "comment"], "tasks": tasks}
         else:
@@ -4142,6 +4492,8 @@ def brief_text(data, budget=BRIEF_BYTES, max_chars=None, reader=None):
         facts.append(f"From: {task['requested_by']}" + (f" ({who})" if who else ""))
     if task["audience"]:
         facts.append(f"For: {task['audience']}")
+    if task.get("due"):
+        facts.append(f"Due: {task['due']} ({due_text(task['due'])})")
     if facts:
         lines.append(". ".join(facts) + ".")
     if task["claim_valid"]:
@@ -4250,14 +4602,9 @@ def cmd_next(ctx):
     limit = ctx.args.limit or 1
     if not 1 <= limit <= 10:
         raise usage_error("next --limit takes 1 to 10. For a longer list use qtask ready.")
-    rows = conn.execute(
-        f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sort_order('impact', lanes=True)} LIMIT ?",
-        [*params, limit],
-    ).fetchall()
-    picks = [task_dict(r) for r in rows]
+    picks = order_tasks(conn, select_tasks(ctx, where, params))[:limit]
     for n, task in enumerate(picks):
-        task["why"] = why_first(task)
-        label = "Top ready task by impact" if n == 0 else f"Next candidate {n + 1}"
+        label = "Top ready task" if n == 0 else f"Next candidate {n + 1}"
         step = {
             "what": "ready", "task_id": task["id"], "text": f"{label}: {task_line(task)}", "why": task["why"],
             "commands": [f"qtask brief {task['id']}", f"qtask claim {task['id']}"],
@@ -4280,8 +4627,8 @@ def cmd_next(ctx):
     if not top:
         lines.append("No ready task. See qtask decisions for what waits on people.")
     data = {
-        "for": me, "steps": steps, "next_task": shape_task(ctx, top, ("why",)) if top else None,
-        "candidates": shape_tasks(ctx, picks, ("why",)),
+        "for": me, "steps": steps, "next_task": shape_task(ctx, top, ("why", "score", "reasons")) if top else None,
+        "candidates": shape_tasks(ctx, picks, ("why", "score", "reasons")),
     }
     return data, "\n".join(lines)
 
@@ -4297,28 +4644,16 @@ def next_where(ctx, project):
     params = [now()]
     add_scope(where, params, project)
     sides = a.side if a.side is not None else os.environ.get("QTASK_SIDES", "")
-    value_filter(where, params, "t.side", sides, SIDES, "--side")
+    areas = a.area if a.area is not None else os.environ.get("QTASK_AREAS", "").strip() or None
+    side_filter(where, params, sides)
     value_filter(where, params, "t.kind", a.kind, KINDS, "--kind", unset=False)
     value_filter(where, params, "t.priority", a.pri, PRIORITIES, "--pri", upper=True, unset=False)
-    if a.area:
-        if project is None and any(v.strip().lower() != UNSET for v in a.area.split(",") if v.strip()):
+    time_filters(a, where, params)
+    if areas:
+        if project is None and any(v.strip().lower() != UNSET for v in areas.split(",") if v.strip()):
             raise usage_error("--area needs one project. Pass --project, not --all.")
-        area_filter(ctx.conn, where, params, a.area, project)
+        area_filter(ctx.conn, where, params, areas, project)
     return where, params
-
-
-def why_first(task):
-    """The impact sort's reasons for this task, in its order."""
-    reasons = []
-    if task.get("requested_by") in ("manager", "stakeholder"):
-        reasons.append(f"{task['requested_by']} request")
-    if task["kind"] == "bug":
-        reasons.append("bug")
-    if task.get("audience"):
-        reasons.append(f"for {task['audience']}")
-    reasons.append(task["priority"])
-    reasons.append("planned" if task["status"] == "ready" else "backlog")
-    return ", ".join(reasons)
 
 
 # ------------------------------------------------------------ hand-off pack
@@ -5107,6 +5442,193 @@ def cmd_hub(ctx):
     return data, "\n".join(lines)
 
 
+# ---------------------------------------------------------- weights, views
+
+
+def weight_value(name, raw):
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        raise usage_error(f"config set {name} takes a number. Got {raw!r}.")
+    if name in ("due_soon_days", "age_max", "blocks_max", "blocks_share", "age_per_week") and value < 0:
+        raise usage_error(f"{name} cannot be below 0.")
+    if name == "due_soon_days" and (value != int(value) or value > 7):
+        raise usage_error("due_soon_days takes a whole number of days, 0 to 7.")
+    return int(value) if value == int(value) else value
+
+
+def cmd_config(ctx):
+    """The weights of the important order for one project: list, set NAME VALUE, unset NAME, reset."""
+    a = ctx.args
+    if a.all:
+        raise usage_error("config works on one project. Pass --project, not --all.")
+    project = ctx.project()
+    saved = saved_weights(ctx.conn, project)
+    if a.action in ("set", "unset"):
+        if a.name not in DEFAULT_WEIGHTS:
+            raise usage_error(
+                f"config {a.action} takes a weight name: {', '.join(DEFAULT_WEIGHTS)}. Got {a.name!r}.", "unknown_weight",
+            )
+        if a.action == "set":
+            if a.value is None:
+                raise usage_error(f"config set {a.name} needs a value, such as qtask config set {a.name} 20.")
+            saved[a.name] = weight_value(a.name, a.value)
+        else:
+            saved.pop(a.name, None)
+    elif a.action == "reset":
+        saved = {}
+    elif a.name or a.value:
+        raise usage_error("config ls takes no name. Use config set NAME VALUE or config unset NAME.")
+    if a.action in ("set", "unset", "reset"):
+        with write_tx(ctx) as conn:
+            if saved:
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (weights_key(project), json.dumps(saved, sort_keys=True)),
+                )
+            else:
+                conn.execute("DELETE FROM meta WHERE key = ?", (weights_key(project),))
+    rows = [
+        {"name": n, "value": saved.get(n, d), "default": d, "changed": n in saved, "what": what} for n, d, what in WEIGHTS
+    ]
+    lines = [f"Weights of the important order for {project}. Change one: qtask config set NAME VALUE; undo: qtask config unset NAME."]
+    for r in rows:
+        changed = f"  (default {r['default']:g})" if r["changed"] else ""
+        lines.append(f"  {r['name']:<14} {r['value']:>6g}  {r['what']}{changed}")
+    return {"project": project, "weights": rows}, "\n".join(lines)
+
+
+# Global flags a view run passes on, as (dest, takes a value). They are not saved in a view.
+GLOBAL_FLAGS = {
+    "--json": ("json", False), "--all": ("all", False), "--compact": ("compact", False),
+    "--full-json": ("full_json", False), "--raw-json": ("full_json", False),
+    "--project": ("project", True), "--agent": ("agent", True), "--max-chars": ("max_chars", True),
+}
+VIEW_REFUSED = ("--page", "--offset", "--all-pages")
+
+
+def pull_globals(args, words):
+    """Take the global flags out of a view's words and set them on args, so --json after the name works."""
+    rest, it = [], iter(words)
+    for word in it:
+        flag, eq, value = word.partition("=")
+        if flag not in GLOBAL_FLAGS:
+            rest.append(word)
+            continue
+        dest, takes = GLOBAL_FLAGS[flag]
+        if not takes:
+            setattr(args, dest, True)
+            continue
+        value = value if eq else next(it, None)
+        if value is None:
+            raise usage_error(f"{flag} needs a value.")
+        if dest == "max_chars":
+            try:
+                value = positive_int(flag)(value)
+            except argparse.ArgumentTypeError as exc:
+                raise usage_error(str(exc)) from None
+        setattr(args, dest, value)
+    return rest
+
+
+def view_line(view):
+    return " ".join(["qtask", view["command"], *(shell_word(w) for w in view["args"])])
+
+
+def view_rows(conn, project):
+    where, params = [], []
+    add_scope(where, params, project, "v.project")
+    rows = conn.execute(
+        f"SELECT v.* FROM views v WHERE {' AND '.join(where) or '1'} ORDER BY v.project, v.name", params
+    ).fetchall()
+    out = []
+    for r in rows:
+        view = {k: r[k] for k in r.keys()}
+        view["args"] = json.loads(view["args"])
+        view["line"] = view_line(view)
+        out.append(view)
+    return out
+
+
+def clean_view_name(raw):
+    name = (raw or "").strip().lower()
+    if not VIEW_RE.fullmatch(name) or name in VIEW_ACTIONS:
+        raise usage_error(
+            f"A view name is letters, digits, dot, dash or underscore, up to 40, and not {', '.join(VIEW_ACTIONS)}. "
+            f"Got {raw!r}.",
+            "bad_view_name",
+        )
+    return name
+
+
+def cmd_view(ctx):
+    """
+    Saved views. 'view' or 'view ls' lists them; 'view save NAME [ls|ready|search|facets|next] FLAGS'
+    saves one; 'view rm NAME' deletes one; 'view NAME [FLAGS]' runs one, with FLAGS added.
+    """
+    a = ctx.args
+    action = (a.action or "ls").strip()
+    words = list(a.rest or [])
+    if action == "ls":
+        if a.name or words:
+            raise usage_error("view ls takes no name. Run a view with qtask view NAME.")
+        views = view_rows(ctx.conn, ctx.scope())
+        lines = [f"{v['name']}: {v['line']}" + (f"  ({v['project']})" if ctx.args.all else "")
+                 for v in views] or ["No saved views. Save one: qtask view save NAME ready --side be --kind bug"]
+        return {"views": views, "count": len(views)}, "\n".join(lines)
+    if a.all:
+        raise usage_error(f"view {action} works on one project. Pass --project, not --all.")
+    project = ctx.project()
+    if action == "save":
+        name = clean_view_name(a.name)
+        command = words.pop(0) if words and words[0] in VIEW_COMMANDS else "ls"
+        refused_flags = [w for w in words if w.split("=", 1)[0] in VIEW_REFUSED]
+        if refused_flags:
+            raise usage_error(
+                f"A view keeps filters and the sort, not {refused_flags[0]}. Pass it when you run the view: "
+                f"qtask view {name} --page 2."
+            )
+        build_parser().parse_args([command, *words])  # Exits 2 with the usual message on a bad flag.
+        at = now()
+        with write_tx(ctx) as conn:
+            ensure_project(conn, project)
+            old = conn.execute("SELECT 1 FROM views WHERE project = ? AND name = ?", (project, name)).fetchone()
+            conn.execute(
+                "INSERT INTO views(project, name, command, args, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project, name) DO UPDATE SET "
+                "command = excluded.command, args = excluded.args, updated_at = excluded.updated_at",
+                (project, name, command, json.dumps(words, ensure_ascii=False), ctx.agent, at, at),
+            )
+        view = next(v for v in view_rows(ctx.conn, project) if v["name"] == name)
+        verb = "Replaced" if old else "Saved"
+        return {"view": view, "replaced": bool(old)}, f"{verb} view {name}: {view['line']}\nRun it: qtask view {name}"
+    if action == "rm":
+        name = clean_view_name(a.name)
+        if words:
+            raise usage_error("view rm takes one name.")
+        with write_tx(ctx) as conn:
+            gone = conn.execute("DELETE FROM views WHERE project = ? AND name = ?", (project, name)).rowcount
+        if not gone:
+            raise QtaskError("view_not_found", f"No view {name} in {project}. See qtask view ls.", EXIT_NOT_FOUND)
+        return {"removed": name}, f"Removed view {name}."
+    name = clean_view_name(action)
+    view = next((v for v in view_rows(ctx.conn, project) if v["name"] == name), None)
+    if view is None:
+        raise QtaskError("view_not_found", f"No view {name} in {project}. See qtask view ls.", EXIT_NOT_FOUND)
+    extra = [a.name, *words] if a.name else words
+    inner = build_parser().parse_args([view["command"], *view["args"], *extra])
+    for dest, _ in GLOBAL_FLAGS.values():
+        setattr(inner, dest, getattr(a, dest))
+    inner.project = project
+    inner.argv = a.argv
+    load_inputs(inner)
+    ctx.args = inner
+    data, text = inner.func(ctx)
+    return {"view": view["name"], "line": view["line"], **data}, text
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         if "--json" in sys.argv[1:]:
@@ -5154,8 +5676,9 @@ def positive_int(flag):
 
 def add_paging(parser, fields=True):
     parser.add_argument(
-        "--limit", type=int, metavar="N",
-        help=f"rows per page, 1 to {PAGE_MAX}; default QTASK_LIMIT, else {PAGE_DEFAULT} (QTASK_LIMIT=0: every row)",
+        "--limit", "--top", dest="limit", type=int, metavar="N",
+        help=f"rows per page, 1 to {PAGE_MAX}; default QTASK_LIMIT, else {PAGE_DEFAULT} (QTASK_LIMIT=0: every row). "
+        "--top 5 prints the first 5",
     )
     parser.add_argument("--page", type=int, metavar="N", help="page number, from 1")
     parser.add_argument("--offset", type=int, metavar="N", help="skip N rows, in place of --page")
@@ -5181,6 +5704,18 @@ def add_filter_flags(parser, statuses=True):
     parser.add_argument(
         "--area", help="comma list of areas, each with the areas below it; none = no area, such as --area none"
     )
+    parser.add_argument(
+        "--mine", action="store_true",
+        help="your sides from QTASK_SIDES and your areas from QTASK_AREAS; --side or --area given wins",
+    )
+    parser.add_argument("--created-since", metavar="WHEN", help="made on or after WHEN: 2026-11-01, 7d, 24h or 2w ago")
+    parser.add_argument("--created-before", metavar="WHEN", help="made before WHEN: 2026-11-01, 7d, 24h or 2w ago")
+    parser.add_argument("--updated-since", metavar="WHEN", help="any activity since WHEN: 2026-11-01, 7d, 24h or 2w ago")
+    parser.add_argument("--stale", metavar="DAYS", help="no activity for DAYS days (14), or 36h, 2w")
+    parser.add_argument(
+        "--due-before", metavar="DATE", help="due on or before DATE: 2026-11-25, or days ahead such as 7d or +3d",
+    )
+    parser.add_argument("--overdue", action="store_true", help="open tasks whose due date has passed")
     if not statuses:
         return
     parser.add_argument(
@@ -5191,10 +5726,19 @@ def add_filter_flags(parser, statuses=True):
     )
 
 
-def add_filters(parser, default_sort, statuses=True):
+def add_sort_flags(parser):
+    parser.add_argument(
+        "--sort",
+        help=f"{', '.join(SORTS)}; default {DEFAULT_SORT} (score order, see qtask config). impact is the hub's order",
+    )
+    parser.add_argument("--reverse", action="store_true", help="flip the order")
+    parser.add_argument("--explain", action="store_true", help="print each row's score and the reasons for it")
+
+
+def add_filters(parser, statuses=True):
     add_filter_flags(parser, statuses)
     add_paging(parser)
-    parser.add_argument("--sort", help=f"{', '.join(SORTS)}; default {default_sort}")
+    add_sort_flags(parser)
 
 
 def add_field_flags(parser, on_set=False):
@@ -5212,6 +5756,10 @@ def add_field_flags(parser, on_set=False):
     )
     parser.add_argument("--waiting-note", metavar="TEXT", help="what the task waits for")
     parser.add_argument("--next", metavar="TEXT", help="the next step, shown by brief and prompt")
+    parser.add_argument(
+        "--due", metavar="DATE",
+        help="due date: YYYY-MM-DD, or days from today such as +3d or 2w" + ("; \"\" clears it" if on_set else ""),
+    )
     if on_set:
         parser.add_argument("--summary", metavar="TEXT", help="where the work stands; a handback comment sets it too")
 
@@ -5261,17 +5809,18 @@ def build_parser():
     p.add_argument("--no-similar", action="store_true", help="skip the similar check, such as for a bulk import")
     add_field_flags(p)
 
-    p = command("ls", cmd_ls, "List tasks. Hides done and dropped unless asked.")
-    add_filters(p, "priority")
+    p = command("ls", cmd_ls, "List tasks, most important first. Hides done and dropped unless asked.")
+    add_filters(p)
     p.add_argument(
         "--deployed", help=f"{', '.join(DEPLOY_STATES)}; lists closed tasks too unless --status is given"
     )
 
     p = command(
         "ready", cmd_ready,
-        "List tasks an agent can claim now: the planned lane (status ready), then the backlog, by impact.",
+        "List tasks an agent can claim now, most important first: the planned lane (status ready), then the "
+        "backlog, then parents with open parts.",
     )
-    add_filters(p, "impact", statuses=False)
+    add_filters(p, statuses=False)
     lanes = p.add_mutually_exclusive_group()
     lanes.add_argument("--planned", action="store_true", help="only status ready")
     lanes.add_argument("--backlog", action="store_true", help="only status backlog")
@@ -5292,6 +5841,7 @@ def build_parser():
     p.add_argument("text", help="words to find in titles, bodies and comments")
     p.add_argument("--expand", action="store_true", help="print each matching comment whole")
     add_paging(p)
+    add_sort_flags(p)
 
     p = command(
         "claim", cmd_claim,
@@ -5393,7 +5943,7 @@ def build_parser():
     p.add_argument("--by", help="add open counts by area or requester")
     p.add_argument(
         "--section", metavar="NAME",
-        help="print one section whole: waiting, blocked, parked, idle, stale, unclaimed, checklists, staging, parents",
+        help="print one section whole: waiting, due, blocked, parked, idle, stale, unclaimed, checklists, staging, parents",
     )
     p.add_argument("--full", action="store_true", help="print every row of every section")
 
@@ -5542,7 +6092,9 @@ def build_parser():
     p.add_argument("--kind", help="comma list of kinds, such as bug,feature")
     p.add_argument("--pri", "--priority", dest="pri", help="comma list of priorities, such as P0,P1")
     p.add_argument("--area", help="comma list of areas, each with the areas below it; none = no area")
-    p.add_argument("--limit", type=int, metavar="N", help="how many ready candidates to list, 1 to 10, default 1")
+    p.add_argument(
+        "--limit", "--top", dest="limit", type=int, metavar="N", help="how many ready candidates to list, 1 to 10, default 1",
+    )
 
     p = command(
         "prompt", cmd_prompt,
@@ -5622,6 +6174,27 @@ def build_parser():
 
     p = command("template", cmd_template, "Print the body template of a kind.")
     p.add_argument("kind", help=", ".join(TEMPLATES))
+
+    p = command(
+        "config", cmd_config,
+        "The weights of the important order for this project. 'config' lists them; 'config set NAME VALUE' "
+        "changes one; 'config unset NAME' puts back the default; 'config reset' puts back every default.",
+    )
+    p.add_argument("action", nargs="?", choices=("ls", "set", "unset", "reset"), default="ls", help="ls (default), set, unset or reset")
+    p.add_argument("name", nargs="?", help="a weight name, such as manager, bug, P0, students, overdue")
+    p.add_argument("value", nargs="?", help="for set: a number; negative lowers the score")
+
+    p = command(
+        "view", cmd_view,
+        "Saved lists. 'view save NAME [ls|ready|search|facets|next] FLAGS' saves a command with its filters "
+        "and sort; 'view NAME [FLAGS]' runs it; 'view ls' lists them; 'view rm NAME' deletes one.",
+    )
+    p.add_argument("action", nargs="?", default="ls", help="ls (default), save, rm, or the name of a view to run")
+    p.add_argument("name", nargs="?", help="for save and rm: the view name")
+    p.add_argument(
+        "rest", nargs=argparse.REMAINDER, metavar="FLAGS",
+        help="for save: the command (default ls) and its flags; for a run: flags to add, such as --page 2",
+    )
     return parser
 
 
@@ -5680,6 +6253,11 @@ def main(argv=None):
         os.umask(0o077)  # Tasks, plans and backups are private: only this user may read them.
     args = build_parser().parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
+    if args.command == "view":
+        try:
+            args.rest = pull_globals(args, args.rest or [])
+        except QtaskError as exc:
+            return fail(args, exc.code, exc.message, exc.exit_code, exc.extra)
     args.agent = (args.agent or os.environ.get("QTASK_AGENT") or UNKNOWN_AGENT).strip() or UNKNOWN_AGENT
     try:
         load_inputs(args)
