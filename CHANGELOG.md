@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+Show the right task first, and filter and keep lists by time, number and field.
+
+- **One order for `next`, `ready`, `ls` and `search`: `important`.** Free planned work comes first, then the backlog, then parents with open parts, then held tasks (claimed, blocked, in progress, in review, parked), then closed ones. Inside each group the highest score comes first, then the oldest task. The score adds points: P0 60, P1 30, P2 10, P3 0; manager request 50, stakeholder 40; bug 25; students 12, teachers 9, parents 7, managers 5, admins 3, team -3; for each open task it blocks 5 plus a quarter of that task's own score, at most 40; overdue 40, due within 2 days 25, due within 7 days 10; 1 a week of age, at most 10.
+- `next` prints the reasons with their points: `why first: P0 +60, bug +25, for students +12, planned; score 97`. `ls --explain`, `ready --explain` and `search --explain` print the same line under each row. JSON rows add `score`, `why` and `reasons`. **Change:** the `why` text now carries points and the score, and `next` says `Top ready task` without `by impact`.
+- `qtask config` lists the weights; `config set NAME VALUE`, `config unset NAME` and `config reset` change them for one project. They live in the `meta` table.
+- `--sort important|impact|priority|oldest|newest|updated|due|id` and `--reverse` on `ls`, `ready` and `search`. `impact` keeps the team hub's order of 0.4 to 0.6. JSON lists add `sort`. **Change:** `ls`, `ready` and `search` default to `important`; `ls` sorted by priority before, `ready` by impact, `search` by priority. `--sort priority` and `--sort impact` give the old orders.
+- Time filters on `ls`, `ready` and `facets`: `--created-since`, `--created-before`, `--updated-since` take `2026-11-01` or a time ago (`7d`, `24h`, `2w`); `--stale 14` lists tasks with no activity for 14 days; `--due-before 7d` and `--overdue` use the due date.
+- `--top N` is `--limit N` on every list and on `next`.
+- Saved views: `view save NAME [ls|ready|search|facets|next] FLAGS`, `view NAME [FLAGS]`, `view ls`, `view rm NAME`. The `more:` line of a view repeats `qtask view NAME`.
+- Due dates: `--due YYYY-MM-DD`, `+3d`, `2w` or `today` on `add` and `set` (`""` clears). `show` and `brief` print `Due: 2026-11-25 (in 5 days)`, list rows print `[due ...]` or `[overdue ...]`, and `report` has a `due` section: overdue or due within 7 days.
+- `--mine` on `ls`, `ready` and `facets` uses `QTASK_SIDES` and the new `QTASK_AREAS`; without either it exits 2 with `mine_unset`. `next` reads `QTASK_AREAS` as its default `--area`, as it reads `QTASK_SIDES`.
+- `--side be` also matches a parent with no side of its own whose open parts include be, and `--side none` leaves out a parent whose parts have a side. `facets` counts such a parent as `fe+be`. Task rows carry `part_sides`.
+- Schema 11 adds the `due` column and the `views` table. It only adds.
+
 ## 0.6.1 (unreleased)
 
 Organise tasks by side and area.
