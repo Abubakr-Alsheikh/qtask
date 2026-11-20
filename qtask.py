@@ -34,6 +34,10 @@ Environment:
   QTASK_HUB_URL    hub base URL, such as https://hub.example.com/api, when --hub-url is
                    absent. Else the project's URL from qtask hub set-url.
   QTASK_HUB_TOKEN  hub API token. Else the file ~/.qhub/token. qtask never prints or stores it.
+  QTASK_CONFIG  the global settings file, an absolute path, default config.toml in QTASK_HOME
+  QTASK_CFG_<NAME>  one setting, such as QTASK_CFG_SORT=newest or QTASK_CFG_WEIGHT_BUG=40. Settings
+                    come in layers, the later wins: defaults, the global file, the project, these
+                    variables, flags. qtask config lists them.
 """
 
 from __future__ import annotations
@@ -57,7 +61,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -114,7 +118,8 @@ WEIGHTS = (
     ("overdue", 40, "the due date has passed"),
     ("due_soon", 25, "due within due_soon_days"),
     ("due_soon_days", 2, "days ahead that count as due soon (0 = today only)"),
-    ("due_week", 10, "due within 7 days, past due_soon_days"),
+    ("due_week", 10, "due within due_week_days, past due_soon_days"),
+    ("due_week_days", 7, "days ahead that count for due_week and for the due section of report"),
     ("age_per_week", 1, "each full week since the task was made"),
     ("age_max", 10, "most points age can add"),
 )
@@ -681,6 +686,26 @@ def widen_checks(conn, changes):
         conn.execute("PRAGMA writable_schema = OFF")
 
 
+def relax_checks(conn, table, changes):
+    """Swap CHECK texts in a table's stored CREATE TABLE text, as widen_checks does. changes: (old, new)."""
+    version = conn.execute("PRAGMA schema_version").fetchone()[0]
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()[0]
+    for old, new in changes:
+        if sql.count(old) != 1:
+            raise QtaskError(
+                "schema_unexpected",
+                f"The {table} table does not look the way qtask made it, so qtask left it alone. "
+                "Restore a backup or report this.",
+            )
+        sql = sql.replace(old, new)
+    conn.execute("PRAGMA writable_schema = ON")
+    try:
+        conn.execute("UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?", (sql, table))
+        conn.execute(f"PRAGMA schema_version = {version + 1}")
+    finally:
+        conn.execute("PRAGMA writable_schema = OFF")
+
+
 MANAGER_TAG_RE = re.compile(r"^manager-list(?:-(\d{2})(\d{2}))?", re.IGNORECASE)
 
 
@@ -777,9 +802,22 @@ def migrate_11(conn):
     )
 
 
+def migrate_12(conn):
+    """
+    Sides, kinds and priorities come from the settings (qtask config vocab), so the table checks
+    take any short name in place of the built-in lists. Rows stay as they are. Like widen_checks,
+    this only relaxes a constraint.
+    """
+    relax_checks(conn, "tasks", [
+        (f"kind IN {KINDS!r}", "length(kind) BETWEEN 1 AND 30"),
+        (f"priority IN {PRIORITIES!r}", "length(priority) BETWEEN 1 AND 30"),
+        (f"side IS NULL OR side IN {SIDES!r}", "side IS NULL OR length(side) BETWEEN 1 AND 30"),
+    ])
+
+
 MIGRATIONS = {
     1: migrate_1, 2: migrate_2, 3: migrate_3, 4: migrate_4, 5: migrate_5, 6: migrate_6, 7: migrate_7,
-    8: migrate_8, 9: migrate_9, 10: migrate_10, 11: migrate_11,
+    8: migrate_8, 9: migrate_9, 10: migrate_10, 11: migrate_11, 12: migrate_12,
 }
 
 
@@ -866,6 +904,32 @@ class Ctx:
         self.sent = False  # A request changed the hub, so running the command again would repeat it.
         self.auto_released = []
         self.warnings = []
+        self._cfg = None
+        global CURRENT
+        CURRENT = self
+
+    @property
+    def cfg(self):
+        """The settings of the command's project: --project, else the repo, else the global layers only."""
+        if self._cfg is None:
+            self._cfg = settings_for(self.conn, self.cfg_project())
+        return self._cfg
+
+    def cfg_project(self):
+        if getattr(self.args, "all", False):
+            return None
+        if getattr(self.args, "project", None):
+            return canonical_project(self.conn, self.args.project)
+        try:
+            detected = detect_project()
+        except QtaskError:
+            return None
+        return canonical_project(self.conn, detected) if detected else None
+
+    def use_project(self, project):
+        """Read the settings of this project from now on, such as the project of the task a command changes."""
+        self._cfg = settings_for(self.conn, project)
+        return self._cfg
 
     def project(self):
         """Project from --project or cwd. Raises outside a repo."""
@@ -1070,7 +1134,8 @@ def task_dict(row):
     data["todo_progress"] = f"{data['todos_done']}/{data['todos_total']}" if data.get("todos_total") else None
     if "part_sides" in data:
         found = set((data["part_sides"] or "").split(",")) - {""}
-        data["part_sides"] = [s for s in SIDES if s in found]
+        order = cfg().rank("side")
+        data["part_sides"] = sorted(found, key=lambda s: (order.get(s, len(order)), s))
     data["lock"], data["lock_reason"] = lock_of(data)
     return data
 
@@ -1229,6 +1294,10 @@ def load_inputs(args):
         args.message_text = read_text_file(args.message_file)
     if getattr(args, "scope_file", None) is not None:
         args.scope = read_text_file(args.scope_file)
+    if getattr(args, "template_file", None) is not None:
+        if args.template is not None:
+            raise both_texts_error("Pass --template or --template-file")
+        args.template = read_text_file(args.template_file)
 
 
 def assert_parent_allowed(conn, parent_row, task_id=None):
@@ -1259,10 +1328,35 @@ def add_scope(where, params, project, column="t.project"):
         params.append(project)
 
 
-def value_filter(where, params, column, raw, allowed, flag, upper=False, unset=True):
+class FilterValues:
+    """
+    The values a filter flag takes: the vocabulary's values, retired ones too, and any other value a
+    task still holds, so a value someone removed from the settings stays easy to find.
+    """
+
+    def __init__(self, conn, vocab, column):
+        self.conn, self.vocab, self.column = conn, vocab, column
+        self.names = cfg().names(vocab, active=False)
+        self.extra = None
+
+    def find(self, value):
+        wanted = value.casefold()
+        found = next((n for n in self.names if n.casefold() == wanted), None)
+        if found is None and self.conn is not None:
+            if self.extra is None:
+                field = self.column.split(".")[-1]
+                self.extra = [r[0] for r in self.conn.execute(
+                    f"SELECT DISTINCT {field} FROM tasks WHERE {field} IS NOT NULL ORDER BY 1"
+                ) if r[0] not in self.names]
+            found = next((n for n in self.extra if n.casefold() == wanted), None)
+        return found
+
+
+def value_filter(where, params, column, raw, allowed, flag, unset=True):
     """
     One filter flag as a comma list, such as --side be,fe. With unset, the value none matches
     tasks where the field is empty, such as --side none or --audience students,none.
+    allowed: a FilterValues, or a tuple of fixed values.
     """
     picked, empty = [], False
     for value in (raw or "").split(","):
@@ -1272,10 +1366,13 @@ def value_filter(where, params, column, raw, allowed, flag, upper=False, unset=T
         if unset and value.lower() == UNSET:
             empty = True
             continue
-        name = value.upper() if upper else value.lower()
-        if name not in allowed:
+        if isinstance(allowed, FilterValues):
+            name, names = allowed.find(value), allowed.names
+        else:
+            name, names = (value.lower() if value.lower() in allowed else None), allowed
+        if name is None:
             extra = f", or {UNSET} for unset" if unset else ""
-            raise usage_error(f"{flag} takes a comma list of {', '.join(allowed)}{extra}. Got {value!r}.")
+            raise usage_error(f"{flag} takes a comma list of {', '.join(names)}{extra}. Got {value!r}.")
         if name not in picked:
             picked.append(name)
     parts = []
@@ -1308,23 +1405,27 @@ def area_filter(conn, where, params, raw, project):
         where.append(f"({' OR '.join(parts)})")
 
 
-def side_filter(where, params, raw):
+def side_filter(conn, where, params, raw):
     """
     --side as a comma list. A parent with no side of its own matches a side when one of its open
     parts has it, so a full-stack parent with a be part shows under --side be. none: no side here and none on an open part.
     """
     picked, empty = [], False
+    sides = FilterValues(conn, "side", "t.side")
     for value in (raw or "").split(","):
-        value = value.strip().lower()
+        value = value.strip()
         if not value:
             continue
-        if value == UNSET:
+        if value.lower() == UNSET:
             empty = True
             continue
-        if value not in SIDES:
-            raise usage_error(f"--side takes a comma list of {', '.join(SIDES)}, or {UNSET} for unset. Got {value!r}.")
-        if value not in picked:
-            picked.append(value)
+        name = sides.find(value)
+        if name is None:
+            raise usage_error(
+                f"--side takes a comma list of {', '.join(sides.names)}, or {UNSET} for unset. Got {value!r}."
+            )
+        if name not in picked:
+            picked.append(name)
     open_part = f"SELECT 1 FROM tasks c WHERE c.parent_id = t.id AND c.status NOT IN {SQL_CLOSED}"
     parts = []
     if picked:
@@ -1435,9 +1536,10 @@ def build_filters(ctx, where, params):
     a = ctx.args
     add_scope(where, params, ctx.scope())
     sides, areas = mine_filters(a) if getattr(a, "mine", False) else (a.side, getattr(a, "area", None))
-    value_filter(where, params, "t.kind", a.kind, KINDS, "--kind", unset=False)
-    value_filter(where, params, "t.priority", a.pri, PRIORITIES, "--pri", upper=True, unset=False)
-    side_filter(where, params, sides)
+    conn = ctx.conn
+    value_filter(where, params, "t.kind", a.kind, FilterValues(conn, "kind", "t.kind"), "--kind", unset=False)
+    value_filter(where, params, "t.priority", a.pri, FilterValues(conn, "priority", "t.priority"), "--pri", unset=False)
+    side_filter(conn, where, params, sides)
     time_filters(a, where, params)
     for tag in clean_tags(a.tag):
         where.append("EXISTS (SELECT 1 FROM json_each(t.tags) WHERE value = ?)")
@@ -1451,8 +1553,10 @@ def build_filters(ctx, where, params):
     if a.parent:
         where.append("t.parent_id = ?")
         params.append(normalize_id(a.parent))
-    value_filter(where, params, "t.requested_by", getattr(a, "requested_by", None), REQUESTERS, "--requested-by")
-    value_filter(where, params, "t.audience", getattr(a, "audience", None), AUDIENCES, "--audience")
+    value_filter(where, params, "t.requested_by", getattr(a, "requested_by", None),
+                 FilterValues(conn, "requested_by", "t.requested_by"), "--requested-by")
+    value_filter(where, params, "t.audience", getattr(a, "audience", None), FilterValues(conn, "audience", "t.audience"),
+                 "--audience")
     area_filter(ctx.conn, where, params, areas, ctx.scope())
     if a.search:
         task_ids, comment_ids = search_hits(ctx.conn, a.search)
@@ -1484,31 +1588,33 @@ def saved_weights(conn, project):
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (weights_key(project),)).fetchone()
     if not row:
         return {}
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, AttributeError):
         data = json.loads(row["value"])
-        return {k: v for k, v in data.items() if k in DEFAULT_WEIGHTS and isinstance(v, (int, float))}
+        # Names of values a project added (qtask config vocab priority add P4 --weight -5) count too.
+        return {k: v for k, v in data.items() if isinstance(k, str) and VALUE_RE.fullmatch(k)
+                and isinstance(v, (int, float)) and not isinstance(v, bool)}
     return {}
 
 
 def project_weights(conn, project):
-    return {**DEFAULT_WEIGHTS, **saved_weights(conn, project)}
+    return settings_for(conn, project).weights
 
 
 def plural(n, word):
     return f"{n:g} {word}{'' if n == 1 else 's'}"
 
 
-def own_points(task, w, day, at):
-    """The task's own inputs as (reason, points), in the order of the scoring table."""
-    out = []
+def own_points(task, s, day, at):
+    """The task's own inputs as (reason, points), in the order of the scoring table. s: the project's Settings."""
+    out, w = [], s.weights
     asked = task.get("requested_by")
-    if asked in ("manager", "stakeholder"):
-        out.append((f"{asked} request", w[asked]))
-    if task["kind"] == "bug":
-        out.append(("bug", w["bug"]))
-    out.append((task["priority"], w[task["priority"]]))
+    if asked and s.value_weight(asked):
+        out.append((f"{asked} request", s.value_weight(asked)))
+    if s.value_weight(task["kind"]):
+        out.append((task["kind"], s.value_weight(task["kind"])))
+    out.append((task["priority"], s.value_weight(task["priority"])))
     audience = task.get("audience")
-    out.append((f"for {audience}", w[audience]) if audience else ("no audience", w["audience_none"]))
+    out.append((f"for {audience}", s.value_weight(audience)) if audience else ("no audience", w["audience_none"]))
     due = task.get("due")
     if due and task["status"] not in CLOSED:
         with contextlib.suppress(ValueError):
@@ -1518,7 +1624,7 @@ def own_points(task, w, day, at):
             elif days <= int(w["due_soon_days"]):
                 out.append(("due today" if days == 0 else "due tomorrow" if days == 1 else f"due in {days} days",
                             w["due_soon"]))
-            elif days <= 7:
+            elif days <= int(w["due_week_days"]):
                 out.append((f"due in {days} days", w["due_week"]))
     with contextlib.suppress(ValueError, TypeError):
         weeks = (at - parse_iso(task["created_at"])).days // 7
@@ -1560,12 +1666,13 @@ def rank_tasks(conn, tasks):
         blocks.setdefault(row["from_id"], []).append({k: row[k] for k in row.keys()})
     for task in tasks:
         if task["project"] not in cache:
-            cache[task["project"]] = project_weights(conn, task["project"])
-        w = cache[task["project"]]
-        points = own_points(task, w, day, at)
+            cache[task["project"]] = settings_for(conn, task["project"])
+        s = cache[task["project"]]
+        w = s.weights
+        points = own_points(task, s, day, at)
         targets = blocks.get(task["id"]) if task["status"] not in CLOSED else None
         if targets:
-            extra = sum(w["blocks_each"] + w["blocks_share"] * sum(p for _, p in own_points(b, w, day, at))
+            extra = sum(w["blocks_each"] + w["blocks_share"] * sum(p for _, p in own_points(b, s, day, at))
                         for b in targets)
             ids = sorted((b["id"] for b in targets), key=id_key)
             points.append((f"blocks {', '.join(ids)}", round(min(w["blocks_max"], extra))))
@@ -1587,10 +1694,20 @@ def id_key(task_id):
     return (prefix, int(number) if number.isdigit() else 0)
 
 
-REQUESTER_RANK = {"manager": 0, "stakeholder": 0}
-AUDIENCE_RANK = {name: n for n, name in enumerate(AUDIENCES)}
-PRIORITY_RANK = {name: n for n, name in enumerate(PRIORITIES)}
 LANE_RANK = {"ready": 0, "backlog": 1}
+
+
+def sql_order():
+    """The SQL order of task lists: priority in the configured order, then age, then number."""
+    names = cfg().names("priority", active=False)
+    if list(names) == sorted(names):
+        return SQL_ORDER
+    cases = " ".join(f"WHEN {sql_text(n)} THEN {i}" for i, n in enumerate(names))
+    return f"CASE t.priority {cases} ELSE {len(names)} END, " + SQL_ORDER
+
+
+def sql_text(value):
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def order_tasks(conn, tasks, name=None, lanes=False, reverse=False):
@@ -1600,8 +1717,21 @@ def order_tasks(conn, tasks, name=None, lanes=False, reverse=False):
     order (manager and stakeholder requests, bugs, audience, priority, oldest). lanes: planned
     before backlog under every sort, as ready does.
     """
-    name = choice(name or DEFAULT_SORT, SORTS, "--sort")
+    name = sort_name(name)
     rank_tasks(conn, tasks)
+    ranks = {}
+
+    def rank(t, vocab):
+        """The place of the task's value in its project's list; values the list lacks go last."""
+        if t["project"] not in ranks:
+            s = settings_for(conn, t["project"])
+            ranks[t["project"]] = {v: s.rank(v) for v in ("priority", "audience")}, s
+        order = ranks[t["project"]][0][vocab]
+        return order.get(t.get(vocab), len(order))
+
+    def asked(t):
+        rank(t, "priority")
+        return 0 if ranks[t["project"]][1].value_weight(t.get("requested_by")) > 0 else 1
 
     def tie(t):
         return (t["created_at"], id_key(t["id"]))
@@ -1609,10 +1739,9 @@ def order_tasks(conn, tasks, name=None, lanes=False, reverse=False):
     keys = {
         "important": lambda t: (t["rank_group"], -t["score"], *tie(t)),
         "impact": lambda t: (
-            REQUESTER_RANK.get(t.get("requested_by"), 1), 0 if t["kind"] == "bug" else 1,
-            AUDIENCE_RANK.get(t.get("audience"), len(AUDIENCES)), PRIORITY_RANK[t["priority"]], *tie(t),
+            asked(t), 0 if t["kind"] == "bug" else 1, rank(t, "audience"), rank(t, "priority"), *tie(t),
         ),
-        "priority": lambda t: (PRIORITY_RANK[t["priority"]], *tie(t)),
+        "priority": lambda t: (rank(t, "priority"), *tie(t)),
         "oldest": tie,
         "due": lambda t: (t.get("due") is None, t.get("due") or "", t["rank_group"], -t["score"], *tie(t)),
         "id": lambda t: id_key(t["id"]),
@@ -1630,8 +1759,8 @@ def order_tasks(conn, tasks, name=None, lanes=False, reverse=False):
     return tasks
 
 
-def select_tasks(ctx, where, params, order=SQL_ORDER):
-    sql = f"{TASK_SELECT} WHERE {' AND '.join(where) if where else '1'} ORDER BY {order}"
+def select_tasks(ctx, where, params, order=None):
+    sql = f"{TASK_SELECT} WHERE {' AND '.join(where) if where else '1'} ORDER BY {order or sql_order()}"
     return [task_dict(r) for r in ctx.conn.execute(sql, params).fetchall()]
 
 
@@ -1698,20 +1827,16 @@ def rerun_command(ctx, drop=(), drop_values=(), add=()):
 
 
 def page_limit(ctx):
-    """Rows per page: --limit, else QTASK_LIMIT, else 20. None means every row."""
+    """Rows per page: --limit, else the limit setting (QTASK_LIMIT, project, global, 20). None means every row."""
     a = ctx.args
     if getattr(a, "all_pages", False):
         return None
     if getattr(a, "limit", None) is not None:
-        if not 1 <= a.limit <= PAGE_MAX:
-            raise usage_error(f"--limit takes 1 to {PAGE_MAX}. For more rows use --page or --all-pages.")
+        most = ctx.cfg.get("max_limit")
+        if not 1 <= a.limit <= most:
+            raise usage_error(f"--limit takes 1 to {most}. For more rows use --page or --all-pages.")
         return a.limit
-    raw = os.environ.get("QTASK_LIMIT", "").strip()
-    if not raw:
-        return PAGE_DEFAULT
-    if not raw.isdigit() or int(raw) > PAGE_MAX:
-        raise usage_error(f"QTASK_LIMIT takes 0 (no limit) to {PAGE_MAX}. Got {raw!r}.")
-    return int(raw) or None
+    return ctx.cfg.get("limit") or None
 
 
 class Page:
@@ -1842,7 +1967,7 @@ def row_line(ctx, task, default=None, extra=()):
 
 def cut_text(ctx, text):
     """Cut free text to --max-chars and say so. Text stays whole without the flag."""
-    limit = getattr(ctx.args, "max_chars", None)
+    limit = max_chars(ctx)
     if limit is None or text is None or len(text) <= limit:
         return text
     return text[:limit].rstrip() + f" [... {len(text) - limit} more chars cut by --max-chars]"
@@ -1852,7 +1977,7 @@ def cut_comment(ctx, comment):
     return {**comment, "body": cut_text(ctx, comment["body"])}
 
 
-def snippet(text, query, limit=SNIPPET_CHARS):
+def snippet(text, query, limit):
     """About `limit` characters of `text` around the first word of `query` it holds, on one line."""
     flat = " ".join((text or "").split())
     if len(flat) <= limit:
@@ -2025,21 +2150,23 @@ def clean_day(value, flag):
 
 
 def optional_choice(value, allowed, flag):
-    """An empty value clears the field."""
-    return choice(value, allowed, flag) if value.strip() else None
+    """An empty value clears the field. allowed: a fixed tuple, or the name of a vocabulary."""
+    if not value.strip():
+        return None
+    return cfg().pick(allowed, value, flag) if allowed in VOCABS else choice(value, allowed, flag)
 
 
 def field_flags(a):
     """The request, audience, waiting and hand-off fields passed on add or set. Empty clears."""
     out = {}
     if a.requested_by is not None:
-        out["requested_by"] = optional_choice(a.requested_by, REQUESTERS, "--requested-by")
+        out["requested_by"] = optional_choice(a.requested_by, "requested_by", "--requested-by")
     if a.requester is not None:
         out["requested_name"] = text_or_null(a.requester)
     if a.requested_on is not None:
         out["requested_on"] = clean_day(a.requested_on, "--requested-on") if a.requested_on.strip() else None
     if a.audience is not None:
-        out["audience"] = optional_choice(a.audience, AUDIENCES, "--audience")
+        out["audience"] = optional_choice(a.audience, "audience", "--audience")
     if a.waiting_on is not None:
         out["waiting_on"] = optional_choice(a.waiting_on, WAITING_ON, "--waiting-on")
     if a.waiting_note is not None:
@@ -2073,19 +2200,28 @@ def check_parked(conn, task_id, status, waiting_on):
 
 
 def missing_sections(body, sections):
-    found = {m.group(1).lower() for m in re.finditer(r"(?im)^\s*#*\s*([A-Za-z ]+?)\s*:", body or "")}
-    return [s for s in sections if s.lower() not in found]
+    found = {m.group(1).casefold() for m in re.finditer(r"(?im)^\s*#*\s*([^\W\d_](?:[^\W\d_]| )*?)\s*:", body or "")}
+    return [s for s in sections if s.casefold() not in found]
 
 
-def check_template(kind, body):
-    if kind != "bug":
+def and_list(items):
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def check_template(kind, body, settings=None):
+    """A kind with required headings (bug: Steps, Expected, Actual) needs a line for each in the body."""
+    entry = (settings or cfg()).entry("kind", kind)
+    required = entry.get("required") if entry else None
+    if not required:
         return
-    missing = missing_sections(body, BUG_SECTIONS)
+    missing = missing_sections(body, required)
     if missing:
+        article = "an" if kind[:1].lower() in "aeiou" else "a"
         raise usage_error(
-            f"A bug needs Steps:, Expected: and Actual: lines in its body. Missing: {', '.join(missing)}. "
-            "Print the template with qtask template bug, fill it, and pass it with --body-file.",
-            "bug_template",
+            f"{article.capitalize()} {kind} needs {and_list([h + ':' for h in required])} lines in its body. "
+            f"Missing: {', '.join(missing)}. "
+            f"Print the template with qtask template {kind}, fill it, and pass it with --body-file.",
+            "bug_template" if kind == "bug" else "kind_template",
         )
 
 
@@ -2102,14 +2238,15 @@ STOP_WORDS = {
 
 def stem(word):
     """A crude English stem: crashes, crash -> crash; translate, translation -> translat."""
-    for suffix in STEM_SUFFIXES:
+    for suffix in cfg().get("stem_suffixes"):
         if word.endswith(suffix) and len(word) - len(suffix) >= 3:
             return word[: -len(suffix)]
     return word
 
 
 def title_words(text):
-    return {stem(w) for w in re.findall(r"\w+", (text or "").casefold()) if len(w) > 1 and w not in STOP_WORDS}
+    stop = cfg().stop_set
+    return {stem(w) for w in re.findall(r"\w+", (text or "").casefold()) if len(w) > 1 and w not in stop}
 
 
 def similar_score(words, body_words, area, row):
@@ -2146,10 +2283,11 @@ def suggest_areas(conn, project, title, body=None, skip=None):
     body_words = title_words(body) - words
     if not words:
         return []
+    s = cfg()
     scores, likes = {}, {}
     for row in conn.execute("SELECT name, note FROM areas WHERE project = ?", (project,)):
         label = title_words(f"{row['name'].replace('-', ' ')} {row['note'] or ''}")
-        score = len(words & label) + AREA_BODY_WEIGHT * len(body_words & label)
+        score = len(words & label) + s.get("area_body_weight") * len(body_words & label)
         if score:
             scores[row["name"]] = score
     for row in conn.execute(
@@ -2158,15 +2296,15 @@ def suggest_areas(conn, project, title, body=None, skip=None):
         if row["id"] == skip:
             continue
         share = len(words & title_words(row["title"])) / len(words)
-        if share >= AREA_HINT_TASK:
+        if share >= s.get("area_hint_task"):
             scores[row["area"]] = scores.get(row["area"], 0.0) + share
             likes[row["area"]] = likes.get(row["area"], 0) + 1
     found = [
         {"area": name, "score": round(score, 2), "like_tasks": likes.get(name, 0)}
-        for name, score in scores.items() if score >= AREA_HINT_MIN
+        for name, score in scores.items() if score >= s.get("area_hint_min")
     ]
     found.sort(key=lambda f: (-f["score"], f["area"]))
-    return found[:AREA_HINTS]
+    return found[:s.get("area_hints")]
 
 
 def area_hint_text(hints, task_id):
@@ -2187,10 +2325,592 @@ def similar_tasks(conn, project, title, skip=None, limit=5, body=None, area=None
         if row["id"] == skip:
             continue
         score = similar_score(words, body_words, area, row)
-        if score >= SHOW_SCORE:
+        if score >= cfg().get("similar_min"):
             found.append({"id": row["id"], "title": row["title"], "status": row["status"], "score": score})
     found.sort(key=lambda f: (-f["score"], f["id"]))
     return found[:limit]
+
+
+# ------------------------------------------------------------------- settings
+#
+# One model for every choice a team may change. Five layers, the later wins: the built-in
+# defaults, the global file (QTASK_CONFIG, else config.toml in QTASK_HOME), the project (the meta
+# key config:<project>, and weights:<project> for the weights), QTASK_CFG_* variables, then flags.
+
+CONFIG_FORMAT = 1
+CONFIG_KEYS = ("qtask", "settings", "weights", "vocab")
+CONFIG_FILE = "config.toml"
+ENV_PREFIX = "QTASK_CFG_"
+VOCABS = ("side", "kind", "priority", "audience", "requested_by")
+WEIGHTED_VOCABS = ("kind", "priority", "audience", "requested_by")
+BUILTIN_VOCAB = {"side": SIDES, "kind": KINDS, "priority": PRIORITIES, "audience": AUDIENCES, "requested_by": REQUESTERS}
+VOCAB_FLAGS = {"side": "--side", "kind": "--kind", "priority": "--pri", "audience": "--audience",
+               "requested_by": "--requested-by"}
+VOCAB_ATTRS = {
+    "side": ("label", "retired", "hub"),
+    "kind": ("label", "retired", "hub", "template", "required"),
+    "priority": ("label", "retired", "hub"),
+    "audience": ("label", "retired"),
+    "requested_by": ("label", "retired"),
+}
+VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,29}")
+HEADING_RE = re.compile(r"[^\W\d_]+(?: [^\W\d_]+)*")
+LABEL_MAX = 60
+# Weights that score something other than a value of a vocabulary.
+PLAIN_WEIGHTS = (
+    "audience_none", "blocks_each", "blocks_share", "blocks_max", "overdue", "due_soon", "due_soon_days",
+    "due_week", "due_week_days", "age_per_week", "age_max",
+)
+# (name, default, type, low, high, what). Types: int, float, sort, kind, priority, words.
+SETTINGS = (
+    ("limit", PAGE_DEFAULT, "int", 0, 1000, "rows per page of a list when --limit is absent; 0 prints every row"),
+    ("max_limit", PAGE_MAX, "int", 1, 1000, "the highest --limit a list takes"),
+    ("sort", DEFAULT_SORT, "sort", None, None, "the order of ls, ready and search when --sort is absent"),
+    ("default_kind", "task", "kind", None, None, "the kind of a new task when --kind is absent"),
+    ("default_priority", "P2", "priority", None, None, "the priority of a new task when --pri is absent"),
+    ("lease_hours", DEFAULT_TTL_HOURS, "float", 0.01, MAX_TTL_HOURS, "claim lease when --ttl-hours is absent"),
+    ("idle_hours", IDLE_HOURS, "float", 0.01, MAX_TTL_HOURS, "hours with no activity before report and next call a claim idle"),
+    ("wip_limit", WIP_LIMIT, "int", 1, 100, "claims an agent may hold before claim warns"),
+    ("max_chars", 0, "int", 0, 1000000, "--max-chars when the flag is absent; 0 keeps texts whole"),
+    ("snippet_chars", SNIPPET_CHARS, "int", 40, 10000, "characters of a search hit or a report comment"),
+    ("show_comments", SHOW_COMMENTS, "int", 1, 1000, "comments that show prints without --full"),
+    ("report_rows", REPORT_ROWS, "int", 1, 1000, "rows per report section without --full"),
+    ("brief_bytes", BRIEF_BYTES, "int", 256, 1000000, "the size budget of brief, prompt and export"),
+    ("duplicate_score", DUPLICATE_SCORE, "int", 1, 101, "add refuses a title that scores this or more; 101 turns it off"),
+    ("warn_score", WARN_SCORE, "int", 1, 101, "add warns about a likely duplicate from this score"),
+    ("similar_min", SHOW_SCORE, "int", 1, 100, "the lowest score that similar and add print"),
+    ("duplicate_words", GATE_WORDS, "int", 1, 50, "title words a new task needs before add refuses a duplicate"),
+    ("area_hints", AREA_HINTS, "int", 1, 50, "areas that add and area suggest print"),
+    ("area_hint_min", AREA_HINT_MIN, "float", 0, 1000, "the lowest score of an area hint"),
+    ("area_hint_task", AREA_HINT_TASK, "float", 0, 1, "share of title words a task in an area must hold to count"),
+    ("area_body_weight", AREA_BODY_WEIGHT, "float", 0, 100, "points of a body word found in an area's name or note"),
+    ("stop_words", tuple(sorted(STOP_WORDS)), "words", 0, 2000, "words that similar and area hints skip"),
+    ("stem_suffixes", STEM_SUFFIXES, "words", 0, 200, "endings cut from words before they are compared, in order"),
+)
+SETTING_SPECS = {spec[0]: spec for spec in SETTINGS}
+PRESETS = {
+    "default": ("the built-in lists and numbers; changes nothing", {}),
+    "software": (
+        "a product team: audiences users, admins and team; no content side",
+        {"vocab": {
+            "audience": {"values": {
+                "users": {"added": True}, "students": {"retired": True}, "teachers": {"retired": True},
+                "parents": {"retired": True}, "managers": {"retired": True},
+            }, "order": ["users", "admins", "team"]},
+            "side": {"values": {"content": {"retired": True}}},
+        }, "weights": {"users": 12}},
+    ),
+    "solo": (
+        "one developer with agents: no manager or stakeholder requests, no audiences, smaller pages",
+        {"settings": {"limit": 10, "report_rows": 3},
+         "vocab": {
+             "requested_by": {"values": {"manager": {"retired": True}, "stakeholder": {"retired": True}}},
+             "audience": {"values": {a: {"retired": True} for a in AUDIENCES if a != "team"}},
+         }},
+    ),
+}
+
+
+def config_error(where, message, fix):
+    return QtaskError("bad_config", f"{where}: {message} {fix}".strip(), EXIT_USAGE)
+
+
+def global_config_path():
+    raw = os.environ.get("QTASK_CONFIG", "").strip()
+    if raw:
+        path = Path(msys_to_windows(raw)).expanduser()
+        if not path.is_absolute():
+            raise QtaskError("bad_config", f"QTASK_CONFIG must be an absolute path. Got {raw!r}.", EXIT_USAGE)
+        return path
+    return qtask_home() / CONFIG_FILE
+
+
+def parse_config_text(text, path):
+    """A settings file: JSON when it ends in .json or starts with {, else TOML."""
+    if str(path).lower().endswith(".json") or text.lstrip().startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise QtaskError("bad_config", f"{path}: not valid JSON: {exc}. Fix the file.", EXIT_USAGE) from None
+    else:
+        import tomllib
+
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise QtaskError("bad_config", f"{path}: not valid TOML: {exc}. Fix the file.", EXIT_USAGE) from None
+    if not isinstance(data, dict):
+        raise QtaskError("bad_config", f"{path}: the file must hold a table of settings.", EXIT_USAGE)
+    return data
+
+
+def read_config_file(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        raise QtaskError("file_not_found", f"No settings file at {path}.", EXIT_NOT_FOUND) from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise QtaskError("file_error", f"Cannot read {path}: {exc}", EXIT_ERROR) from None
+    return parse_config_text(text, path)
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key, ensure_ascii=False)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    # A JSON string is a TOML basic string, but for DEL, which TOML wants escaped.
+    return json.dumps(str(value), ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def toml_dump(doc, header=()):
+    """Write a settings table as TOML: the standard library reads TOML but does not write it."""
+    lines = [f"# {line}" for line in header]
+
+    def table(path, data):
+        scalars = [(k, v) for k, v in data.items() if not isinstance(v, dict)]
+        subs = [(k, v) for k, v in data.items() if isinstance(v, dict)]
+        if path and (scalars or not subs):
+            lines.extend(["", "[" + ".".join(toml_key(p) for p in path) + "]"])
+        lines.extend(f"{toml_key(k)} = {toml_value(v)}" for k, v in scalars)
+        for k, v in subs:
+            table([*path, k], v)
+
+    table([], doc)
+    return "\n".join(lines).lstrip("\n") + "\n"
+
+
+def coerce_setting(spec, raw, where, fix):
+    """A setting's value from a file (typed) or the command line (text), checked against its spec."""
+    name, _, kind, low, high, _ = spec
+    if kind == "words":
+        items = raw.split(",") if isinstance(raw, str) else raw
+        if not isinstance(items, (list, tuple)) or not all(isinstance(w, str) for w in items):
+            raise config_error(where, f"{name} takes a list of words.", fix)
+        words = []
+        for word in (w.strip().casefold() for w in items):
+            if word and word not in words:
+                words.append(word)
+        if len(words) > high:
+            raise config_error(where, f"{name} takes {high} words at most.", fix)
+        return tuple(words)
+    if kind in ("sort", "kind", "priority"):
+        if not isinstance(raw, str) or not raw.strip():
+            raise config_error(where, f"{name} takes a name.", fix)
+        value = raw.strip()
+        if kind == "sort" and value.lower() not in SORTS:
+            raise config_error(where, f"{name} takes one of {', '.join(SORTS)}. Got {value!r}.", fix)
+        return value.lower() if kind == "sort" else value
+    if isinstance(raw, bool):
+        raise config_error(where, f"{name} takes a number. Got {raw!r}.", fix)
+    try:
+        value = float(raw) if kind == "float" else int(str(raw).strip()) if isinstance(raw, str) else raw
+    except ValueError:
+        value = None
+    if kind == "int" and isinstance(value, float) and value == int(value):
+        value = int(value)
+    good = isinstance(value, int) if kind == "int" else isinstance(value, (int, float)) and math.isfinite(value)
+    if not good or value < low or value > high:
+        number = "a whole number" if kind == "int" else "a number"
+        raise config_error(where, f"{name} takes {number} from {low:g} to {high:g}. Got {raw!r}.", fix)
+    if kind == "float" and value == int(value):
+        return int(value)
+    return value
+
+
+def check_weight(name, raw, where, fix):
+    try:
+        return weight_value(name, raw)
+    except QtaskError as exc:
+        raise config_error(where, exc.message, fix) from None
+
+
+def check_value_name(vocab, name, where, fix):
+    if not isinstance(name, str) or not VALUE_RE.fullmatch(name) or name.casefold() == UNSET:
+        raise config_error(
+            where, f"{vocab} value {name!r} is not a valid name: use 1 to 30 letters, digits, - or _, "
+            f"starting with a letter or digit, and not {UNSET}.", fix,
+        )
+    return name
+
+
+def check_attr(vocab, value, attr, raw, where, fix):
+    label = f"{vocab}.{value}.{attr}"
+    if attr == "added" or attr == "retired":
+        if isinstance(raw, str) and raw.strip().lower() in ("true", "false", "yes", "no", "1", "0"):
+            raw = raw.strip().lower() in ("true", "yes", "1")
+        if not isinstance(raw, bool):
+            raise config_error(where, f"{label} takes true or false. Got {raw!r}.", fix)
+        return raw
+    if attr == "required":
+        items = raw.split(",") if isinstance(raw, str) else raw
+        if not isinstance(items, (list, tuple)):
+            raise config_error(where, f"{label} takes a list of headings.", fix)
+        out = []
+        for item in items:
+            heading = " ".join(str(item).split())
+            if not heading:
+                continue
+            if not HEADING_RE.fullmatch(heading) or len(heading) > 40:
+                raise config_error(where, f"{label}: a heading holds letters and spaces only. Got {item!r}.", fix)
+            if heading.casefold() not in (h.casefold() for h in out):
+                out.append(heading)
+        return out
+    if not isinstance(raw, str):
+        raise config_error(where, f"{label} takes text. Got {raw!r}.", fix)
+    if attr == "template":
+        return raw.replace("\r\n", "\n")
+    text = raw.strip()
+    if attr == "label":
+        if len(text) > LABEL_MAX or "\n" in text:
+            raise config_error(where, f"{label} takes one line of {LABEL_MAX} characters at most.", fix)
+        return text
+    allowed = {"side": HUB_SIDES, "kind": HUB_KINDS, "priority": HUB_PRIORITIES}[vocab]
+    if text not in allowed:
+        raise config_error(where, f"{label} takes a hub {vocab}: {', '.join(allowed)}. Got {raw!r}.", fix)
+    return text
+
+
+def check_doc(doc, where, fix):
+    """A layer's settings, checked and in the shape Settings reads. Raises bad_config naming the key."""
+    if not isinstance(doc, dict):
+        raise config_error(where, "the settings must be a table.", fix)
+    unknown = [k for k in doc if k not in CONFIG_KEYS]
+    if unknown:
+        raise config_error(where, f"unknown key {unknown[0]!r}; the keys are {', '.join(CONFIG_KEYS)}.", fix)
+    if doc.get("qtask", CONFIG_FORMAT) != CONFIG_FORMAT:
+        raise config_error(where, f"qtask = {doc['qtask']!r}: this qtask reads settings format {CONFIG_FORMAT}.", fix)
+    out = {"settings": {}, "weights": {}, "vocab": {}}
+    settings = doc.get("settings", {})
+    weights = doc.get("weights", {})
+    vocab = doc.get("vocab", {})
+    for key, value in (("settings", settings), ("weights", weights), ("vocab", vocab)):
+        if not isinstance(value, dict):
+            raise config_error(where, f"{key} must be a table.", fix)
+    for name, raw in settings.items():
+        if name not in SETTING_SPECS:
+            raise config_error(where, f"unknown setting {name!r}. qtask config lists them.", fix)
+        out["settings"][name] = coerce_setting(SETTING_SPECS[name], raw, where, fix)
+    for name, raw in weights.items():
+        if not isinstance(name, str) or not VALUE_RE.fullmatch(name):
+            raise config_error(where, f"weight name {name!r} is not valid.", fix)
+        out["weights"][name] = check_weight(name, raw, where, fix)
+    for name, data in vocab.items():
+        if name not in VOCABS:
+            raise config_error(where, f"unknown vocabulary {name!r}; the vocabularies are {', '.join(VOCABS)}.", fix)
+        if not isinstance(data, dict) or any(k not in ("order", "values") for k in data):
+            raise config_error(where, f"vocab.{name} takes order and values.", fix)
+        entry = {}
+        if "order" in data:
+            order = data["order"].split(",") if isinstance(data["order"], str) else data["order"]
+            if not isinstance(order, (list, tuple)):
+                raise config_error(where, f"vocab.{name}.order takes a list of names.", fix)
+            entry["order"] = [check_value_name(name, str(v).strip(), where, fix) for v in order if str(v).strip()]
+        values = data.get("values", {})
+        if not isinstance(values, dict):
+            raise config_error(where, f"vocab.{name}.values must be a table.", fix)
+        entry["values"] = {}
+        for value, attrs in values.items():
+            check_value_name(name, value, where, fix)
+            if not isinstance(attrs, dict):
+                raise config_error(where, f"vocab.{name}.values.{value} must be a table.", fix)
+            known = (*VOCAB_ATTRS[name], "added")
+            bad = [a for a in attrs if a not in known]
+            if bad:
+                raise config_error(where, f"{name}.{value} has no setting {bad[0]!r}; it takes {', '.join(known)}.", fix)
+            entry["values"][value] = {a: check_attr(name, value, a, v, where, fix) for a, v in attrs.items()}
+        out["vocab"][name] = entry
+    return out
+
+
+def builtin_entry(vocab, name):
+    entry = {"name": name, "label": None, "retired": False, "builtin": True, "source": "default", "changed": []}
+    if vocab == "kind":
+        entry.update(template=TEMPLATES.get(name), required=list(BUG_SECTIONS) if name == "bug" else [],
+                     hub=name if name in HUB_KINDS else "task")
+    elif vocab == "priority":
+        entry["hub"] = HUB_PRIORITY[name]
+    elif vocab == "side":
+        entry["hub"] = "other" if name == "docs" else name
+    return entry
+
+
+def custom_entry(vocab, name, source):
+    entry = {"name": name, "label": None, "retired": False, "builtin": False, "source": source, "changed": []}
+    if vocab == "kind":
+        entry.update(template=None, required=[], hub="task")
+    elif vocab == "priority":
+        entry["hub"] = "medium"
+    elif vocab == "side":
+        entry["hub"] = "other"
+    return entry
+
+
+def kind_template(entry):
+    """The body template of a kind: its own, else one line per required heading."""
+    if entry.get("template"):
+        return entry["template"]
+    if entry.get("required"):
+        return "".join(f"{h}:\n\n" for h in entry["required"])
+    return None
+
+
+class Settings:
+    """The resolved settings of one project (or of no project): values, their sources, vocabularies."""
+
+    def __init__(self, project, layers):
+        self.project = project
+        self.layers = layers  # [(source, doc, where, fix)], lowest first
+        self.values = {spec[0]: spec[1] for spec in SETTINGS}
+        self.sources = dict.fromkeys(self.values, "default")
+        for source, doc, _, _ in layers:
+            for name, value in doc["settings"].items():
+                self.values[name], self.sources[name] = value, source
+        self.vocab = {name: self._entries(name) for name in VOCABS}
+        self.stop_set = frozenset(self.values["stop_words"])
+        self.weights = dict(DEFAULT_WEIGHTS)
+        self.weight_sources = dict.fromkeys(self.weights, "default")
+        names = {n.casefold(): n for n in self.weight_names()}
+        for source, doc, where, fix in layers:
+            for name, value in doc["weights"].items():
+                found = names.get(name.casefold())
+                if found is None:
+                    if source == "env":
+                        raise config_error(where, f"there is no weight {name!r}. qtask config lists the weights.", fix)
+                    continue  # The weight of a value that is gone: nothing to score.
+                self.weights[found], self.weight_sources[found] = value, source
+        self._check()
+
+    def _entries(self, vocab):
+        entries = {name: builtin_entry(vocab, name) for name in BUILTIN_VOCAB[vocab]}
+        folded = {name.casefold(): name for name in entries}
+        order = None
+        for source, doc, where, fix in self.layers:
+            data = doc["vocab"].get(vocab, {})
+            if "order" in data:
+                order = data["order"]
+            for value, attrs in data.get("values", {}).items():
+                name = folded.get(value.casefold())
+                if name is None:
+                    if not attrs.get("added"):
+                        continue  # A change to a value that no layer adds any more.
+                    name = value
+                    entries[name] = custom_entry(vocab, name, source)
+                    folded[name.casefold()] = name
+                elif name != value and attrs.get("added"):
+                    raise config_error(where, f"{vocab} {value} differs from {name} only in case.", fix)
+                for attr, x in attrs.items():
+                    if attr != "added":
+                        entries[name][attr] = x
+                if any(a != "added" for a in attrs) and source not in entries[name]["changed"]:
+                    entries[name]["changed"].append(source)
+        names = list(entries)
+        if order:
+            picked = []
+            for value in order:
+                name = folded.get(value.casefold())
+                if name and name not in picked:
+                    picked.append(name)
+            names = picked + [n for n in names if n not in picked]
+        return {name: entries[name] for name in names}
+
+    def _check(self):
+        for setting, vocab in (("default_kind", "kind"), ("default_priority", "priority")):
+            entry = self.entry(vocab, self.values[setting])
+            if entry is None or entry["retired"]:
+                state = "is retired" if entry else "does not exist"
+                source = self.sources[setting] if entry is None else entry["changed"][-1]
+                where, fix = self.where(source)
+                flag = " --global" if source == "global" else ""
+                raise config_error(
+                    where, f"{setting} is {self.values[setting]}, and that {vocab} {state}.",
+                    f"Set another with qtask config set {setting} NAME{flag}, or bring the {vocab} back. " + fix,
+                )
+            self.values[setting] = entry["name"]
+        if self.values["limit"] > self.values["max_limit"]:
+            if self.sources["limit"] == "env" and os.environ.get("QTASK_LIMIT", "").strip():
+                raise usage_error(
+                    f"QTASK_LIMIT takes 0 (no limit) to {self.values['max_limit']}. Got {os.environ['QTASK_LIMIT']!r}."
+                )
+            where, fix = self.where(self.sources["limit"])
+            raise config_error(
+                where, f"limit {self.values['limit']} is above max_limit {self.values['max_limit']}.",
+                "Lower limit or raise max_limit. " + fix,
+            )
+
+    def where(self, source):
+        for layer_source, _, where, fix in self.layers:
+            if layer_source == source:
+                return where, fix
+        return "settings", ""
+
+    def get(self, name):
+        return self.values[name]
+
+    def entries(self, vocab):
+        return list(self.vocab[vocab].values())
+
+    def entry(self, vocab, name):
+        if not isinstance(name, str):
+            return None
+        wanted = name.strip().casefold()
+        return next((e for n, e in self.vocab[vocab].items() if n.casefold() == wanted), None)
+
+    def names(self, vocab, active=True):
+        return [n for n, e in self.vocab[vocab].items() if not (active and e["retired"])]
+
+    def rank(self, vocab):
+        return {name: n for n, name in enumerate(self.vocab[vocab])}
+
+    def weight_names(self):
+        names = [name for name, _, _ in WEIGHTS]
+        for vocab in WEIGHTED_VOCABS:
+            names += [n for n in self.vocab[vocab] if n not in names]
+        return names
+
+    def value_weight(self, name):
+        """The points of a vocabulary value, such as P0, bug or students. 0 when it has none."""
+        if not name or name in PLAIN_WEIGHTS:
+            return 0
+        return self.weights.get(name, 0)
+
+    def pick(self, vocab, raw, flag=None):
+        """A value to write on a task: a known, active value of the vocabulary, in its own spelling."""
+        flag = flag or VOCAB_FLAGS[vocab]
+        value = raw.strip()
+        entry = self.entry(vocab, value)
+        active = ", ".join(self.names(vocab))
+        if entry is None:
+            raise usage_error(
+                f"{flag} must be one of {active}. Got {value!r}. "
+                f"To add a {vocab}: qtask config vocab {vocab} add NAME."
+            )
+        if entry["retired"]:
+            raise usage_error(
+                f"{flag} {entry['name']} is retired here. Use one of {active}, or bring it back with "
+                f"qtask config vocab {vocab} restore {entry['name']}.", "value_retired",
+            )
+        return entry["name"]
+
+    def label_of(self, vocab, name):
+        entry = self.entry(vocab, name)
+        return entry["label"] if entry else None
+
+
+@functools.lru_cache(maxsize=1)
+def builtin_settings():
+    return Settings(None, [])
+
+
+SETTINGS_CACHE = {}
+
+
+def project_config_key(project):
+    return f"config:{project}"
+
+
+def raw_global_doc():
+    path = global_config_path()
+    if not path.exists():
+        return path, {}
+    return path, read_config_file(path)
+
+
+def raw_project_doc(conn, project):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (project_config_key(project),)).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        raise config_error(
+            f"project settings of {project}", "the saved settings are not valid JSON.",
+            "Run qtask config reset to clear them.",
+        ) from None
+    return data if isinstance(data, dict) else {}
+
+
+def global_fix(path):
+    return f"Fix it in {path}, or run qtask config unset NAME --global."
+
+
+def project_fix(project):
+    return f"Run qtask config unset NAME --project {project}, or qtask config reset --project {project}."
+
+
+def env_doc():
+    """QTASK_CFG_<SETTING> and QTASK_CFG_WEIGHT_<NAME>, and QTASK_LIMIT, as a layer: (doc, where, fix)."""
+    settings, weights, names = {}, {}, []
+    limit = os.environ.get("QTASK_LIMIT", "").strip()
+    if limit:
+        if not limit.isdigit():
+            raise usage_error(f"QTASK_LIMIT takes 0 (no limit) to {PAGE_MAX}. Got {limit!r}.")
+        settings["limit"] = int(limit)
+        names.append("QTASK_LIMIT")
+    for key in sorted(os.environ):
+        if not key.upper().startswith(ENV_PREFIX):
+            continue
+        name, raw = key[len(ENV_PREFIX):].lower(), os.environ[key]
+        names.append(key)
+        fix = f"Fix or unset the variable {key}."
+        if name.startswith("weight_"):
+            weights[name[len("weight_"):]] = check_weight(name[len("weight_"):], raw, key, fix)
+        elif name in SETTING_SPECS:
+            settings[name] = coerce_setting(SETTING_SPECS[name], raw, key, fix)
+        else:
+            raise config_error(key, f"there is no setting {name!r}. qtask config lists them.", fix)
+    where = " ".join(names) or "the environment"
+    return {"settings": settings, "weights": weights, "vocab": {}}, where, "Fix or unset the variable."
+
+
+def layer_docs(conn, project, override=None):
+    """[(source, doc, where, fix)] for Settings. override: {source: raw doc} in place of the saved one."""
+    override = override or {}
+    layers = []
+    path, raw = (global_config_path(), override["global"]) if "global" in override else raw_global_doc()
+    if raw:
+        layers.append(("global", check_doc(raw, str(path), global_fix(path)), str(path), global_fix(path)))
+    if project is not None:
+        where, fix = f"project settings of {project}", project_fix(project)
+        raw = override["project"] if "project" in override else raw_project_doc(conn, project)
+        doc = check_doc(raw, where, fix)
+        weights = override.get("project_weights")
+        doc["weights"] = {**doc["weights"], **(saved_weights(conn, project) if weights is None else weights)}
+        if any(doc.values()):
+            layers.append(("project", doc, where, fix))
+    doc, where, fix = env_doc()
+    if any(doc.values()):
+        layers.append(("env", doc, where, fix))
+    return layers
+
+
+def settings_for(conn, project):
+    """The settings of a project, or of no project (the global layers) when project is None."""
+    if project not in SETTINGS_CACHE:
+        SETTINGS_CACHE[project] = Settings(project, layer_docs(conn, project))
+    return SETTINGS_CACHE[project]
+
+
+CURRENT = None  # The Ctx of the running command, so helpers read its settings.
+
+
+def cfg():
+    """The settings of the running command's project, else the built-in ones."""
+    return CURRENT.cfg if CURRENT is not None else builtin_settings()
+
+
+def max_chars(ctx):
+    """--max-chars, else the max_chars setting; None keeps texts whole."""
+    value = getattr(ctx.args, "max_chars", None)
+    if value is not None:
+        return value
+    return ctx.cfg.get("max_chars") or None
 
 
 def cmd_add(ctx):
@@ -2200,21 +2920,22 @@ def cmd_add(ctx):
     title = a.title.strip()
     if not title:
         raise usage_error("The title cannot be empty.")
-    kind = choice(a.kind, KINDS, "--kind")
-    priority = choice(a.pri, PRIORITIES, "--pri", upper=True)
-    status = open_status(a.status)
-    side = choice(a.side, SIDES, "--side") if a.side else None
-    tags = clean_tags(a.tag)
-    fields = field_flags(a)
-    check_template(kind, a.body)
-    if fields.get("requested_by") and "requested_on" not in fields:
-        fields["requested_on"] = datetime.now().strftime("%Y-%m-%d")
-    area = clean_area(a.area) if a.area else None
     parent_id = normalize_id(a.parent) if a.parent else None
     if parent_id and not a.project:
         project = get_row(ctx.conn, parent_id)["project"]
     else:
         project = ctx.project()
+    s = ctx.use_project(project)
+    kind = s.pick("kind", a.kind if a.kind is not None else s.get("default_kind"))
+    priority = s.pick("priority", a.pri if a.pri is not None else s.get("default_priority"))
+    status = open_status(a.status)
+    side = s.pick("side", a.side) if a.side else None
+    tags = clean_tags(a.tag)
+    fields = field_flags(a)
+    check_template(kind, a.body, s)
+    if fields.get("requested_by") and "requested_on" not in fields:
+        fields["requested_on"] = datetime.now().strftime("%Y-%m-%d")
+    area = clean_area(a.area) if a.area else None
     with write_tx(ctx) as conn:
         if parent_id:
             parent = get_row(conn, parent_id)
@@ -2227,9 +2948,9 @@ def cmd_add(ctx):
             require_area(conn, row["name"], area)
         task_id = f"{row['prefix']}-{row['next_n']}"
         similar = [] if a.no_similar else similar_tasks(conn, row["name"], title, body=a.body, area=area)
-        duplicate = next((t for t in similar if t["score"] >= DUPLICATE_SCORE), None)
+        duplicate = next((t for t in similar if t["score"] >= s.get("duplicate_score")), None)
         reason = (a.duplicate_reason or "").strip()
-        if duplicate and len(title_words(title)) >= GATE_WORDS and not reason:
+        if duplicate and len(title_words(title)) >= s.get("duplicate_words") and not reason:
             raise refused(
                 "duplicate_likely",
                 f"{duplicate['id']} ({duplicate['score']}/100) looks like the same work: {duplicate['title']}. "
@@ -2257,7 +2978,7 @@ def cmd_add(ctx):
             log_event(ctx, task_id, "duplicate_reason", duplicate["id"], reason, at)
     task = fetch_task(ctx.conn, task_id)
     text = f"Created {task_id}: {title}"
-    warn = [t for t in similar if t["score"] >= WARN_SCORE]
+    warn = [t for t in similar if t["score"] >= s.get("warn_score")]
     if similar:
         head = "Likely the same work, check you did not add it twice:" if warn else "Similar open tasks:"
         text += f"\n{head}\n" + "\n".join(f"  {s['score']} {s['id']} {s['status']}: {s['title']}" for s in similar)
@@ -2281,15 +3002,39 @@ def cmd_similar(ctx):
 
 
 def cmd_template(ctx):
-    kind = choice(ctx.args.kind, tuple(TEMPLATES), "kind")
-    return {"kind": kind, "template": TEMPLATES[kind]}, TEMPLATES[kind].rstrip("\n")
+    s = ctx.cfg
+    kinds = [e["name"] for e in s.entries("kind") if kind_template(e) and not e["retired"]]
+    entry = s.entry("kind", ctx.args.kind)
+    if entry is None or not kind_template(entry):
+        raise usage_error(f"kind must be one of {', '.join(kinds)}. Got {ctx.args.kind.strip()!r}.")
+    template = kind_template(entry)
+    data = {"kind": entry["name"], "template": template}
+    if entry["required"]:
+        data["required"] = entry["required"]
+    return data, template.rstrip("\n")
 
 
-FACETS = (
-    ("lane", None), ("status", STATUSES), ("priority", PRIORITIES), ("kind", KINDS), ("side", SIDES),
-    ("audience", AUDIENCES), ("requested_by", REQUESTERS), ("area", None),
-    ("lock", ("free", "claimed", "blocked", "needs_decision", "in_review", "has_subtasks", "closed")),
-)
+LOCKS = ("free", "claimed", "blocked", "needs_decision", "in_review", "has_subtasks", "closed")
+
+
+def facet_orders(s):
+    """The facets and the order of their values: the configured lists, so a team's own values count in place."""
+    return (
+        ("lane", None), ("status", STATUSES), ("priority", s.names("priority", False)),
+        ("kind", s.names("kind", False)), ("side", s.names("side", False)),
+        ("audience", s.names("audience", False)), ("requested_by", s.names("requested_by", False)), ("area", None),
+        ("lock", LOCKS),
+    )
+
+
+def facet_name(s, key, value):
+    """A value in facets text: with its label and a retired mark when the settings give them."""
+    vocab = key if key in VOCABS else None
+    entry = s.entry(vocab, value) if vocab else None
+    if not entry:
+        return value
+    notes = [n for n in (entry["label"], "retired" if entry["retired"] else None) if n]
+    return f"{value} ({', '.join(notes)})" if notes else value
 
 
 def cmd_facets(ctx):
@@ -2317,7 +3062,8 @@ def cmd_facets(ctx):
             # A parent with no side of its own counts under the sides of its open parts, such as fe+be.
             task["side"] = "+".join(task["part_sides"])
     facets = {}
-    for key, order in FACETS:
+    s = ctx.cfg
+    for key, order in facet_orders(s):
         counts = count_by(tasks, key, order or ())
         if order is None:
             counts = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -2325,7 +3071,8 @@ def cmd_facets(ctx):
     total = len(tasks)
     in_reach = sum(1 for t in tasks if t["id"] in claimable)
     lines = [f"total {total}  claimable {in_reach}"]
-    lines += [f"{key}: {fmt_counts(counts)}" for key, counts in facets.items() if counts]
+    lines += [f"{key}: {fmt_counts({facet_name(s, key, k): v for k, v in counts.items()})}"
+              for key, counts in facets.items() if counts]
     lines.append("Filter a list the same way: qtask ls --side be --pri P1, or qtask ready --area NAME")
     return {"total": total, "claimable": in_reach, "facets": facets}, "\n".join(lines)
 
@@ -2356,7 +3103,7 @@ def cmd_ls(ctx):
 
 
 def sort_name(raw):
-    return choice(raw or DEFAULT_SORT, SORTS, "--sort")
+    return choice(raw or cfg().get("sort"), SORTS, "--sort")
 
 
 def explain_fields(ctx):
@@ -2375,13 +3122,13 @@ def stale_claims(ctx, project):
     where = ["t.claimed_by IS NOT NULL", "t.claim_expires_at <= ?", f"t.status NOT IN {SQL_CLOSED}"]
     params = [now()]
     add_scope(where, params, project)
-    sql = f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}"
+    sql = f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sql_order()}"
     return [task_dict(r) for r in ctx.conn.execute(sql, params).fetchall()]
 
 
-def idle_claims(ctx, project, hours=IDLE_HOURS):
-    """Valid claims whose holder logged nothing for more than `hours`."""
-    cutoff = iso(utc_now() - timedelta(hours=hours))
+def idle_claims(ctx, project, hours=None):
+    """Valid claims whose holder logged nothing for more than `hours` (the idle_hours setting)."""
+    cutoff = iso(utc_now() - timedelta(hours=hours or ctx.cfg.get("idle_hours")))
     where = [
         "t.claimed_by IS NOT NULL", "t.claim_expires_at > ?", f"t.status NOT IN {SQL_CLOSED}",
         "coalesce(t.claim_active_at, t.updated_at) < ?",
@@ -2429,8 +3176,8 @@ def cmd_ready(ctx):
     stale = [t["id"] for t in stale_claims(ctx, ctx.scope())]
     footer = {
         "by_lane": count_by(every, "lane", LANES.values()),
-        "by_side": count_by(every, "side", SIDES),
-        "by_priority": count_by(every, "priority", PRIORITIES),
+        "by_side": count_by(every, "side", ctx.cfg.names("side", False)),
+        "by_priority": count_by(every, "priority", ctx.cfg.names("priority", False)),
     }
     extra = explain_fields(ctx)
     lines = [
@@ -2469,7 +3216,7 @@ def cmd_show(ctx):
     children = [
         task_dict(r)
         for r in conn.execute(
-            f"{TASK_SELECT} WHERE t.parent_id = ? ORDER BY {SQL_ORDER}", (task_id,)
+            f"{TASK_SELECT} WHERE t.parent_id = ? ORDER BY {sql_order()}", (task_id,)
         )
     ]
     comments = [
@@ -2527,7 +3274,7 @@ def cmd_show(ctx):
         lines += ["", "Links:"] + [f"  {k}: {', '.join(v)}" for k, v in links.items() if v]
     if commits:
         lines += ["", "Commits:"] + [f"  {commit_line(c, task['project'])}" for c in commits]
-    shown = comments if full else comments[-SHOW_COMMENTS:]
+    shown = comments if full else comments[-ctx.cfg.get("show_comments"):]
     shown = [cut_comment(ctx, c) for c in shown]
     if comments:
         head = "Comments:"
@@ -2583,7 +3330,7 @@ def cmd_search(ctx):
         if ctx.args.expand:
             comment = cut_comment(ctx, comment)
         else:
-            body, cut = snippet(comment["body"], text)
+            body, cut = snippet(comment["body"], text, ctx.cfg.get("snippet_chars"))
             comment = {**comment, "body": body, **({"body_cut": True} if cut else {})}
         comments.append(comment)
     extra = explain_fields(ctx)
@@ -2601,6 +3348,8 @@ def cmd_search(ctx):
 
 def cmd_claim(ctx):
     a = ctx.args
+    if a.ttl_hours is None:
+        a.ttl_hours = settings_for(ctx.conn, get_row(ctx.conn, a.id)["project"]).get("lease_hours")
     if not math.isfinite(a.ttl_hours) or not 0 < a.ttl_hours <= MAX_TTL_HOURS:
         raise usage_error(f"--ttl-hours must be above 0 and at most {MAX_TTL_HOURS}.")
     task_id = normalize_id(a.id)
@@ -2667,11 +3416,11 @@ def held_claims(ctx, agent, project=None):
 
 
 def wip_warnings(ctx, task_id):
-    """A warning when the agent now holds more than WIP_LIMIT claims. The claim still stands."""
+    """A warning when the agent now holds more than wip_limit claims. The claim still stands."""
     if ctx.agent == UNKNOWN_AGENT:
         return []
     others = [t["id"] for t in held_claims(ctx, ctx.agent) if t["id"] != task_id]
-    if len(others) < WIP_LIMIT:
+    if len(others) < ctx.cfg.get("wip_limit"):
         return []
     return [
         f"{ctx.agent} also holds {len(others)} other claims: {', '.join(others)}. "
@@ -2719,6 +3468,7 @@ def text_or_null(value):
 def cmd_set(ctx):
     a = ctx.args
     changes = {}
+    s = ctx.use_project(get_row(ctx.conn, a.id)["project"])
     if a.title is not None:
         if not a.title.strip():
             raise usage_error("The title cannot be empty.")
@@ -2726,13 +3476,13 @@ def cmd_set(ctx):
     if a.body is not None:
         changes["body"] = a.body or None
     if a.kind is not None:
-        changes["kind"] = choice(a.kind, KINDS, "--kind")
+        changes["kind"] = s.pick("kind", a.kind)
     if a.pri is not None:
-        changes["priority"] = choice(a.pri, PRIORITIES, "--pri", upper=True)
+        changes["priority"] = s.pick("priority", a.pri)
     if a.status is not None:
         changes["status"] = open_status(a.status)
     if a.side is not None:
-        changes["side"] = choice(a.side, SIDES, "--side") if a.side.strip() else None
+        changes["side"] = s.pick("side", a.side) if a.side.strip() else None
     if a.visibility is not None:
         changes["visibility"] = choice(a.visibility, VISIBILITIES, "--visibility")
     if a.deployed is not None:
@@ -2925,7 +3675,7 @@ def cmd_inbox(ctx):
     add_scope(where, params, project)
     tasks = [
         task_dict(r)
-        for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params)
+        for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sql_order()}", params)
     ]
     page = Page(ctx, len(comments) + len(tasks))
     items = page.rows([("comment", c) for c in comments] + [("task", t) for t in tasks])
@@ -3143,7 +3893,7 @@ def cmd_report(ctx):
         by_status[r["status"]] = r["n"]
     open_where = [*where, f"t.status NOT IN {SQL_CLOSED}"]
     open_clause = f"WHERE {' AND '.join(open_where)}"
-    by_priority = {p: 0 for p in PRIORITIES}
+    by_priority = {p: 0 for p in ctx.cfg.names("priority")}
     for r in conn.execute(
         f"SELECT t.priority, count(*) AS n FROM tasks t {open_clause} GROUP BY t.priority", params
     ):
@@ -3152,7 +3902,7 @@ def cmd_report(ctx):
     blocked = [
         task_dict(r)
         for r in conn.execute(
-            f"{TASK_SELECT} {open_clause} AND (t.status = 'blocked' OR {SQL_HAS_BLOCKER}) ORDER BY {SQL_ORDER}",
+            f"{TASK_SELECT} {open_clause} AND (t.status = 'blocked' OR {SQL_HAS_BLOCKER}) ORDER BY {sql_order()}",
             params,
         )
     ]
@@ -3170,7 +3920,7 @@ def cmd_report(ctx):
             f"{TASK_SELECT} {open_clause} AND ("
             "(t.status = 'needs_review' AND (t.owner IS NULL OR t.owner = ?)) "
             "OR (t.status = 'needs_confirm' AND t.owner = ?)) "
-            f"ORDER BY {SQL_ORDER}",
+            f"ORDER BY {sql_order()}",
             [*params, DEVELOPER, DEVELOPER],
         )
     ]
@@ -3178,7 +3928,7 @@ def cmd_report(ctx):
         task_dict(r)
         for r in conn.execute(
             f"{TASK_SELECT} {open_clause} AND EXISTS (SELECT 1 FROM tasks c WHERE c.parent_id = t.id) "
-            f"ORDER BY {SQL_ORDER}",
+            f"ORDER BY {sql_order()}",
             params,
         )
     ]
@@ -3188,26 +3938,26 @@ def cmd_report(ctx):
     staging_where = [*where, "t.deployed = 'staging'"]
     on_staging = [
         task_dict(r)
-        for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(staging_where)} ORDER BY {SQL_ORDER}", params)
+        for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(staging_where)} ORDER BY {sql_order()}", params)
     ]
     checklists = [
         task_dict(r)
-        for r in conn.execute(f"{TASK_SELECT} {open_clause} AND {SQL_OPEN_TODOS} ORDER BY {SQL_ORDER}", params)
+        for r in conn.execute(f"{TASK_SELECT} {open_clause} AND {SQL_OPEN_TODOS} ORDER BY {sql_order()}", params)
     ]
     left = sum(n for s, n in by_status.items() if s not in CLOSED)
     idle = idle_claims(ctx, project)
     unclaimed = [
         task_dict(r) for r in conn.execute(
             f"{TASK_SELECT} {open_clause} AND t.status = 'in_progress' "
-            f"AND (t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?) ORDER BY {SQL_ORDER}",
+            f"AND (t.claimed_by IS NULL OR t.claim_expires_at IS NULL OR t.claim_expires_at <= ?) ORDER BY {sql_order()}",
             [*params, now()],
         )
     ]
     parked = parked_without_reason(ctx, project)
-    week = (today() + timedelta(days=7)).isoformat()
+    week = (today() + timedelta(days=int(ctx.cfg.weights["due_week_days"]))).isoformat()
     due_soon = [
         task_dict(r) for r in conn.execute(
-            f"{TASK_SELECT} {open_clause} AND t.due IS NOT NULL AND t.due <= ? ORDER BY t.due, {SQL_ORDER}",
+            f"{TASK_SELECT} {open_clause} AND t.due IS NOT NULL AND t.due <= ? ORDER BY t.due, {sql_order()}",
             [*params, week],
         )
     ]
@@ -3220,7 +3970,8 @@ def cmd_report(ctx):
         ("blocked", "blocked", "Blocked", [("task", t) for t in blocked]),
         ("parked", "parked_no_reason", "Parked with no recorded reason (set one with --waiting-on)",
          [("parked", p) for p in parked]),
-        ("idle", "idle_claims", f"Claims idle for more than {IDLE_HOURS} h", [("idle", t) for t in idle]),
+        ("idle", "idle_claims", f"Claims idle for more than {ctx.cfg.get('idle_hours'):g} h",
+         [("idle", t) for t in idle]),
         ("stale", "stale_claims", "Stale claims", [("task", t) for t in stale]),
         ("unclaimed", "in_progress_unclaimed",
          "In progress with nobody holding them (ready and next do not list these; claim or release)",
@@ -3236,7 +3987,7 @@ def cmd_report(ctx):
         if wanted not in names:
             raise usage_error(f"--section takes one of {', '.join(names)}. Got {ctx.args.section!r}.", "unknown_section")
         sections = [s for s in sections if s[0] == wanted]
-    cap = None if ctx.args.full or wanted else REPORT_ROWS
+    cap = None if ctx.args.full or wanted else ctx.cfg.get("report_rows")
     data = {
         "project": project,
         "counts_by_status": by_status,
@@ -3254,7 +4005,7 @@ def cmd_report(ctx):
     if deployed:
         lines.append("Deployed: " + ", ".join(deployed))
     render = {
-        "comment": lambda c: comment_line({**c, "body": one_line(c["body"], SNIPPET_CHARS)}),
+        "comment": lambda c: comment_line({**c, "body": one_line(c["body"], ctx.cfg.get("snippet_chars"))}),
         "task": task_line,
         "idle": lambda t: f"{task_line(t)} [last activity {t['claim_active_at'] or t['updated_at']}]",
         "parked": lambda p: f"{p['task_id']}: {one_line(p['title'], 100)}",
@@ -3296,7 +4047,8 @@ def report_breakdown(ctx, project, by):
             f"sum(t.status NOT IN {SQL_CLOSED}) AS open FROM tasks t {clause} GROUP BY 1",
             params,
         )}
-        for who in (*REQUESTERS, "none"):
+        names = ctx.cfg.names("requested_by", False)
+        for who in (*names, *sorted(k for k in counts if k not in names and k != "none"), "none"):
             if who in counts:
                 rows.append({"label": who, "open": counts[who][0], "total": counts[who][1]})
         return rows
@@ -3472,7 +4224,7 @@ def cmd_plans(ctx):
 
 def tree_node(conn, task, seen):
     seen = seen | {task["id"]}
-    rows = conn.execute(f"{TASK_SELECT} WHERE t.parent_id = ? ORDER BY {SQL_ORDER}", (task["id"],)).fetchall()
+    rows = conn.execute(f"{TASK_SELECT} WHERE t.parent_id = ? ORDER BY {sql_order()}", (task["id"],)).fetchall()
     children = [task_dict(r) for r in rows if r["id"] not in seen]
     return {**task, "children": [tree_node(conn, child, seen) for child in children]}
 
@@ -3502,7 +4254,7 @@ def cmd_tree(ctx):
         ]
         params = []
         add_scope(where, params, ctx.scope())
-        rows = conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params)
+        rows = conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sql_order()}", params)
         roots = [task_dict(r) for r in rows.fetchall()]
     page = Page(ctx, len(roots))
     if ctx.args.id:
@@ -4390,7 +5142,7 @@ def waits_on_groups(ctx, project):
         })
     where, params = [f"t.status IN {PARKED!r}", f"t.status NOT IN {SQL_CLOSED}"], []
     add_scope(where, params, project)
-    for task in (task_dict(r) for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {SQL_ORDER}", params)):
+    for task in (task_dict(r) for r in conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)} ORDER BY {sql_order()}", params)):
         questions = open_question_ids(conn, task["id"])
         if task["waiting_on"]:
             who = task["waiting_on"]
@@ -4477,11 +5229,12 @@ def brief_data(conn, task_id):
     }
 
 
-def brief_text(data, budget=BRIEF_BYTES, max_chars=None, reader=None):
+def brief_text(data, budget=None, max_chars=None, reader=None):
     """
     About 2 KB of what an agent needs to start: the fixed facts first, the body last. With a
-    reader, text someone else wrote comes fenced.
+    reader, text someone else wrote comes fenced. budget: the brief_bytes setting.
     """
+    budget = budget or cfg().get("brief_bytes")
     task = data["task"]
     lines = [task_line(task), f"Project: {task['project']}"]
     facts = []
@@ -4540,7 +5293,7 @@ def brief_text(data, budget=BRIEF_BYTES, max_chars=None, reader=None):
 def cmd_brief(ctx):
     task_id = get_row(ctx.conn, ctx.args.id)["id"]
     data = brief_data(ctx.conn, task_id)
-    text = brief_text(data, max_chars=ctx.args.max_chars, reader=ctx.agent)
+    text = brief_text(data, max_chars=max_chars(ctx), reader=ctx.agent)
     data["task"] = {**data["task"], "body": cut_text(ctx, data["task"]["body"])}
     return {**data, "text": text}, text
 
@@ -4573,7 +5326,7 @@ def cmd_next(ctx):
                 step["text"] = f"#{c['id']} on {c['task_id']} [{c['kind']}] from {c['author']}:"
                 step["body"] = fence(me, cut_text(ctx, c["body"]), c["author"])
             steps.append(step)
-        cutoff = iso(utc_now() - timedelta(hours=IDLE_HOURS))
+        cutoff = iso(utc_now() - timedelta(hours=ctx.cfg.get("idle_hours")))
         for task in held_claims(ctx, me, project):
             idle = (task["claim_active_at"] or task["updated_at"]) < cutoff
             note = f"idle since {task['claim_active_at'] or task['updated_at']}" if idle else f"until {task['claim_expires_at']}"
@@ -4611,7 +5364,7 @@ def cmd_next(ctx):
         }
         if ctx.args.expand and n == 0:
             data = brief_data(conn, task["id"])
-            step["brief"] = brief_text(data, max_chars=ctx.args.max_chars, reader=me)
+            step["brief"] = brief_text(data, max_chars=max_chars(ctx), reader=me)
             step["commands"] = [f"qtask claim {task['id']}"]
         steps.append(step)
     top = picks[0] if picks else None
@@ -4645,9 +5398,10 @@ def next_where(ctx, project):
     add_scope(where, params, project)
     sides = a.side if a.side is not None else os.environ.get("QTASK_SIDES", "")
     areas = a.area if a.area is not None else os.environ.get("QTASK_AREAS", "").strip() or None
-    side_filter(where, params, sides)
-    value_filter(where, params, "t.kind", a.kind, KINDS, "--kind", unset=False)
-    value_filter(where, params, "t.priority", a.pri, PRIORITIES, "--pri", upper=True, unset=False)
+    side_filter(ctx.conn, where, params, sides)
+    value_filter(where, params, "t.kind", a.kind, FilterValues(ctx.conn, "kind", "t.kind"), "--kind", unset=False)
+    value_filter(where, params, "t.priority", a.pri, FilterValues(ctx.conn, "priority", "t.priority"), "--pri",
+                 unset=False)
     time_filters(a, where, params)
     if areas:
         if project is None and any(v.strip().lower() != UNSET for v in areas.split(",") if v.strip()):
@@ -4839,8 +5593,9 @@ def cmd_export(ctx):
 def cmd_split(ctx):
     a = ctx.args
     parts = []
+    s = ctx.use_project(get_row(ctx.conn, a.id)["project"])
     for raw in a.part:
-        part = choice(raw, SIDES, "--part")
+        part = s.pick("side", raw, "--part")
         if part not in parts:
             parts.append(part)
     created, existing = [], []
@@ -4894,11 +5649,11 @@ def cmd_take(ctx):
         "ORDER BY CAST(substr(id, instr(id, '-') + 1) AS INTEGER)",
         (parent["id"],),
     ).fetchall()
-    part = a.part.strip().lower()
+    part = a.part.strip()
     if part.isdigit():
         picked = children[int(part) - 1]["id"] if 0 < int(part) <= len(children) else None
     else:
-        picked = next((c["id"] for c in children if c["side"] == part), None)
+        picked = next((c["id"] for c in children if (c["side"] or "").casefold() == part.casefold()), None)
     if picked is None:
         names = ", ".join(f"{n} {c['side'] or '-'}" for n, c in enumerate(children, 1)) or "none"
         raise QtaskError(
@@ -4915,9 +5670,12 @@ HUB_KINDS = ("task", "bug", "feature", "chore", "content", "docs", "research")
 HUB_STATUSES = ("backlog", "to_do", "proposed")
 HUB_FIELDS = ("title", "scope", "checklist", "priority", "side", "tags")
 HUB_DEFAULT_FIELDS = ("title", "scope")
+# The hub's own lists. A qtask value maps to one of them through its hub setting
+# (qtask config vocab priority edit P0 --hub urgent).
 HUB_PRIORITY = {"P0": "urgent", "P1": "high", "P2": "medium", "P3": "low"}
-# The hub has every qtask side but docs.
-HUB_SIDE = {side: side for side in SIDES} | {"docs": "other"}
+HUB_PRIORITIES = tuple(HUB_PRIORITY.values())
+# The hub has every built-in qtask side but docs.
+HUB_SIDES = tuple(side for side in SIDES if side != "docs")
 HUB_MAX_CRITERIA = 30
 HUB_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 HUB_SAFE_IPS = ("127.0.0.1", "0.0.0.0")
@@ -5145,16 +5903,17 @@ def publish_payload(ctx, row, fields, scope, ref):
     payload = {"title": row["title"]}
     if "scope" in fields:
         payload["description"] = scope
+    settings = settings_for(ctx.conn, row["project"])
     if "priority" in fields:
-        payload["priority"] = HUB_PRIORITY[row["priority"]]
+        payload["priority"] = (settings.entry("priority", row["priority"]) or {}).get("hub", "medium")
     if "side" in fields and row["side"]:
-        payload["side"] = HUB_SIDE[row["side"]]
+        payload["side"] = (settings.entry("side", row["side"]) or {}).get("hub", "other")
     if "tags" in fields:
         payload["tags"] = json.loads(row["tags"])
     if a.kind:
         payload["kind"] = choice(a.kind, HUB_KINDS, "--kind")
     else:
-        payload["kind"] = row["kind"] if row["kind"] in HUB_KINDS else "task"
+        payload["kind"] = (settings.entry("kind", row["kind"]) or {}).get("hub", "task")
     payload["status"] = a.status
     if "checklist" in fields:
         criteria = [t["body"] for t in fetch_todos(ctx.conn, row["id"]) if not t["done"]]
@@ -5456,48 +6215,624 @@ def weight_value(name, raw):
         raise usage_error(f"{name} cannot be below 0.")
     if name == "due_soon_days" and (value != int(value) or value > 7):
         raise usage_error("due_soon_days takes a whole number of days, 0 to 7.")
+    if name == "due_week_days" and (value != int(value) or not 0 <= value <= 60):
+        raise usage_error("due_week_days takes a whole number of days, 0 to 60.")
     return int(value) if value == int(value) else value
 
 
-def cmd_config(ctx):
-    """The weights of the important order for one project: list, set NAME VALUE, unset NAME, reset."""
+CONFIG_ACTIONS = ("ls", "get", "set", "unset", "reset", "export", "import", "presets", "vocab")
+VOCAB_OPS = ("ls", "add", "edit", "label", "rm", "restore", "order")
+
+
+def show_value(value):
+    if isinstance(value, (list, tuple)):
+        return ",".join(value) if value else '""'
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def prune(doc):
+    """Drop empty tables, so an unset leaves no trace behind."""
+    for vocab in list(doc.get("vocab", {})):
+        data = doc["vocab"][vocab]
+        for value in list(data.get("values", {})):
+            if not data["values"][value]:
+                del data["values"][value]
+        if not data.get("values"):
+            data.pop("values", None)
+        if not data:
+            del doc["vocab"][vocab]
+    for key in ("settings", "weights", "vocab"):
+        if key in doc and not doc[key]:
+            del doc[key]
+    doc.pop("qtask", None)
+    return doc
+
+
+class Layer:
+    """One layer a config command changes: the global file or a project's settings, as a raw table."""
+
+    def __init__(self, ctx, target, project, read=True):
+        self.ctx, self.target, self.project = ctx, target, project
+        self.path, self.doc = global_config_path(), {}
+        if not read:
+            return
+        if target == "global":
+            self.path, raw = raw_global_doc()
+            self.doc = json.loads(json.dumps(raw))
+        else:
+            self.doc = raw_project_doc(ctx.conn, project)
+            weights = saved_weights(ctx.conn, project)
+            if weights:
+                self.doc["weights"] = {**weights, **self.doc.get("weights", {})}
+
+    def table(self, *keys):
+        node = self.doc
+        for key in keys:
+            if not isinstance(node.get(key), dict):
+                node[key] = {}
+            node = node[key]
+        return node
+
+    def values(self, vocab):
+        return self.table("vocab", vocab, "values")
+
+    def flag(self):
+        return " --global" if self.target == "global" else ""
+
+    def settings(self):
+        """The Settings the change gives. Raises bad_config, naming the key, before anything is saved."""
+        doc = prune(json.loads(json.dumps(self.doc)))
+        if self.target == "global":
+            return Settings(self.project, layer_docs(self.ctx.conn, self.project, {"global": doc}))
+        weights = doc.pop("weights", {})
+        return Settings(self.project, layer_docs(self.ctx.conn, self.project, {"project": doc, "project_weights": weights}))
+
+    def save(self):
+        self.settings()
+        doc = prune(self.doc)
+        if self.target == "global":
+            if doc:
+                write_config_file(self.path, doc, [
+                    "qtask settings: the global layer, read by every project on this computer.",
+                    "qtask config set NAME VALUE --global changes it and rewrites this file, without comments.",
+                ])
+            elif self.path.exists():
+                self.path.unlink()
+        else:
+            weights = doc.pop("weights", {})
+            with write_tx(self.ctx) as conn:
+                for key, value in ((project_config_key(self.project), doc), (weights_key(self.project), weights)):
+                    if value:
+                        conn.execute(
+                            "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (key, json.dumps(value, sort_keys=True, ensure_ascii=False)),
+                        )
+                    else:
+                        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        SETTINGS_CACHE.clear()
+
+
+def write_config_file(path, doc, header=()):
+    """Write a settings file atomically: TOML, or JSON when the name ends in .json."""
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        text = json.dumps({"qtask": CONFIG_FORMAT, **doc}, indent=2, ensure_ascii=False) + "\n"
+    else:
+        text = toml_dump({"qtask": CONFIG_FORMAT, **doc}, header)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8", newline="\n")
+        os.replace(temp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+
+
+def user_path(raw):
+    """A file path as the user typed it, also in Git Bash form (/d/x), made absolute."""
+    found, exists = resolve_path(raw)
+    return Path(found) if exists else Path(msys_to_windows(raw.strip())).absolute()
+
+
+def config_target(ctx, needs_project=True):
+    """('global', project or None) with --global, else ('project', project)."""
     a = ctx.args
     if a.all:
-        raise usage_error("config works on one project. Pass --project, not --all.")
-    project = ctx.project()
-    saved = saved_weights(ctx.conn, project)
-    if a.action in ("set", "unset"):
-        if a.name not in DEFAULT_WEIGHTS:
-            raise usage_error(
-                f"config {a.action} takes a weight name: {', '.join(DEFAULT_WEIGHTS)}. Got {a.name!r}.", "unknown_weight",
-            )
-        if a.action == "set":
-            if a.value is None:
-                raise usage_error(f"config set {a.name} needs a value, such as qtask config set {a.name} 20.")
-            saved[a.name] = weight_value(a.name, a.value)
-        else:
-            saved.pop(a.name, None)
-    elif a.action == "reset":
-        saved = {}
-    elif a.name or a.value:
-        raise usage_error("config ls takes no name. Use config set NAME VALUE or config unset NAME.")
-    if a.action in ("set", "unset", "reset"):
-        with write_tx(ctx) as conn:
-            if saved:
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (weights_key(project), json.dumps(saved, sort_keys=True)),
-                )
-            else:
-                conn.execute("DELETE FROM meta WHERE key = ?", (weights_key(project),))
-    rows = [
-        {"name": n, "value": saved.get(n, d), "default": d, "changed": n in saved, "what": what} for n, d, what in WEIGHTS
+        raise usage_error("config works on one project or on the global layer. Pass --project or --global, not --all.")
+    if a.global_:
+        if a.project:
+            raise usage_error("Pass --global or --project, not both. --global changes the layer every project reads.")
+        return "global", ctx.cfg_project()
+    if not needs_project and not a.project and not detect_project():
+        return None, None
+    return "project", ctx.project()
+
+
+def setting_name(s, raw, action):
+    """What a config name points at: ('setting', name), ('weight', name), ('attr', vocab, value, attr), ('order', vocab)."""
+    name = (raw or "").strip()
+    if not name:
+        raise usage_error(f"config {action} needs a name, such as limit, bug or side.ml.label. qtask config lists them.")
+    if name in SETTING_SPECS:
+        return ("setting", name)
+    weights = {w.casefold(): w for w in s.weight_names()}
+    if name.lower().startswith("weight."):
+        found = weights.get(name[len("weight."):].casefold())
+        if found:
+            return ("weight", found)
+    parts = name.split(".")
+    if parts[0] in VOCABS and len(parts) == 2 and parts[1] == "order":
+        return ("order", parts[0])
+    if parts[0] in VOCABS and len(parts) == 3:
+        vocab, value, attr = parts
+        if attr not in VOCAB_ATTRS[vocab]:
+            raise usage_error(f"A {vocab} has no setting {attr!r}. It takes {', '.join(VOCAB_ATTRS[vocab])}.",
+                              "unknown_setting")
+        entry = s.entry(vocab, value)
+        if entry is None:
+            raise usage_error(f"There is no {vocab} {value}. Add it with qtask config vocab {vocab} add {value}.",
+                              "unknown_value")
+        return ("attr", vocab, entry["name"], attr)
+    if "." not in name and name.casefold() in weights:
+        return ("weight", weights[name.casefold()])
+    raise usage_error(
+        f"config {action} takes a setting, a weight or a value setting, such as limit, bug, weight.P0 or "
+        f"side.fe.label. Got {name!r}. qtask config lists them.",
+        "unknown_setting" if "." in name else "unknown_weight",
+    )
+
+
+def setting_rows(s):
+    return [
+        {"name": name, "value": s.values[name], "default": default, "source": s.sources[name],
+         "changed": s.sources[name] != "default", "what": what}
+        for name, default, _, _, _, what in SETTINGS
     ]
-    lines = [f"Weights of the important order for {project}. Change one: qtask config set NAME VALUE; undo: qtask config unset NAME."]
-    for r in rows:
-        changed = f"  (default {r['default']:g})" if r["changed"] else ""
+
+
+def weight_rows(s):
+    rows = []
+    for name, default, what in WEIGHTS:
+        rows.append({"name": name, "value": s.weights[name], "default": default, "source": s.weight_sources[name],
+                     "changed": s.weight_sources[name] != "default", "what": what})
+    for vocab in WEIGHTED_VOCABS:
+        for entry in s.entries(vocab):
+            if entry["builtin"] and entry["name"] in DEFAULT_WEIGHTS:
+                continue
+            name = entry["name"]
+            if entry["builtin"] and name not in s.weights:
+                continue
+            rows.append({"name": name, "value": s.weights.get(name, 0), "default": 0,
+                         "source": s.weight_sources.get(name, "default"), "changed": name in s.weight_sources,
+                         "what": f"{vocab.replace('_', ' ')} {name}"})
+    return rows
+
+
+def vocab_rows(s, vocab, counts=None):
+    rows = []
+    for e in s.entries(vocab):
+        row = {"name": e["name"], "label": e["label"], "retired": e["retired"], "builtin": e["builtin"],
+               "source": e["source"], "changed_in": e["changed"]}
+        if vocab in WEIGHTED_VOCABS:
+            row["weight"] = s.value_weight(e["name"])
+        if "hub" in e:
+            row["hub"] = e["hub"]
+        if vocab == "kind":
+            row["required"] = e["required"]
+            row["has_template"] = bool(kind_template(e))
+        if counts is not None:
+            row["tasks"], row["open"] = counts.get(e["name"], (0, 0))
+        rows.append(row)
+    return rows
+
+
+def vocab_line(s, vocab):
+    names = []
+    for e in s.entries(vocab):
+        notes = [n for n in (e["label"], "retired" if e["retired"] else None) if n]
+        names.append(f"{e['name']} ({', '.join(notes)})" if notes else e["name"])
+    return f"  {vocab}: {', '.join(names)}"
+
+
+def layer_info(conn, project):
+    path = global_config_path()
+    layers = [{"source": "default", "where": "built into qtask"},
+              {"source": "global", "where": str(path), "exists": path.exists()}]
+    if project:
+        saved = bool(raw_project_doc(conn, project) or saved_weights(conn, project))
+        layers.append({"source": "project", "where": f"the database, project {project}", "exists": saved})
+    _, where, _ = env_doc()
+    layers.append({"source": "env", "where": where})
+    return layers
+
+
+def config_listing(ctx, s, project, head=None):
+    settings, weights = setting_rows(s), weight_rows(s)
+    data = {"project": project, "layers": layer_info(ctx.conn, project), "settings": settings, "weights": weights,
+            "vocab": {v: vocab_rows(s, v) for v in VOCABS}}
+    path = global_config_path()
+    lines = [head] if head else []
+    lines += [
+        f"Settings for {project or 'no project (outside a repo)'}. Layers, later wins: default, global "
+        f"({path}{'' if path.exists() else ', not made yet'}), project, env (QTASK_CFG_*), then flags.",
+        "Change one: qtask config set NAME VALUE [--global]; undo: qtask config unset NAME [--global].",
+    ]
+    for r in settings:
+        value = f"{len(r['value'])} words" if isinstance(r["value"], tuple) else show_value(r["value"])
+        lines.append(f"  {r['name']:<17} {value:<12} {r['source']:<8} {r['what']}")
+    lines.append("Weights of the important order. Change one: qtask config set NAME VALUE; undo: qtask config unset NAME.")
+    for r in weights:
+        changed = f"  (default {r['default']:g}) [{r['source']}]" if r["changed"] else ""
         lines.append(f"  {r['name']:<14} {r['value']:>6g}  {r['what']}{changed}")
-    return {"project": project, "weights": rows}, "\n".join(lines)
+    lines.append("Values. Change them with qtask config vocab NAME add|edit|label|rm|restore|order:")
+    lines += [vocab_line(s, v) for v in VOCABS]
+    return data, "\n".join(lines)
+
+
+def value_counts(conn, vocab, project):
+    """{value: (tasks, open tasks)} of a vocabulary's column, in one project or in all."""
+    column = vocab
+    where, params = [f"t.{column} IS NOT NULL"], []
+    add_scope(where, params, project)
+    return {r[0]: (r[1], r[2] or 0) for r in conn.execute(
+        f"SELECT t.{column}, count(*), sum(t.status NOT IN {SQL_CLOSED}) FROM tasks t WHERE {' AND '.join(where)} "
+        "GROUP BY 1", params,
+    )}
+
+
+def vocab_options(a, layer, vocab, value):
+    """--label, --weight, --hub, --template(-file) and --required onto a value in the layer."""
+    attrs = layer.values(vocab).setdefault(value, {})
+    fix = ""
+    if a.label is not None:
+        if a.label.strip():
+            attrs["label"] = check_attr(vocab, value, "label", a.label, "config", fix)
+        else:
+            attrs.pop("label", None)
+    for flag, attr, raw in (("--hub", "hub", a.hub), ("--template", "template", a.template),
+                            ("--required", "required", a.required)):
+        if raw is None:
+            continue
+        if attr not in VOCAB_ATTRS[vocab]:
+            raise usage_error(f"{flag} works on {'kinds' if attr != 'hub' else 'sides, kinds and priorities'} only.")
+        attrs[attr] = check_attr(vocab, value, attr, raw, "config", fix)
+    if a.weight is not None:
+        if vocab not in WEIGHTED_VOCABS:
+            raise usage_error(f"--weight works on {', '.join(WEIGHTED_VOCABS)}. A {vocab} adds no points.")
+        layer.table("weights")[value] = weight_value(value, a.weight)
+
+
+def weight_clash(s, vocab, name):
+    """A weighted value shares one namespace with the weights, so a new name must not be one of them."""
+    if vocab not in WEIGHTED_VOCABS:
+        return None
+    folded = name.casefold()
+    if folded in (w.casefold() for w in PLAIN_WEIGHTS):
+        return "a weight"
+    for other in WEIGHTED_VOCABS:
+        if other != vocab and any(n.casefold() == folded for n in s.names(other, False)):
+            return f"a {other.replace('_', ' ')} value"
+    return None
+
+
+def cmd_config_vocab(ctx, project):
+    a = ctx.args
+    words = list(a.words or [])
+    s = ctx.cfg
+    if not a.name:
+        lines = ["Values per vocabulary. qtask config vocab NAME lists one; add, edit, label, rm, restore, order change it."]
+        lines += [vocab_line(s, v) for v in VOCABS]
+        return {"project": project, "vocab": {v: vocab_rows(s, v) for v in VOCABS}}, "\n".join(lines)
+    vocab = a.name.strip().lower().replace("-", "_")
+    if vocab not in VOCABS:
+        raise usage_error(f"config vocab takes one of {', '.join(VOCABS)}. Got {a.name!r}.")
+    op = (a.value or "ls").strip().lower()
+    if op not in VOCAB_OPS:
+        raise usage_error(f"config vocab {vocab} takes one of {', '.join(VOCAB_OPS)}. Got {a.value!r}.")
+    if op == "ls":
+        counts = value_counts(ctx.conn, vocab, project)
+        rows = vocab_rows(s, vocab, counts)
+        lines = [f"{vocab} values for {project or 'every project'}, in order. Tasks: open/all."]
+        for r in rows:
+            state = "retired" if r["retired"] else "active"
+            where = "built in" if r["builtin"] else f"added in {r['source']}"
+            extra = [f"weight {r['weight']:g}"] if "weight" in r and r["weight"] else []
+            extra += [f"hub {r['hub']}"] if r.get("hub") and r["hub"] != r["name"] else []
+            extra += [f"needs {', '.join(r['required'])}"] if r.get("required") else []
+            label = f" \"{r['label']}\"" if r["label"] else ""
+            lines.append(f"  {r['name']:<14}{label} {state}, {where}, tasks {r['open']}/{r['tasks']}"
+                         + (f"; {'; '.join(extra)}" if extra else ""))
+        for name, (total, open_) in sorted(counts.items()):
+            if s.entry(vocab, name) is None:
+                lines.append(f"  {name:<14} not in the settings, tasks {open_}/{total}")
+        return {"project": project, "vocab": vocab, "values": rows}, "\n".join(lines)
+    target, project = config_target(ctx)
+    layer = Layer(ctx, target, project)
+    if not words:
+        raise usage_error(f"config vocab {vocab} {op} needs a value, such as qtask config vocab {vocab} {op} NAME.")
+    warnings = []
+    if op == "order":
+        order = [w.strip() for word in words for w in word.split(",") if w.strip()]
+        for name in order:
+            if s.entry(vocab, name) is None:
+                raise usage_error(f"There is no {vocab} {name}. The {vocab} values: {', '.join(s.names(vocab, False))}.",
+                                  "unknown_value")
+        layer.table("vocab", vocab)["order"] = [s.entry(vocab, n)["name"] for n in order]
+        text = f"New {vocab} order{layer.flag()}: {', '.join(order)}, then the rest."
+    else:
+        raw = words[0].strip()
+        entry = s.entry(vocab, raw)
+        if op == "add":
+            check_value_name(vocab, raw, "config vocab", "")
+            if entry is not None:
+                hint = f" Bring it back with qtask config vocab {vocab} restore {entry['name']}." if entry["retired"] else ""
+                raise usage_error(f"{vocab} {entry['name']} exists already.{hint}", "value_exists")
+            clash = weight_clash(s, vocab, raw)
+            if clash:
+                raise usage_error(f"{raw} is already {clash}, and weights share one list of names. Pick another name.",
+                                  "value_exists")
+            layer.values(vocab)[raw] = {"added": True}
+            vocab_options(a, layer, vocab, raw)
+            text = f"Added {vocab} {raw}{layer.flag()}."
+        else:
+            if entry is None:
+                raise usage_error(f"There is no {vocab} {raw}. The {vocab} values: {', '.join(s.names(vocab, False))}.",
+                                  "unknown_value")
+            name = entry["name"]
+            attrs = layer.values(vocab).setdefault(name, {})
+            if op == "edit":
+                vocab_options(a, layer, vocab, name)
+                text = f"Changed {vocab} {name}{layer.flag()}."
+            elif op == "label":
+                a.label = " ".join(words[1:])
+                vocab_options(a, layer, vocab, name)
+                text = f"{vocab} {name} label{layer.flag()}: {a.label.strip() or 'none'}."
+            elif op == "restore":
+                attrs.pop("retired", None)
+                if layer.settings().entry(vocab, name)["retired"]:
+                    attrs["retired"] = False
+                text = f"Restored {vocab} {name}{layer.flag()}. New tasks can use it again."
+            else:  # rm
+                counts = value_counts(ctx.conn, vocab, project if target == "project" else None)
+                total, open_ = counts.get(name, (0, 0))
+                if attrs.get("added") and not total:
+                    del layer.values(vocab)[name]
+                    layer.table("weights").pop(name, None)
+                    text = f"Removed {vocab} {name}{layer.flag()}."
+                else:
+                    attrs["retired"] = True
+                    text = f"Retired {vocab} {name}{layer.flag()}. New tasks cannot use it; old ones keep it."
+                    if total:
+                        warnings.append(
+                            f"{total} tasks ({open_} open) still use {vocab} {name}. They keep it, and "
+                            f"{VOCAB_FLAGS[vocab]} {name} still finds them. Move them with qtask set ID {VOCAB_FLAGS[vocab]} NAME."
+                        )
+    layer.save()
+    s = ctx.use_project(project) if target == "project" else settings_for(ctx.conn, ctx.cfg_project())
+    data = {"project": project, "layer": target, "vocab": vocab, "values": vocab_rows(s, vocab), "warnings": warnings}
+    return data, "\n".join([text, *(f"warning: {w}" for w in warnings), vocab_line(s, vocab)])
+
+
+def merge_doc(into, doc):
+    """Deep-merge a checked settings table into a raw layer table. Lists and values replace."""
+    for key in ("settings", "weights"):
+        if doc.get(key):
+            into.setdefault(key, {}).update(doc[key])
+    for vocab, data in doc.get("vocab", {}).items():
+        node = into.setdefault("vocab", {}).setdefault(vocab, {})
+        if "order" in data:
+            node["order"] = data["order"]
+        for value, attrs in data.get("values", {}).items():
+            node.setdefault("values", {}).setdefault(value, {}).update(attrs)
+    return into
+
+
+def import_doc(ctx, target, project, doc, replace):
+    """Merge (or with replace, put) a checked settings table into a layer and save it. Returns a summary."""
+    layer = Layer(ctx, target, project)
+    if replace:
+        layer.doc = {}
+    merge_doc(layer.doc, doc)
+    layer.save()
+    values = sum(len(d.get("values", {})) for d in doc.get("vocab", {}).values())
+    return {"settings": len(doc.get("settings", {})), "weights": len(doc.get("weights", {})), "values": values}
+
+
+def preset_doc(name):
+    key = (name or "").strip().lower()
+    if key not in PRESETS:
+        raise usage_error(f"--preset takes one of {', '.join(PRESETS)}. Got {name!r}. qtask config presets lists them.",
+                          "unknown_preset")
+    return key, check_doc(PRESETS[key][1], f"preset {key}", "")
+
+
+def source_doc(a):
+    """The table that import and init load: --preset NAME or a file. (label, checked doc)."""
+    if a.preset and getattr(a, "file", None):
+        raise usage_error("Pass a file or --preset, not both.")
+    if a.preset:
+        key, doc = preset_doc(a.preset)
+        return f"preset {key}", doc
+    path = a.file
+    return path, check_doc(read_config_file(user_path(path)), path, "Fix the file and import it again.")
+
+
+def cmd_config(ctx):
+    """Settings in layers: list, get, set, unset, reset, export, import, presets, vocab."""
+    a = ctx.args
+    action = (a.action or "ls").strip().lower()
+    if action not in CONFIG_ACTIONS:
+        raise usage_error(f"config takes one of {', '.join(CONFIG_ACTIONS)}. Got {a.action!r}.")
+    if action == "presets":
+        rows = [{"name": n, "what": what} for n, (what, _) in PRESETS.items()]
+        lines = ["Presets. Start a project from one: qtask init --preset NAME, or qtask config import --preset NAME."]
+        lines += [f"  {r['name']:<10} {r['what']}" for r in rows]
+        return {"presets": rows}, "\n".join(lines)
+    if action == "ls":
+        if a.all:
+            raise usage_error("config works on one project. Pass --project, not --all.")
+        if a.name or a.value:
+            raise usage_error("config ls takes no name. Use config get NAME, config set NAME VALUE or config unset NAME.")
+        project = ctx.cfg_project()
+        if a.project:
+            project = ctx.project()
+        return config_listing(ctx, ctx.cfg, project)
+    if action == "vocab":
+        if a.all:
+            raise usage_error("config vocab works on one project. Pass --project or --global, not --all.")
+        return cmd_config_vocab(ctx, ctx.cfg_project())
+    if action == "get":
+        s = ctx.cfg
+        what = setting_name(s, a.name, "get")
+        if what[0] == "setting":
+            value, default, source = s.values[what[1]], SETTING_SPECS[what[1]][1], s.sources[what[1]]
+        elif what[0] == "weight":
+            value, default = s.weights.get(what[1], 0), DEFAULT_WEIGHTS.get(what[1], 0)
+            source = s.weight_sources.get(what[1], "default")
+        elif what[0] == "order":
+            value, default, source = s.names(what[1], False), list(BUILTIN_VOCAB[what[1]]), "settings"
+        else:
+            entry = s.entry(what[1], what[2])
+            value, default, source = entry.get(what[3]), None, ", ".join(entry["changed"]) or entry["source"]
+        name = a.name.strip()
+        return ({"name": name, "value": value, "default": default, "source": source},
+                show_value(value) if value is not None else "(not set)")
+    if action == "export":
+        return config_export(ctx)
+    target, project = config_target(ctx)
+    if action == "import":
+        if not a.preset and not a.name:
+            raise usage_error("config import needs a file, or --preset NAME. qtask config presets lists the presets.")
+        a.file = a.name
+        label, doc = source_doc(a)
+        counts = import_doc(ctx, target, project, doc, a.replace)
+        s = ctx.use_project(project) if target == "project" else settings_for(ctx.conn, project)
+        head = (f"Loaded {label} into the {target} layer{' (replaced)' if a.replace else ''}: "
+                f"{counts['settings']} settings, {counts['weights']} weights, {counts['values']} values.")
+        data, text = config_listing(ctx, s, project, head)
+        return {**data, "imported": counts, "layer": target}, text
+    layer = Layer(ctx, target, project, read=action != "reset")
+    if action == "reset":
+        if a.name or a.value:
+            raise usage_error("config reset takes no name. It clears every setting of the layer.")
+        head = f"Cleared the {target} layer: every value there is back to the layer below."
+    else:
+        try:
+            s = ctx.cfg if target == "global" else ctx.use_project(project)
+        except QtaskError as exc:
+            if exc.code != "bad_config":
+                raise
+            s = builtin_settings()  # A broken layer: still let set and unset fix it.
+        what = setting_name(s, a.name, action)
+        if action == "set" and a.value is None:
+            raise usage_error(f"config set {a.name} needs a value, such as qtask config set {a.name} 20.")
+        if action == "set" and a.words:
+            raise usage_error("config set takes one value. Quote a value with spaces.")
+        fix = ""
+        if what[0] == "setting":
+            node, key = layer.table("settings"), what[1]
+            value = coerce_setting(SETTING_SPECS[key], a.value, "config set", fix) if action == "set" else None
+        elif what[0] == "weight":
+            node, key = layer.table("weights"), what[1]
+            value = weight_value(key, a.value) if action == "set" else None
+        elif what[0] == "order":
+            node, key = layer.table("vocab", what[1]), "order"
+            value = None
+            if action == "set":
+                value = [w.strip() for w in a.value.split(",") if w.strip()]
+                bad = [w for w in value if s.entry(what[1], w) is None]
+                if bad:
+                    raise usage_error(f"There is no {what[1]} {bad[0]}.", "unknown_value")
+        else:
+            _, vocab, name, attr = what
+            node, key = layer.values(vocab).setdefault(name, {}), attr
+            value = check_attr(vocab, name, attr, a.value, "config set", fix) if action == "set" else None
+        if action == "set":
+            node[key] = list(value) if isinstance(value, tuple) else value
+            head = f"Set {a.name.strip()} = {show_value(value)} in the {target} layer."
+        else:
+            had = node.pop(key, None) is not None
+            head = (f"Unset {a.name.strip()} in the {target} layer." if had
+                    else f"{a.name.strip()} was not set in the {target} layer; nothing changed.")
+    layer.save()
+    s = ctx.use_project(project) if target == "project" else settings_for(ctx.conn, project)
+    return config_listing(ctx, s, project, head)
+
+
+def config_export(ctx):
+    """The settings of the global and project layers (not env) as one file, to share or start a project from."""
+    a = ctx.args
+    which = (a.layer or "both").strip().lower()
+    if which not in ("both", "global", "project"):
+        raise usage_error(f"--layer takes both, global or project. Got {a.layer!r}.")
+    project = ctx.project() if which != "global" else ctx.cfg_project()
+    docs = {source: doc for source, doc, _, _ in layer_docs(ctx.conn, project) if source in ("global", "project")}
+    merged = {}
+    for source in ("global", "project"):
+        if source in docs and which in ("both", source):
+            merge_doc(merged, docs[source])
+    merged = prune(merged)
+    header = [f"qtask settings ({which} layer{'s' if which == 'both' else ''}) of {project or 'no project'}, "
+              f"exported {today().isoformat()} by qtask {__version__}.",
+              "Load it: qtask config import FILE [--global], or start a project: qtask init --from FILE."]
+    path = a.name
+    if path in (None, "-"):
+        text = toml_dump({"qtask": CONFIG_FORMAT, **merged}, header)
+        return {"project": project, "layer": which, "settings": merged}, text.rstrip("\n")
+    target = user_path(path)
+    if target.exists() and not a.force:
+        raise refused("file_exists", f"{target} exists. Pass --force to write over it.", path=str(target))
+    write_config_file(target, merged, header)
+    return ({"project": project, "layer": which, "path": str(target), "settings": merged},
+            f"Wrote the {which} settings of {project or 'no project'} to {target}.")
+
+
+def cmd_init(ctx):
+    """Set up a project: its ID prefix and, from a preset or an exported file, its settings."""
+    a = ctx.args
+    if a.all:
+        raise usage_error("init sets up one project. Pass --project, not --all.")
+    project = ctx.project()
+    prefix = None
+    if a.prefix:
+        prefix = a.prefix.strip().upper()
+        if not PREFIX_RE.fullmatch(prefix):
+            raise usage_error(f"A prefix is 1 to 6 letters from A to Z, such as QT. Got {a.prefix!r}.", "bad_prefix")
+    label, doc = source_doc(a) if (a.preset or a.file) else (None, None)
+    with write_tx(ctx) as conn:
+        row = conn.execute("SELECT * FROM projects WHERE name = ?", (project,)).fetchone()
+        made = row is None
+        if made:
+            if prefix:
+                owners = prefix_owners(conn).get(prefix, set())
+                if any(p.casefold() != project.casefold() for p in owners):
+                    raise refused("prefix_taken", f"Another project uses the prefix {prefix}. Pick another prefix.")
+            row = ensure_project(conn, project, prefix)
+        elif prefix and prefix != row["prefix"]:
+            raise refused("project_exists", f"{project} exists with the prefix {row['prefix']}. "
+                          f"Change it with qtask project set-prefix {prefix}.")
+    lines = [f"{'Set up' if made else 'Found'} {row['name']}: IDs {row['prefix']}-{row['next_n']} on."]
+    counts = None
+    if doc is not None:
+        saved = raw_project_doc(ctx.conn, row["name"]) or saved_weights(ctx.conn, row["name"])
+        if saved and not a.replace:
+            raise refused(
+                "config_exists",
+                f"{row['name']} has settings already. Pass --replace to start over from {label}, or merge it "
+                f"with qtask config import.",
+            )
+        counts = import_doc(ctx, "project", row["name"], doc, True)
+        lines.append(f"Loaded {label}: {counts['settings']} settings, {counts['weights']} weights, "
+                     f"{counts['values']} values.")
+    s = ctx.use_project(row["name"])
+    lines += ["Values:"] + [vocab_line(s, v) for v in VOCABS]
+    lines.append("See every setting with qtask config.")
+    data = {"project": project_dict(ctx.conn, row), "created": made, "loaded": label, "imported": counts,
+            "vocab": {v: s.names(v) for v in VOCABS}}
+    return data, "\n".join(lines)
 
 
 # Global flags a view run passes on, as (dest, takes a value). They are not saved in a view.
@@ -5629,6 +6964,49 @@ def cmd_view(ctx):
     return {"view": view["name"], "line": view["line"], **data}, text
 
 
+HELP = {"cfg": None}  # The settings that --help prints the lists of; build_parser sets it.
+
+
+def hcfg():
+    return HELP["cfg"] or builtin_settings()
+
+
+def hlist(vocab):
+    """The active values of a vocabulary, for --help, so a team sees its own lists."""
+    return ", ".join(hcfg().names(vocab))
+
+
+def help_settings(argv):
+    """
+    The settings --help shows: the global file and, read-only, the project's settings. Any error
+    gives the built-in lists, so --help always prints.
+    """
+    try:
+        project = None
+        for n, word in enumerate(argv):
+            if word == "--project" and n + 1 < len(argv):
+                project = argv[n + 1]
+            elif word.startswith("--project="):
+                project = word.split("=", 1)[1]
+        project = project or detect_project()
+        db = qtask_home() / "qtask.db"
+        conn = None
+        if project and db.exists():
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT name FROM projects WHERE name = ?", (project.strip().rstrip("/"),)).fetchone()
+            project = row["name"] if row else project
+        try:
+            if conn is None:
+                return Settings(None, [layer for layer in layer_docs(None, None)])
+            return Settings(project, layer_docs(conn, project))
+        finally:
+            if conn is not None:
+                conn.close()
+    except (QtaskError, sqlite3.Error, OSError, ValueError):
+        return None
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         if "--json" in sys.argv[1:]:
@@ -5677,7 +7055,8 @@ def positive_int(flag):
 def add_paging(parser, fields=True):
     parser.add_argument(
         "--limit", "--top", dest="limit", type=int, metavar="N",
-        help=f"rows per page, 1 to {PAGE_MAX}; default QTASK_LIMIT, else {PAGE_DEFAULT} (QTASK_LIMIT=0: every row). "
+        help=f"rows per page, 1 to {hcfg().get('max_limit')}; default the limit setting, now "
+        f"{hcfg().get('limit') or 'every row'} (QTASK_LIMIT=0: every row). "
         "--top 5 prints the first 5",
     )
     parser.add_argument("--page", type=int, metavar="N", help="page number, from 1")
@@ -5691,16 +7070,16 @@ def add_paging(parser, fields=True):
 
 def add_filter_flags(parser, statuses=True):
     """The task filters that ls, ready and facets share. ready picks its own statuses."""
-    parser.add_argument("--kind", help=f"comma list of {', '.join(KINDS)}")
-    parser.add_argument("--pri", "--priority", dest="pri", help="comma list of P0 to P3, such as P0,P1")
-    parser.add_argument("--side", help=f"comma list of {', '.join(SIDES)}; none = no side")
+    parser.add_argument("--kind", help=f"comma list of {hlist('kind')}")
+    parser.add_argument("--pri", "--priority", dest="pri", help=f"comma list of {hlist('priority')}")
+    parser.add_argument("--side", help=f"comma list of {hlist('side')}; none = no side")
     parser.add_argument("--tag", action="append", help="repeatable; a task needs every tag given")
     parser.add_argument("--owner", metavar="NAME", help="tasks with this owner")
     parser.add_argument("--claimed-by", metavar="AGENT", help="tasks this agent holds, such as your own")
     parser.add_argument("--parent", metavar="ID", help="subtasks of this task")
     parser.add_argument("--search", metavar="TEXT", help="tasks whose title, body or comments hold TEXT")
-    parser.add_argument("--requested-by", help=f"comma list of {', '.join(REQUESTERS)}; none = not recorded")
-    parser.add_argument("--audience", help=f"comma list of {', '.join(AUDIENCES)}; none = not set")
+    parser.add_argument("--requested-by", help=f"comma list of {hlist('requested_by')}; none = not recorded")
+    parser.add_argument("--audience", help=f"comma list of {hlist('audience')}; none = not set")
     parser.add_argument(
         "--area", help="comma list of areas, each with the areas below it; none = no area, such as --area none"
     )
@@ -5729,7 +7108,8 @@ def add_filter_flags(parser, statuses=True):
 def add_sort_flags(parser):
     parser.add_argument(
         "--sort",
-        help=f"{', '.join(SORTS)}; default {DEFAULT_SORT} (score order, see qtask config). impact is the hub's order",
+        help=f"{', '.join(SORTS)}; default {hcfg().get('sort')} (the sort setting; important is the score order, "
+        "see qtask config). impact is the hub's order",
     )
     parser.add_argument("--reverse", action="store_true", help="flip the order")
     parser.add_argument("--explain", action="store_true", help="print each row's score and the reasons for it")
@@ -5743,13 +7123,13 @@ def add_filters(parser, statuses=True):
 
 def add_field_flags(parser, on_set=False):
     """Flags for who asked, for whom, what the task waits on and its next step."""
-    parser.add_argument("--requested-by", help=f"who asked: {', '.join(REQUESTERS)}")
+    parser.add_argument("--requested-by", help=f"who asked: {hlist('requested_by')}")
     parser.add_argument("--requester", metavar="NAME", help="the name of the person who asked")
     parser.add_argument(
         "--requested-on", metavar="YYYY-MM-DD",
         help="when they asked; default today on add, the task's creation day on set",
     )
-    parser.add_argument("--audience", help=f"who the work is for: {', '.join(AUDIENCES)}")
+    parser.add_argument("--audience", help=f"who the work is for: {hlist('audience')}")
     parser.add_argument("--area", help="an area made with qtask area add")
     parser.add_argument(
         "--waiting-on", help=f"for needs_confirm or blocked with no open question or blocker: {', '.join(WAITING_ON)}"
@@ -5769,7 +7149,8 @@ def add_text(parser, help_text):
     parser.add_argument("--body-file", help="read the text from a UTF-8 file, or stdin with -")
 
 
-def build_parser():
+def build_parser(settings=None):
+    HELP["cfg"] = settings
     parser = Parser(
         prog="qtask", description="Local task tracker for AI coding agents and the people they work with.",
         allow_abbrev=False,
@@ -5790,9 +7171,14 @@ def build_parser():
         "you pass no --area.",
     )
     p.add_argument("title", help="a short title in quotes, such as \"Fix the login redirect\"")
-    p.add_argument("--kind", default="task", help=f"{', '.join(KINDS)}; default task. A bug needs qtask template bug")
-    p.add_argument("--pri", "--priority", dest="pri", default="P2", help=f"{', '.join(PRIORITIES)}; default P2")
-    p.add_argument("--side", help=f"{', '.join(SIDES)}; for work on two sides, add it, then qtask split ID")
+    p.add_argument(
+        "--kind", help=f"{hlist('kind')}; default {hcfg().get('default_kind')}. A kind with required headings, "
+        "such as bug, needs them: qtask template KIND",
+    )
+    p.add_argument(
+        "--pri", "--priority", dest="pri", help=f"{hlist('priority')}; default {hcfg().get('default_priority')}"
+    )
+    p.add_argument("--side", help=f"{hlist('side')}; for work on two sides, add it, then qtask split ID")
     p.add_argument("--tag", action="append", help="repeatable")
     p.add_argument("--body", metavar="TEXT", help="the task body; use --body-file for quotes or line breaks")
     p.add_argument("--body-file", help="read the body from a UTF-8 file, or stdin with -")
@@ -5804,7 +7190,7 @@ def build_parser():
     p.add_argument("--pr", metavar="URL", help="pull request link")
     p.add_argument(
         "--duplicate-reason", metavar="TEXT",
-        help=f"add despite an open task scoring {DUPLICATE_SCORE} or more; say how this one differs",
+        help=f"add despite an open task scoring {hcfg().get('duplicate_score')} or more; say how this one differs",
     )
     p.add_argument("--no-similar", action="store_true", help="skip the similar check, such as for a bulk import")
     add_field_flags(p)
@@ -5827,7 +7213,7 @@ def build_parser():
 
     p = command(
         "show", cmd_show,
-        f"Show a task with its checklist, children, links, commits and the last {SHOW_COMMENTS} comments. "
+        f"Show a task with its checklist, children, links, commits and the last {hcfg().get('show_comments')} comments. "
         "The event log stays out unless asked.",
     )
     p.add_argument("id", help="task ID")
@@ -5836,7 +7222,7 @@ def build_parser():
 
     p = command(
         "search", cmd_search,
-        f"Search tasks and comments. A comment hit prints about {SNIPPET_CHARS} characters around the match.",
+        f"Search tasks and comments. A comment hit prints about {hcfg().get('snippet_chars')} characters around the match.",
     )
     p.add_argument("text", help="words to find in titles, bodies and comments")
     p.add_argument("--expand", action="store_true", help="print each matching comment whole")
@@ -5850,7 +7236,7 @@ def build_parser():
     )
     p.add_argument("id", help="task ID, such as APP-12")
     p.add_argument(
-        "--ttl-hours", type=float, default=DEFAULT_TTL_HOURS, help=f"lease length, default {DEFAULT_TTL_HOURS:g} h",
+        "--ttl-hours", type=float, help=f"lease length, default the lease_hours setting, now {hcfg().get('lease_hours'):g} h",
     )
 
     p = command("release", cmd_release, "Clear the claim and return the task to the lane it was claimed from.")
@@ -5865,10 +7251,10 @@ def build_parser():
     p.add_argument("--title", help="a new title")
     p.add_argument("--body", metavar="TEXT", help="replace the body; use --body-file for quotes or line breaks")
     p.add_argument("--body-file", help="read the body from a UTF-8 file, or stdin with -")
-    p.add_argument("--kind", help=", ".join(KINDS))
+    p.add_argument("--kind", help=hlist("kind"))
     p.add_argument("--status", help="any open status; use done or drop to close")
-    p.add_argument("--pri", "--priority", dest="pri", help=", ".join(PRIORITIES))
-    p.add_argument("--side", help=f"{', '.join(SIDES)}; \"\" clears it")
+    p.add_argument("--pri", "--priority", dest="pri", help=hlist("priority"))
+    p.add_argument("--side", help=f"{hlist('side')}; \"\" clears it")
     p.add_argument("--owner", metavar="NAME", help="who answers for the task")
     p.add_argument("--plan", metavar="PATH", help="plan file path; qtask plan-path TOPIC --task ID makes one")
     p.add_argument("--branch", help="git branch of the work")
@@ -6088,9 +7474,9 @@ def build_parser():
     )
     p.add_argument("--for", dest="for_agent", help="agent name, default the current agent")
     p.add_argument("--expand", action="store_true", help="whole inbox comments and the brief of the top task")
-    p.add_argument("--side", help=f"comma list of {', '.join(SIDES)}, or none; default QTASK_SIDES")
-    p.add_argument("--kind", help="comma list of kinds, such as bug,feature")
-    p.add_argument("--pri", "--priority", dest="pri", help="comma list of priorities, such as P0,P1")
+    p.add_argument("--side", help=f"comma list of {hlist('side')}, or none; default QTASK_SIDES")
+    p.add_argument("--kind", help=f"comma list of {hlist('kind')}")
+    p.add_argument("--pri", "--priority", dest="pri", help=f"comma list of {hlist('priority')}")
     p.add_argument("--area", help="comma list of areas, each with the areas below it; none = no area")
     p.add_argument(
         "--limit", "--top", dest="limit", type=int, metavar="N", help="how many ready candidates to list, 1 to 10, default 1",
@@ -6144,19 +7530,20 @@ def build_parser():
         "and gets that side.",
     )
     p.add_argument("id", help="the parent task's ID")
-    p.add_argument("--part", action="append", required=True, help=f"repeatable: {', '.join(SIDES)}")
+    p.add_argument("--part", action="append", required=True, help=f"repeatable: {hlist('side')}")
 
     p = command("take", cmd_take, "Claim one part of a split task, by side or by number.")
     p.add_argument("id", help="the parent task's ID")
     p.add_argument("--part", required=True, help="a side such as be, or the part's number")
     p.add_argument(
-        "--ttl-hours", type=float, default=DEFAULT_TTL_HOURS, help=f"lease length, default {DEFAULT_TTL_HOURS:g} h",
+        "--ttl-hours", type=float, help=f"lease length, default the lease_hours setting, now {hcfg().get('lease_hours'):g} h",
     )
 
     p = command(
         "similar", cmd_similar,
         "Open tasks of the project that look like the same work, scored 0 to 100 on title and body. add runs it "
-        f"too, and refuses a title of {GATE_WORDS} or more words that scores {DUPLICATE_SCORE} or more.",
+        f"too, and refuses a title of {hcfg().get('duplicate_words')} or more words that scores "
+        f"{hcfg().get('duplicate_score')} or more.",
     )
     p.add_argument("title", help="the title you plan to add, in quotes")
     p.add_argument("--body-file", help="compare this body too: a UTF-8 file, or stdin with -")
@@ -6173,16 +7560,51 @@ def build_parser():
     p.add_argument("--ready", action="store_true", help="only tasks an agent can claim now")
 
     p = command("template", cmd_template, "Print the body template of a kind.")
-    p.add_argument("kind", help=", ".join(TEMPLATES))
+    p.add_argument(
+        "kind", help=", ".join(e["name"] for e in hcfg().entries("kind") if kind_template(e) and not e["retired"])
+    )
 
     p = command(
         "config", cmd_config,
-        "The weights of the important order for this project. 'config' lists them; 'config set NAME VALUE' "
-        "changes one; 'config unset NAME' puts back the default; 'config reset' puts back every default.",
+        "Settings, in layers where the later wins: built-in defaults, the global file, the project, "
+        "QTASK_CFG_* variables, flags. 'config' lists each setting with its value and layer; get NAME; "
+        "set NAME VALUE; unset NAME; reset; export [FILE]; import FILE|--preset NAME; presets; "
+        "vocab [side|kind|priority|audience|requested_by] [add|edit|label|rm|restore|order] VALUE.",
     )
-    p.add_argument("action", nargs="?", choices=("ls", "set", "unset", "reset"), default="ls", help="ls (default), set, unset or reset")
-    p.add_argument("name", nargs="?", help="a weight name, such as manager, bug, P0, students, overdue")
-    p.add_argument("value", nargs="?", help="for set: a number; negative lowers the score")
+    p.add_argument("action", nargs="?", default="ls", help=f"{', '.join(CONFIG_ACTIONS)}; default ls")
+    p.add_argument(
+        "name", nargs="?",
+        help="a setting (limit), a weight (bug or weight.bug), a value setting (side.fe.label), a vocabulary "
+        "for vocab, or a file for export and import",
+    )
+    p.add_argument("value", nargs="?", help="for set: the value; for vocab: add, edit, label, rm, restore, order or ls")
+    p.add_argument("words", nargs="*", help="for vocab: the value name, then for label the label text")
+    p.add_argument(
+        "--global", dest="global_", action="store_true",
+        help=f"change the global layer ({CONFIG_FILE} in QTASK_HOME, or QTASK_CONFIG) in place of the project",
+    )
+    p.add_argument("--label", help="vocab add or edit: a longer name, shown in facets and config")
+    p.add_argument("--weight", help="vocab add or edit: points in the important order, for kinds, priorities, "
+                   "audiences and requesters")
+    p.add_argument("--hub", help="vocab add or edit: the team hub value this one publishes as")
+    p.add_argument("--template", help="vocab add or edit on a kind: the body template")
+    p.add_argument("--template-file", help="vocab add or edit on a kind: read the template from a file, - for stdin")
+    p.add_argument("--required", metavar="LIST",
+                   help="vocab add or edit on a kind: headings its body needs, such as \"Question,Answer by\"")
+    p.add_argument("--layer", help="export: both (default), global or project")
+    p.add_argument("--preset", help="import: a built-in preset in place of a file; qtask config presets lists them")
+    p.add_argument("--replace", action="store_true", help="import: clear the layer first in place of merging")
+    p.add_argument("--force", action="store_true", help="export: write over an existing file")
+
+    p = command(
+        "init", cmd_init,
+        "Set up the project of this repo: register it, set its ID prefix, and load its settings from a "
+        "preset or an exported file (qtask config export).",
+    )
+    p.add_argument("--preset", help="start from a built-in preset; qtask config presets lists them")
+    p.add_argument("--from", dest="file", metavar="FILE", help="start from a settings file, such as one from config export")
+    p.add_argument("--prefix", help="ID prefix of 1 to 6 letters for a new project, such as QT")
+    p.add_argument("--replace", action="store_true", help="replace settings the project has already")
 
     p = command(
         "view", cmd_view,
@@ -6251,8 +7673,10 @@ def main(argv=None):
     force_utf8()
     if os.name != "nt":
         os.umask(0o077)  # Tasks, plans and backups are private: only this user may read them.
-    args = build_parser().parse_args(argv)
-    args.argv = list(sys.argv[1:] if argv is None else argv)
+    words = list(sys.argv[1:] if argv is None else argv)
+    shown = help_settings(words) if any(w in ("-h", "--help") for w in words) else None
+    args = build_parser(shown).parse_args(argv)
+    args.argv = words
     if args.command == "view":
         try:
             args.rest = pull_globals(args, args.rest or [])

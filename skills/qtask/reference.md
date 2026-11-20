@@ -107,13 +107,13 @@ The score adds these points. `qtask config set NAME VALUE` changes one for the p
 |------|---------|-----------|
 | `P0`, `P1`, `P2`, `P3` | 60, 30, 10, 0 | the priority |
 | `manager`, `stakeholder` | 50, 40 | `requested_by` |
-| `bug` | 25 | kind bug |
+| `bug` | 25 | kind bug; any kind can have a weight |
 | `students`, `teachers`, `parents`, `managers`, `admins`, `team` | 12, 9, 7, 5, 3, -3 | the audience; `team` is internal work |
 | `audience_none` | 0 | no audience set |
 | `blocks_each`, `blocks_share`, `blocks_max` | 5, 0.25, 40 | for each open task it blocks: 5 plus a quarter of that task's own score, at most 40 in all |
 | `overdue` | 40 | the due date has passed |
 | `due_soon`, `due_soon_days` | 25, 2 | due today or within 2 days |
-| `due_week` | 10 | due within 7 days, past `due_soon_days` |
+| `due_week`, `due_week_days` | 10, 7 | due within 7 days, past `due_soon_days` |
 | `age_per_week`, `age_max` | 1, 10 | each full week since the task was made, at most 10 |
 
 A task's own score is every row but the blocks rows. Weights from config may be negative (lower the score) or decimals.
@@ -133,6 +133,50 @@ Sorts (`--sort` on `ls`, `ready`, `search`; `--reverse` flips the list):
 | `id` | the ID number |
 
 `ready` keeps the planned lane above the backlog under every sort. JSON lists name the sort in `sort`.
+
+## Settings
+
+Every choice a team may change sits in one model with five layers. The later layer wins:
+
+1. default: built into qtask
+2. global: `config.toml` in `QTASK_HOME` (or the file `QTASK_CONFIG` names); `qtask config ... --global` writes it and rewrites the file without comments
+3. project: the database, meta keys `config:<project>` and `weights:<project>`; `qtask config ...` without `--global`
+4. env: `QTASK_CFG_<SETTING>` (such as `QTASK_CFG_SORT=newest`), `QTASK_CFG_WEIGHT_<NAME>` (such as `QTASK_CFG_WEIGHT_BUG=40`), and `QTASK_LIMIT`
+5. flags: `--limit`, `--sort`, `--ttl-hours`, `--max-chars`, `--kind`, `--pri`
+
+`qtask config` lists each setting, its value and the layer it came from. `config get NAME` prints one. Names: a setting (`limit`), a weight (`bug` or `weight.bug`), a value setting (`side.ml.label`, `kind.spike.required`, `priority.P0.hub`, `side.other.retired`) or an order (`side.order`). An unknown bare name exits 2 with `unknown_weight`, a dotted one with `unknown_setting`.
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `limit` | 20 | rows per page when `--limit` is absent; 0 prints every row |
+| `max_limit` | 100 | the highest `--limit` |
+| `sort` | important | the order of `ls`, `ready`, `search` without `--sort` |
+| `default_kind`, `default_priority` | task, P2 | a new task's kind and priority without `--kind`, `--pri` |
+| `lease_hours` | 2 | the claim lease without `--ttl-hours` |
+| `idle_hours` | 24 | hours with no activity before `report` and `next` call a claim idle |
+| `wip_limit` | 2 | claims an agent holds before `claim` warns |
+| `max_chars` | 0 | `--max-chars` when the flag is absent; 0 keeps texts whole |
+| `snippet_chars` | 160 | characters of a search hit or a report comment |
+| `show_comments` | 10 | comments `show` prints without `--full` |
+| `report_rows` | 5 | rows per `report` section |
+| `brief_bytes` | 2048 | the size of `brief`, `prompt` and `export --pack` |
+| `duplicate_score`, `warn_score`, `similar_min` | 90, 75, 50 | `add` refuses, warns and lists similar tasks from these scores; 101 turns one off |
+| `duplicate_words` | 3 | title words before `add` refuses a duplicate |
+| `area_hints`, `area_hint_min`, `area_hint_task`, `area_body_weight` | 3, 0.5, 0.34, 0.25 | how many areas `add` suggests and how they score |
+| `stop_words`, `stem_suffixes` | 26 English words, 11 endings | words `similar` and area hints skip, and endings they cut; a comma list |
+
+The weights of the important order are settings too, in the same layers (table above, plus `due_week_days`, 7: the days `due_week` and the report's due section cover).
+
+Vocabularies: `side`, `kind`, `priority`, `audience`, `requested_by`. Each value has a `label`, a `retired` flag and, for sides, kinds and priorities, a `hub` value for `publish`. Kinds carry a `template` and `required` headings (bug: Steps, Expected, Actual); `add` exits 2 with `kind_template` (`bug_template` for a bug) when one is missing. Kinds, priorities, audiences and requesters can carry a weight (`--weight`), which shares one list of names with the other weights.
+
+- `config vocab side add ml --label "Machine learning" --hub be` adds a value; `edit` changes one; `label be Backend` sets a label (`""` clears it); `order be,fe` puts those first.
+- `rm` removes a value this layer added and no task uses. Any other value it retires: new tasks cannot use it (`value_retired`), old tasks keep it, and filters and `facets` still show it, marked `(retired)`. `restore` brings it back.
+- A value removed from the settings while tasks still hold it stays usable in filters and shows in `config vocab NAME` as `not in the settings`.
+- Values are 1 to 30 letters, digits, `-` or `_`, matched without case. `none` is reserved.
+
+What stays fixed, and why: the statuses and lanes (claim, release, review, done and drop move tasks between them, and the database checks them); comment kinds (questions and answers drive `needs_confirm`); `waiting_on` and deploy states (report sections read them); the sorts and rank groups (code); the ID form `PREFIX-N` (scan, commit links and the hub parse it; `project set-prefix` and `init --prefix` change the prefix); the env variable names (qtask reads `QTASK_HOME` before any setting); the hub's own lists (the hub defines them; the `hub` setting maps to them). qtask prints no colours.
+
+`qtask config export team.toml` writes the global and project layers as one file (env left out); `--layer project` writes one. `qtask config import team.toml` merges a file into the project layer (`--replace` clears it first, `--global` loads it into the global file). `qtask init --from team.toml` or `qtask init --preset software` sets up a new project. Presets: `default`, `software` (audiences users, admins, team; no content side), `solo` (no manager or stakeholder requests, no audiences, smaller pages). A broken file or variable exits 2 with `bad_config` and a message that names the key and the fix.
 
 ## Saved views
 
@@ -195,7 +239,10 @@ Commands that take text (`comment`, `ask`, `answer`, `todo add`) read it from th
 | `ready [the filters of ls, without --status and --include-closed] [--planned \| --backlog] [--sort --reverse --explain]` | Claimable tasks with a lane column, most important first: planned (status ready), then backlog, then parents with open parts. Ends with counts by lane, side and priority |
 | `next [--for AGENT --side LIST --kind LIST --pri LIST --area LIST --limit N --expand]` | Comments to you, your idle or expired claims, then the top ready task with `why first:`, with commands. Skips parents with open subtasks. `QTASK_SIDES` and `QTASK_AREAS` are the default `--side` and `--area`. `--limit` (or `--top`) takes 1 to 10. `--expand` prints whole comments and the top task's brief |
 | `view [ls]`, `view save NAME [COMMAND] FLAGS`, `view NAME [FLAGS]`, `view rm NAME` | Saved views: see Saved views |
-| `config [ls]`, `config set NAME VALUE`, `config unset NAME`, `config reset` | The weights of the important order for the project |
+| `config [ls]`, `config get NAME`, `config set NAME VALUE`, `config unset NAME`, `config reset` `[--global]` | Every setting with its value and layer; change one for the project, or with `--global` for every project. See Settings |
+| `config vocab [VOCAB [ls\|add\|edit\|label\|rm\|restore\|order] VALUE] [--label --weight --hub --template --template-file --required --global]` | The values of side, kind, priority, audience and requested_by |
+| `config export [FILE] [--layer both\|global\|project] [--force]`, `config import FILE\|--preset NAME [--replace] [--global]`, `config presets` | Share settings as a TOML (or `.json`) file and load them |
+| `init [--preset NAME \| --from FILE] [--prefix P] [--replace]` | Set up the project: register it, its ID prefix, its settings |
 | `facets [--ready] [the filters of ls]` | Counts by lane, status, priority, kind, side, audience, requester, area (direct, not rolled up) and lock; `none` counts empty fields |
 | `brief ID` | About 2 KB: status, claim, next step, summary, plan, branch, worktree, open checklist items, open questions, blockers, context files, body |
 | `show ID [--events --full]` | Task, checklist, children, links, commits, the last 10 comments, the event count, hub link |

@@ -73,7 +73,7 @@ HAS_FTS5 = sqlite_has_fts5()
 ARABIC ="إصلاح زر الإرسال «ذاكر» في الاختبار"
 RACE_ROUNDS = 5
 RACE_PROCESSES = 20
-LATEST_SCHEMA = 11
+LATEST_SCHEMA = 12
 BUG_BODY = "Steps: save a file\nExpected: it saves\nActual: it crashes"
 SCISSORS = "# ------------------------ >8 ------------------------"
 
@@ -2572,8 +2572,11 @@ class AgentSchema(Base):
         # Wider CHECK lists take the new values; old values and bad values behave as before.
         self.js("comment", "APP-1", "Summary: a\nChecks run: b\nLeft: c", "--kind", "handback")
         self.js("set", "APP-1", "--side", "mobile", "--kind", "chore")
+        # Schema 12 lets a side be any short name (the settings check it); an empty side or a bad status still fails.
         with self.assertRaises(sqlite3.IntegrityError):
-            self.sql("UPDATE tasks SET side = 'nope' WHERE id = 'APP-1'")
+            self.sql("UPDATE tasks SET side = '' WHERE id = 'APP-1'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.sql("UPDATE tasks SET status = 'nope' WHERE id = 'APP-1'")
         self.assertEqual(self.add("new"), "APP-4")
         self.assertEqual([c["body"] for c in self.js("search", "n", "--all")["comments"]][:1], ["n"])
         self.js("context", "APP-1", "add", "a.md")
@@ -3201,6 +3204,250 @@ class SmartOrder(Base):
         self.assertEqual([r[1] for r in self.sql("PRAGMA table_info(tasks)")][-1], "due")
         self.assertEqual([r[1] for r in self.sql("PRAGMA table_info(views)")],
                          ["project", "name", "command", "args", "created_by", "created_at", "updated_at"])
+
+
+class Config(Base):
+    """Settings in layers: defaults, the global file, the project, env, flags; vocabularies a team owns."""
+
+    def cfg(self, *args, expect=0, env=None):
+        return self.js("config", *args, "--project", self.project, expect=expect, env=env)
+
+    def get(self, name, env=None):
+        return self.cfg("get", name, env=env)
+
+    def write_global(self, text):
+        Path(self.home, "config.toml").write_text(text, encoding="utf-8")
+
+    def test_each_layer_wins_over_the_one_before(self):
+        self.add("x")
+        self.assertEqual((self.get("limit")["value"], self.get("limit")["source"]), (20, "default"))
+        self.js("config", "set", "limit", "30", "--global")
+        self.assertIn("limit = 30", Path(self.home, "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual((self.get("limit")["value"], self.get("limit")["source"]), (30, "global"))
+        self.cfg("set", "limit", "40")
+        self.assertEqual((self.get("limit")["value"], self.get("limit")["source"]), (40, "project"))
+        env = {**self.env, "QTASK_CFG_LIMIT": "50"}
+        self.assertEqual((self.get("limit", env)["value"], self.get("limit", env)["source"]), (50, "env"))
+        legacy = {**self.env, "QTASK_LIMIT": "7"}
+        self.assertEqual(self.get("limit", legacy)["value"], 7)
+        self.bulk_add(45)
+        self.assertEqual(self.js("ls", "--project", self.project)["count"], 40)
+        self.assertEqual(self.js("ls", "--project", self.project, env=env)["count"], 46)
+        self.assertEqual(self.js("ls", "--project", self.project, "--limit", "3", env=env)["count"], 3)
+        rows = {r["name"]: r for r in self.cfg()["settings"]}
+        self.assertEqual((rows["limit"]["source"], rows["sort"]["source"]), ("project", "default"))
+        self.cfg("unset", "limit")
+        self.assertEqual(self.get("limit")["source"], "global")
+        self.js("config", "reset", "--global")
+        self.assertFalse(Path(self.home, "config.toml").exists())
+        self.assertEqual(self.get("limit")["source"], "default")
+        other = self.js("config", "get", "limit", "--project", "two/other")
+        self.assertEqual(other["source"], "default")
+
+    def bulk_add(self, n):
+        for i in range(n):
+            self.js("add", f"bulk {i}", "--project", self.project, "--no-similar")
+
+    def test_sort_and_lease_defaults_come_from_settings(self):
+        old = self.add("old one")
+        new = self.add("new one")
+        self.cfg("set", "sort", "newest")
+        self.assertEqual(self.ls("ls"), [new, old])
+        self.assertEqual(self.ls("ls", "--sort", "oldest"), [old, new])
+        self.cfg("set", "lease_hours", "5")
+        claim = self.js("claim", old, agent="bob")["task"]
+        self.assertEqual(claim["claim_ttl_hours"], 5)
+        self.cfg("set", "default_priority", "P1")
+        self.assertEqual(self.js("show", self.add("third"))["task"]["priority"], "P1")
+
+    def test_custom_side_and_kind_work_everywhere(self):
+        self.cfg("vocab", "side", "add", "ml", "--label", "Machine learning")
+        self.cfg("vocab", "kind", "add", "spike", "--required", "Question,Answer by", "--weight", "15")
+        spike = self.add("try a model", "--side", "ML", "--kind", "spike", "--body", "Question: which?\nAnswer by: Friday")
+        task = self.js("show", spike)["task"]
+        self.assertEqual((task["side"], task["kind"]), ("ml", "spike"))
+        self.add("plain", "--side", "be")
+        self.assertEqual(self.ls("ls", "--side", "ml"), [spike])
+        self.assertEqual(self.ls("ready", "--kind", "spike"), [spike])
+        facets = self.js("facets", "--project", self.project)["facets"]
+        self.assertEqual(facets["side"], {"be": 1, "ml": 1})
+        self.assertEqual(facets["kind"], {"task": 1, "spike": 1})
+        self.assertIn("ml (Machine learning) 1", self.run_qtask("facets", "--project", self.project).stdout)
+        self.assertIn("spike +15", self.js("ls", "--project", self.project, "--explain")["tasks"][0]["why"])
+        error = self.js("add", "x", "--side", "nope", "--project", self.project, expect=2)["error"]
+        self.assertIn("qtask config vocab side add", error["message"])
+        self.assertIn("ml", error["message"])
+        wide = {**self.env, "COLUMNS": "400"}
+        self.assertIn("design, ml;", self.run_qtask("add", "--help", "--project", self.project, env=wide).stdout)
+        self.assertIn("spike", self.cfg("vocab", "kind")["values"][-1]["name"])
+        self.assertNotIn("spike", self.run_qtask("add", "--help", "--project", "two/other").stdout)
+
+    def test_custom_template_needs_its_headings(self):
+        self.cfg("vocab", "kind", "add", "spike", "--required", "Question,Answer by")
+        error = self.js("add", "x", "--kind", "spike", "--body", "Question: a", "--project", self.project, expect=2)["error"]
+        self.assertEqual(error["code"], "kind_template")
+        self.assertIn("Answer by", error["message"])
+        self.assertEqual(self.js("template", "spike", "--project", self.project)["template"], "Question:\n\nAnswer by:\n\n")
+        template = Path(self.home, "t.md")
+        template.write_text("Goal:\n\nRisk:\n", encoding="utf-8")
+        self.cfg("vocab", "kind", "edit", "spike", "--template-file", str(template), "--required", "Goal,Risk")
+        self.assertEqual(self.js("template", "spike", "--project", self.project)["template"], "Goal:\n\nRisk:\n")
+        self.add("x", "--kind", "spike", "--body", "Goal: g\nRisk: r")
+        self.cfg("vocab", "kind", "edit", "bug", "--required", "")
+        self.add("crash", "--kind", "bug", "--body", "it broke")
+
+    def test_retiring_a_value_in_use_keeps_it_readable(self):
+        used = self.add("old work", "--side", "other")
+        data = self.cfg("vocab", "side", "rm", "other")
+        self.assertIn("1 tasks (1 open) still use side other", data["warnings"][0])
+        error = self.js("add", "x", "--side", "other", "--project", self.project, expect=2)["error"]
+        self.assertEqual(error["code"], "value_retired")
+        self.assertIn("restore other", error["message"])
+        self.js("set", used, "--side", "other", expect=2)
+        self.assertEqual(self.ls("ls", "--side", "other"), [used])
+        self.assertIn("other (retired) 1", self.run_qtask("facets", "--project", self.project).stdout)
+        help_text = self.run_qtask("add", "--help", "--project", self.project, env={**self.env, "COLUMNS": "400"}).stdout
+        self.assertIn("docs, mobile", help_text)
+        self.assertNotIn("docs, other", help_text)
+        self.cfg("vocab", "side", "restore", "other")
+        self.add("y", "--side", "other")
+        self.cfg("vocab", "side", "add", "tmp")
+        self.assertEqual(self.cfg("vocab", "side", "rm", "tmp")["warnings"], [])
+        self.assertIsNone(next((v for v in self.cfg("vocab", "side")["values"] if v["name"] == "tmp"), None))
+        error = self.cfg("vocab", "kind", "rm", "task", expect=2)["error"]
+        self.assertEqual(error["code"], "bad_config")
+        self.assertIn("default_kind", error["message"])
+
+    def test_a_value_gone_from_the_settings_still_filters(self):
+        self.cfg("vocab", "side", "add", "ml")
+        task = self.add("x", "--side", "ml")
+        self.cfg("reset")
+        self.assertEqual(self.ls("ls", "--side", "ml"), [task])
+        self.assertIn("not in the settings", self.run_qtask("config", "vocab", "side", "--project", self.project).stdout)
+
+    def test_priority_values_order_and_weights(self):
+        self.cfg("vocab", "priority", "add", "P4", "--weight", "-5", "--hub", "low")
+        low = self.add("later", "--pri", "p4")
+        mid = self.add("middle", "--pri", "P2")
+        self.assertEqual(self.ls("ls", "--sort", "priority"), [mid, low])
+        self.assertIn("P4 -5", self.js("ls", "--project", self.project, "--explain")["tasks"][1]["why"])
+        self.cfg("vocab", "priority", "order", "P4,P0")
+        self.assertEqual(self.ls("ls", "--sort", "priority"), [low, mid])
+        self.assertEqual(self.cfg("get", "priority.order")["value"][:2], ["P4", "P0"])
+        payload = self.js("publish", low, "--scope", "x", "--fields", "title,scope,priority", "--hub-url",
+                          "https://hub.example.com/api", "--dry-run")["payload"]
+        self.assertEqual(payload["priority"], "low")
+        error = self.cfg("vocab", "audience", "add", "manager", expect=2)["error"]
+        self.assertEqual(error["code"], "value_exists")
+
+    def test_export_and_import_round_trip(self):
+        self.js("config", "set", "report_rows", "8", "--global")
+        self.cfg("vocab", "side", "add", "ml", "--label", "Machine \"learning\"", "--hub", "be")
+        self.cfg("vocab", "kind", "add", "spike", "--template", "Ask:\nTell:\n", "--required", "Ask")
+        self.cfg("vocab", "audience", "rm", "parents")
+        self.cfg("set", "bug", "70")
+        self.cfg("set", "stop_words", "the,a,an")
+        out = Path(self.home, "team.toml")
+        self.cfg("export", str(out))
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("report_rows = 8", text)
+        self.assertEqual(self.cfg("export", str(out), expect=4)["error"]["code"], "file_exists")
+        self.cfg("export", str(Path(self.home, "team.json")))
+        for name in ("team.toml", "team.json"):
+            target = f"new/{name.split('.')[1]}"
+            self.js("init", "--project", target, "--from", str(Path(self.home, name)))
+            data = self.js("config", "--project", target)
+            rows = {r["name"]: r for r in data["settings"]}
+            self.assertEqual((rows["report_rows"]["value"], rows["report_rows"]["source"]), (8, "project"))
+            self.assertEqual(rows["stop_words"]["value"], ["the", "a", "an"])
+            self.assertEqual(next(w for w in data["weights"] if w["name"] == "bug")["value"], 70)
+            sides = {v["name"]: v for v in data["vocab"]["side"]}
+            self.assertEqual((sides["ml"]["label"], sides["ml"]["hub"]), ('Machine "learning"', "be"))
+            kinds = {v["name"]: v for v in data["vocab"]["kind"]}
+            self.assertEqual(kinds["spike"]["required"], ["Ask"])
+            self.assertTrue(next(v for v in data["vocab"]["audience"] if v["name"] == "parents")["retired"])
+            self.assertEqual(self.js("template", "spike", "--project", target)["template"], "Ask:\nTell:\n")
+            again = self.js("config", "export", "--project", target, "--layer", "project")["settings"]
+            original = self.js("config", "export", "--project", self.project)["settings"]
+            self.assertEqual(again, original)
+        self.assertEqual(self.js("init", "--project", "new/toml", "--preset", "solo", expect=4)["error"]["code"],
+                         "config_exists")
+        self.js("init", "--project", "new/toml", "--preset", "solo", "--replace")
+        self.assertTrue(next(v for v in self.js("config", "--project", "new/toml")["vocab"]["requested_by"]
+                             if v["name"] == "manager")["retired"])
+
+    def test_presets_and_init(self):
+        names = [p["name"] for p in self.js("config", "presets")["presets"]]
+        self.assertEqual(names, ["default", "software", "solo"])
+        made = self.js("init", "--project", "acme/fresh", "--preset", "software", "--prefix", "FR")
+        self.assertEqual(made["project"]["prefix"], "FR")
+        self.assertIn("users", made["vocab"]["audience"])
+        self.assertNotIn("students", made["vocab"]["audience"])
+        self.assertTrue(self.js("add", "x", "--project", "acme/fresh", "--audience", "users")["task"]["id"].startswith("FR-"))
+        self.js("init", "--project", "acme/fresh", "--preset", "nope", expect=2)
+        self.js("config", "import", "--project", "acme/fresh", "--preset", "default", "--replace")
+        self.assertIn("students", self.js("config", "--project", "acme/fresh")["vocab"]["audience"][0]["name"])
+
+    def test_invalid_settings_name_the_fix(self):
+        self.add("x")
+        self.write_global("[settings]\nlimit = \"lots\"\n")
+        error = self.js("ls", "--project", self.project, expect=2)["error"]
+        self.assertEqual(error["code"], "bad_config")
+        self.assertIn("config.toml", error["message"])
+        self.assertIn("qtask config unset NAME --global", error["message"])
+        self.js("config", "unset", "limit", "--global")
+        self.js("ls", "--project", self.project)
+        self.write_global("[setings]\nlimit = 3\n")
+        self.assertIn("unknown key 'setings'", self.js("ls", "--project", self.project, expect=2)["error"]["message"])
+        self.write_global("limit = [")
+        self.assertIn("not valid TOML", self.js("ls", "--project", self.project, expect=2)["error"]["message"])
+        self.js("config", "reset", "--global")
+        bad = {**self.env, "QTASK_CFG_NOPE": "1"}
+        error = self.js("ls", "--project", self.project, expect=2, env=bad)["error"]
+        self.assertIn("QTASK_CFG_NOPE", error["message"])
+        self.assertIn("unset the variable", error["message"])
+        self.assertEqual(self.cfg("set", "limit", "500", expect=2)["error"]["code"], "bad_config")
+        self.assertEqual(self.cfg("set", "side.zz.label", "x", expect=2)["error"]["code"], "unknown_value")
+        self.assertEqual(self.cfg("set", "side.fe.colour", "x", expect=2)["error"]["code"], "unknown_setting")
+        self.assertEqual(self.cfg("vocab", "side", "add", "bad name", expect=2)["error"]["code"], "bad_config")
+        self.assertIn("above max_limit", self.cfg("set", "max_limit", "10", expect=2)["error"]["message"])
+        self.cfg("set", "limit", "5")
+        self.cfg("set", "max_limit", "10")
+        error = self.cfg("set", "limit", "11", expect=2)["error"]
+        self.assertIn("above max_limit", error["message"])
+        self.assertEqual(self.js("ls", "--project", self.project, "--limit", "11", expect=2)["error"]["code"], "bad_usage")
+
+    def test_env_overrides_weights_and_settings(self):
+        bug = self.add("crash", "--kind", "bug", "--body", BUG_BODY)
+        urgent = self.add("urgent", "--pri", "P0")
+        self.assertEqual(self.ls("ls"), [urgent, bug])
+        env = {**self.env, "QTASK_CFG_WEIGHT_BUG": "90", "QTASK_CFG_SORT": "important"}
+        self.assertEqual([t["id"] for t in self.js("ls", "--project", self.project, env=env)["tasks"]], [bug, urgent])
+        row = next(w for w in self.js("config", "--project", self.project, env=env)["weights"] if w["name"] == "bug")
+        self.assertEqual((row["value"], row["source"]), (90, "env"))
+        self.assertIn("QTASK_CFG_WEIGHT_NOPE", self.js("ls", "--project", self.project, expect=2,
+                      env={**self.env, "QTASK_CFG_WEIGHT_NOPE": "1"})["error"]["message"])
+
+    def test_labels_and_set_get_of_value_settings(self):
+        self.cfg("set", "side.be.label", "Backend")
+        self.assertEqual(self.get("side.be.label")["value"], "Backend")
+        self.add("x", "--side", "be")
+        self.assertIn("be (Backend) 1", self.run_qtask("facets", "--project", self.project).stdout)
+        self.cfg("vocab", "side", "label", "be", "")
+        self.assertIsNone(self.get("side.be.label")["value"])
+        self.cfg("set", "side.be.retired", "true")
+        self.js("add", "y", "--side", "be", "--project", self.project, expect=2)
+        self.cfg("unset", "side.be.retired")
+        self.add("y", "--side", "be")
+        self.assertNotIn(f"config:{self.project}", [r[0] for r in self.sql("SELECT key FROM meta")])
+
+    def test_schema_12_relaxes_the_value_checks_only(self):
+        self.add("x")
+        sql = self.sql("SELECT sql FROM sqlite_master WHERE name = 'tasks'")[0][0]
+        self.assertIn("length(side) BETWEEN 1 AND 30", sql)
+        self.assertIn("status IN (", sql)
+        self.assertIn("visibility IN (", sql)
+        self.assertEqual(self.sql("PRAGMA integrity_check"), [("ok",)])
 
 
 class Version(Base):
