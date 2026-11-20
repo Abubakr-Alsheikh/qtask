@@ -103,7 +103,7 @@ Track work with the `qtask` CLI. `qtask COMMAND --help` lists the flags.
 |---------|------|
 | `add`, `set`, `show`, `ls`, `search` | Create, change, read and find tasks |
 | `ready`, `next`, `facets` | Tasks an agent may claim now, most important first; what to do next, with the reasons and the commands; counts by field |
-| `view`, `config` | Saved lists with their filters and sort; the weights of the important order |
+| `view`, `config`, `init` | Saved lists with their filters and sort; settings, values and weights in layers; set up a project from a preset or a file |
 | `brief` | About 2 KB of what an agent needs to start a task |
 | `claim`, `release` | Take or give back a task. Activity renews a claim; an expired one goes back to its lane |
 | `review`, `approve`, `reject`, `decisions` | The review queue, and what waits on whom |
@@ -255,6 +255,23 @@ my-org/my-repo now uses the prefix QT. Next ID: QT-105. Existing IDs stay as the
 
 New tasks get the new prefix and keep the counter. Old IDs keep working.
 
+### Your own values and settings
+
+The sides, kinds, priorities, audiences and requesters, the page size, the sort, the lease and the thresholds are defaults. Change them for one project, or with `--global` for every project:
+
+```bash
+qtask config                                   # every setting, its value and its layer
+qtask config set limit 30                      # this project
+qtask config set sort newest --global          # every project
+qtask config vocab side add ml --label "Machine learning"
+qtask config vocab kind add spike --required "Question,Answer by" --weight 15
+qtask config vocab side rm other               # retires it: old tasks keep it, new ones cannot use it
+qtask config export team.toml                  # share the setup
+qtask init --from team.toml                    # start a new project from it, or --preset software
+```
+
+Layers, the later wins: built-in defaults, `~/.qtask/config.toml`, the project (in the database), `QTASK_CFG_*` variables, flags. `--help`, errors and `facets` print the lists in use.
+
 ### Publish to a team hub
 
 `publish` sends one task to a TaskFlow team hub, so the rest of the team can see it. You choose what leaves your machine, check it, and confirm it in your own terminal.
@@ -326,6 +343,8 @@ qtask needs SQLite 3.24 or newer with JSON functions. The Python builds from pyt
 | `QTASK_AGENT` | Agent name when `--agent` is absent |
 | `QTASK_SIDES` | Comma list of sides `next` picks from when `--side` is absent |
 | `QTASK_LIMIT` | Rows per page of a list when `--limit` is absent, 1 to 100, default 20. `0` prints every row |
+| `QTASK_CONFIG` | The global settings file, an absolute path. Default `config.toml` in `QTASK_HOME` |
+| `QTASK_CFG_<NAME>` | One setting for this shell, such as `QTASK_CFG_SORT=newest` or `QTASK_CFG_WEIGHT_BUG=40`. Wins over the files |
 | `QTASK_NO_FTS` | Use plain `LIKE` search instead of SQLite FTS5 when the database is created |
 | `QTASK_HUB_URL` | Hub base URL when `--hub-url` is absent |
 | `QTASK_HUB_TOKEN` | Hub API token. Else qtask reads `~/.qhub/token` |

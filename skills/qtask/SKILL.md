@@ -56,6 +56,16 @@ Filters on `ls`, `ready`, `facets` and `next` take comma lists (`--side be,fe`, 
 - Saved views: `qtask view save be-bugs ready --side be --kind bug`, then `qtask view be-bugs`; `qtask view ls`, `qtask view rm NAME`.
 - The developer tunes the weights for a project with `qtask config set bug 40`; `qtask config` lists them. Do not change them on your own.
 
+## Settings and your own values
+
+The lists above are defaults. A project can add, label, reorder and retire sides, kinds, priorities, audiences and requesters, and change limits, sort, lease and thresholds. `--help` and errors print the lists in use; trust them over this file.
+
+- See what is in use: `qtask config` (every setting, its value and its layer), `qtask config vocab side`.
+- Layers, the later wins: built-in default, global file (`~/.qtask/config.toml`, `--global`), project (the database), env (`QTASK_CFG_LIMIT=30`, `QTASK_CFG_WEIGHT_BUG=40`), flags.
+- Change: `qtask config set limit 30`, `config unset NAME`, `config vocab side add ml --label "Machine learning"`, `config vocab kind add spike --required "Question,Answer by"`, `config vocab side rm other` (retires a value in use: old tasks keep it), `restore`, `order be,fe`.
+- Share or start a project: `qtask config export team.toml`, then `qtask init --from team.toml` or `config import FILE`; presets: `qtask config presets`.
+- Change settings only when the developer asks. A retired value exits 2 with `value_retired`; a broken setting exits 2 with `bad_config` and names the fix.
+
 ## Reading output
 
 - Lists (`ls`, `ready`, `search`, `review`, `inbox`, `tree`, `plans`, `decisions`) print 20 rows. A cut list starts with `showing 21-40 of 133 (page 2 of 7)` and ends with `more: <the next command>`: run that line for the next page. `--limit N` (1 to 100), `--page N`, `--offset N`, `--all-pages`.

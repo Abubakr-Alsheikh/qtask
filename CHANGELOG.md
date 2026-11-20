@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0 (unreleased)
+
+Your own values and settings, in layers you can share.
+
+- **One settings model.** Every value a team may change sits in five layers, the later wins: built-in defaults, the global file (`config.toml` in `QTASK_HOME`, or `QTASK_CONFIG`), the project (in the database), `QTASK_CFG_*` variables, then flags. With nothing set, qtask behaves as 0.7 did.
+- `qtask config` lists every setting with its value and layer: `limit`, `max_limit`, `sort`, `default_kind`, `default_priority`, `lease_hours`, `idle_hours`, `wip_limit`, `max_chars`, `snippet_chars`, `show_comments`, `report_rows`, `brief_bytes`, `duplicate_score`, `warn_score`, `similar_min`, `duplicate_words`, the area hint numbers, `stop_words`, `stem_suffixes`, and the weights. `config get NAME`, `config set NAME VALUE`, `config unset NAME` and `config reset` take `--global` for the global layer.
+- **Your own values.** `config vocab side|kind|priority|audience|requested_by add|edit|label|rm|restore|order`. A value has a label, a retired flag and, for sides, kinds and priorities, the hub value `publish` sends. A kind has a template and required headings (`--required "Question,Answer by"`); a kind, priority, audience or requester can have a weight. `add`, `set`, `split`, filters, `facets`, `ready`, `report`, `--help` and errors use the configured lists. `rm` on a value in use retires it: new tasks cannot use it (`value_retired`), old ones keep it, filters still find it and `facets` marks it `(retired)`.
+- `config export [FILE]` writes the global and project layers as TOML (or JSON for a `.json` name); `config import FILE|--preset NAME [--replace]` loads one; `config presets` lists `default`, `software` and `solo`. New command `qtask init [--preset NAME | --from FILE] [--prefix P]` sets up a project.
+- Env: `QTASK_CFG_<SETTING>` and `QTASK_CFG_WEIGHT_<NAME>`; `QTASK_LIMIT` keeps working as the env layer of `limit`.
+- A broken setting exits 2 with `bad_config` and a message that names the file or variable, the key and the fix.
+- New weight `due_week_days` (7): the days `due_week` and the report's due section cover.
+- `--kind`, `--pri` on `add` and `--ttl-hours` on `claim` and `take` have no fixed default in the parser any more; the settings give it. **Change:** `config` JSON adds `settings`, `vocab` and `layers`, and weight rows add `source`.
+- Schema 12 relaxes the table checks on kind, side and priority to any name of 1 to 30 characters, so a project's own values fit. It only relaxes a constraint, as schema 8 and 10 did.
+
 ## 0.7.0 (unreleased)
 
 Show the right task first, and filter and keep lists by time, number and field.
